@@ -1,0 +1,11 @@
+
+this is not json at all
+{"type":"assistant"
+{"type":"assistant","message":{"model":"claude-fable-5","id":"msg_g0000000000000000000001"},"requestId":"req_g0000000000000000000001","timestamp":"2026-07-08T03:00:00.000Z","sessionId":"99999999-9999-4999-8999-999999999999"}
+{"type":"assistant","message":{"model":"claude-fable-5","id":"msg_g0000000000000000000002","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"requestId":"req_g0000000000000000000002","timestamp":"not-a-timestamp","sessionId":"99999999-9999-4999-8999-999999999999"}
+[{"type":"assistant"}]
+42
+"just a string"
+{"type":"assistant","message":{"model":"<synthetic>","id":"msg_g0000000000000000000003","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"requestId":"req_g0000000000000000000003","timestamp":"2026-07-08T03:00:01.000Z","isApiErrorMessage":true,"sessionId":"99999999-9999-4999-8999-999999999999"}
+{"type":"assistant","message":{"model":"claude-fable-5","usage":{"input_tokens":5,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"requestId":"req_g0000000000000000000004","timestamp":"2026-07-08T03:00:02.000Z","sessionId":"99999999-9999-4999-8999-999999999999"}
+{"type":"assistant","message":{"model":"claude-fable-5","id":"msg_g0000000000000000000005","usage":{"input_tokens":7,"output_tokens":3,"cache_creation_input_tokens":2,"cache_read_input_tokens":1}},"requestId":"req_g0000000000000000000005","timestamp":"2026-07-08T03:00:03.000Z","sessionId":"99999999-9999-4999-8999-999999999999","cwd":"/home/dev/example-project"}
