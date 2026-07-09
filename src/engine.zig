@@ -91,7 +91,54 @@ pub const Model = struct {
     codex_buf: [text_buf_len]u8 = undefined,
     today_buf: [text_buf_len]u8 = undefined,
     status_buf: [text_buf_len]u8 = undefined,
+
+    // Instrument display state (pure display, refreshed each sweep):
+    // the tach needs a stable scale (a ratcheted, slowly decaying burn
+    // peak) and the previous/current needle pose so the view's render
+    // animation can sweep between them instead of snapping.
+    gauge_peak_tpm: f64 = 0,
+    needle_from_deg: f32 = -half_sweep_deg,
+    needle_to_deg: f32 = -half_sweep_deg,
 };
+
+/// The tach sweeps ±120° around 12 o'clock (a classic 240° dial).
+pub const half_sweep_deg: f32 = 120;
+
+/// Ratchet decay per 2 s sweep: the peak halves in roughly 30 minutes,
+/// so the dial re-ranges down slowly instead of flapping.
+const peak_decay_per_sweep: f64 = 0.99923;
+
+/// Smallest 1-2-5 ladder scale (tokens/min) that clears the recent
+/// peak with ~15% headroom; never below 10k/m.
+pub fn gaugeScaleTpm(peak_tpm: f64) f64 {
+    const target = @max(peak_tpm * 1.15, 10_000);
+    var decade: f64 = 10_000;
+    while (decade < target) {
+        if (decade * 2 >= target) return decade * 2;
+        if (decade * 5 >= target) return decade * 5;
+        decade *= 10;
+    }
+    return decade;
+}
+
+/// Needle pose (degrees clockwise from 12 o'clock) for a burn rate on
+/// the current scale.
+pub fn needleDeg(tpm: f64, scale_tpm: f64) f32 {
+    const frac = std.math.clamp(tpm / @max(scale_tpm, 1), 0, 1);
+    return @floatCast(-half_sweep_deg + 2 * half_sweep_deg * frac);
+}
+
+/// Redline truth: a wall projected within 45 minutes, or any limit
+/// window past 80% utilization.
+pub fn dangerState(model: *const Model) bool {
+    if (model.walls.maxUtilization()) |hot| {
+        if (hot.used_percent > 80) return true;
+    }
+    if (model.walls.nearestWall(model.now_ms)) |wall| {
+        if (wall.at_ms - model.now_ms < 45 * 60_000) return true;
+    }
+    return false;
+}
 
 /// Environment facts setup needs — extracted from the runner's
 /// `init.environ_map` by main (keeps setup unit-testable).
@@ -401,6 +448,13 @@ fn nextReset(model: *const Model) ?i64 {
 }
 
 fn refreshDisplay(model: *Model) void {
+    // Instrument state first: ratchet the peak, re-range the dial,
+    // journal the needle sweep (from = the pose the user last saw).
+    const tpm = model.burn.tokensPerMin(model.now_ms);
+    model.gauge_peak_tpm = @max(tpm, model.gauge_peak_tpm * peak_decay_per_sweep);
+    model.needle_from_deg = model.needle_to_deg;
+    model.needle_to_deg = needleDeg(tpm, gaugeScaleTpm(model.gauge_peak_tpm));
+
     model.glance_text = trayfmt.render(&model.glance_buf, model.cfg.tray_format, glanceState(model));
     model.claude_text = agentLine(&model.claude_buf, model, .claude, model.claude_limits);
     model.codex_text = agentLine(&model.codex_buf, model, .codex, model.codex_limits);

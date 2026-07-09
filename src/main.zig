@@ -1,8 +1,9 @@
 //! token-tach: a menu-bar tachometer for AI coding-agent token usage.
-//! The engine (Model/Msg/boot/update) lives in `engine.zig`; the markup
-//! view in `app.native`; the UI-free core under `core/`. This file is
-//! shell wiring: window scene, permissions, the status-item glance, and
-//! the runtime entry point.
+//! The engine (Model/Msg/boot/update) lives in `engine.zig`; the
+//! instrument-cluster canvas view in `view.zig` (theme in `theme.zig`);
+//! the UI-free core under `core/`. This file is shell wiring: window
+//! scene, permissions, the status-item glance, and the runtime entry
+//! point.
 
 const std = @import("std");
 const runner = @import("runner");
@@ -14,6 +15,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 const engine = @import("engine.zig");
+const view = @import("view.zig");
+const theme = @import("theme.zig");
 const trayfmt = @import("core/trayfmt.zig");
 
 pub const Model = engine.Model;
@@ -22,8 +25,8 @@ pub const update = engine.update;
 pub const boot = engine.boot;
 
 const canvas_label = "main-canvas";
-const window_width: f32 = 520;
-const window_height: f32 = 340;
+const window_width: f32 = view.window_width;
+const window_height: f32 = view.window_height;
 
 const app_permissions = [_][]const u8{
     native_sdk.security.permission_command,
@@ -46,7 +49,6 @@ const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 // ------------------------------------------------------------------- view
 
 pub const AppUi = canvas.Ui(Msg);
-pub const app_markup = @embedFile("app.native");
 
 const TachApp = native_sdk.UiApp(Model, Msg);
 
@@ -75,7 +77,9 @@ pub fn main(init: std.process.Init) !void {
         .update_fx = update,
         .init_fx = boot,
         .status_item_fn = statusItem,
-        .markup = .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io },
+        .view = view.rootView,
+        .tokens = theme.tokens(),
+        .animations = view.animations,
     });
     defer app_state.destroy();
 
