@@ -1,0 +1,88 @@
+#!/bin/sh
+# token-tach pre-commit — fast hygiene gate (target <2s, no network, no prompts).
+# Checks staged files only. Emergency bypass: git commit --no-verify
+# (see docs/DEVELOPMENT.md "Hygiene" for what you're skipping and why not to).
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+
+# Chain to the beads-managed hook first (issue-tracker bookkeeping), if present.
+if [ -x .beads/hooks/pre-commit ]; then
+  .beads/hooks/pre-commit "$@"
+fi
+
+fail=0
+MAX_BYTES=512000 # 500 KB flat cap on any staged file
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+if [ -z "$STAGED" ]; then
+  echo "pre-commit ✓ nothing staged to check"
+  exit 0
+fi
+
+# 1. zig fmt --check on staged .zig/.zon files (vendor/ excluded)
+ZIG_FILES=$(printf '%s\n' "$STAGED" | grep -E '\.(zig|zon)$' | grep -v '^vendor/' || true)
+if [ -n "$ZIG_FILES" ]; then
+  if command -v zig >/dev/null 2>&1; then
+    if UNFMT=$(printf '%s\n' "$ZIG_FILES" | tr '\n' '\0' | xargs -0 zig fmt --check 2>&1); then
+      echo "✓ zig fmt ($(printf '%s\n' "$ZIG_FILES" | wc -l | tr -d ' ') staged file(s))"
+    else
+      echo "✗ zig fmt: staged files need formatting:"
+      printf '%s\n' "$UNFMT" | sed 's/^/    /'
+      echo "  fix: zig fmt <file> && git add <file>"
+      fail=1
+    fi
+  else
+    echo "! zig not found on PATH — skipping fmt check (run scripts/setup)"
+  fi
+fi
+
+# 2. native check — markup + manifest (validates app.zon), ~40ms
+if command -v native >/dev/null 2>&1; then
+  if OUT=$(native check 2>&1); then
+    echo "✓ native check (markup + app.zon)"
+  else
+    echo "✗ native check failed:"
+    printf '%s\n' "$OUT" | sed 's/^/    /'
+    fail=1
+  fi
+else
+  echo "! native CLI not found on PATH — skipping native check (run scripts/setup)"
+fi
+
+# 3 + 4. per-file checks on staged blob content: conflict markers, size cap
+content_ok=1
+OLDIFS=$IFS
+IFS='
+'
+set -f
+for f in $STAGED; do
+  if git show ":$f" | grep -qIE '^(<{7}( |$)|>{7}( |$)|\|{7}( |$))'; then
+    echo "✗ merge conflict markers in $f"
+    content_ok=0
+  fi
+  size=$(git cat-file -s ":$f")
+  if [ "$size" -gt "$MAX_BYTES" ]; then
+    echo "✗ $f is ${size} bytes (limit ${MAX_BYTES}) — large blobs don't belong in git history"
+    content_ok=0
+  fi
+done
+set +f
+IFS=$OLDIFS
+if [ "$content_ok" -eq 1 ]; then
+  echo "✓ no conflict markers, no files >500KB"
+else
+  fail=1
+fi
+
+# 5. warn-but-allow: new TODO/FIXME in this commit
+TODOS=$(git diff --cached -U0 -- . ':(exclude)vendor' | grep -E '^\+' | grep -cE '\b(TODO|FIXME)\b' || true)
+if [ "${TODOS:-0}" -gt 0 ]; then
+  echo "! warning: this commit adds $TODOS line(s) with TODO/FIXME (allowed — consider filing a bead instead)"
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo ""
+  echo "pre-commit ✗ BLOCKED — fix the above, or (emergencies only) git commit --no-verify"
+  exit 1
+fi
+echo "pre-commit ✓ all checks passed"

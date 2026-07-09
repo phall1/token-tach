@@ -1,0 +1,25 @@
+# https://editorconfig.org — keep editors honest before the hooks have to be.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Zig convention: 4-space indent (enforced by zig fmt; this keeps editors in sync)
+[*.{zig,zon}]
+indent_size = 4
+
+[*.native]
+indent_size = 4
+
+[*.{yml,yaml,json,jsonl}]
+indent_size = 2
+
+[*.md]
+indent_size = 2
+# trailing double-space is a hard line break in markdown
+trim_trailing_whitespace = false

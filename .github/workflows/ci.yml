@@ -17,6 +17,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Format check
+        run: zig fmt --check src build.zig build.zig.zon
+
       - name: Install Native SDK CLI
         run: npm install -g @native-sdk/cli@0.4.0
 

@@ -1,0 +1,18 @@
+#!/bin/sh
+# token-tach pre-push — keep pushes honest: build + tests, no GUI windows.
+# Emergency bypass: git push --no-verify (then fix the build immediately).
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+
+# Chain to the beads-managed hook first (it reads the ref list from stdin).
+if [ -x .beads/hooks/pre-push ]; then
+  .beads/hooks/pre-push "$@"
+fi
+
+echo "pre-push: scripts/verify --no-smoke (bypass: git push --no-verify)"
+if scripts/verify --no-smoke; then
+  echo "pre-push ✓ verify green"
+else
+  echo "pre-push ✗ BLOCKED — scripts/verify --no-smoke failed; don't push a broken build"
+  exit 1
+fi

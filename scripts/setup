@@ -1,0 +1,59 @@
+#!/bin/sh
+# token-tach first-run bootstrap. Idempotent — safe to re-run any time.
+#   1. points git at the tracked .githooks/ (hooks chain through to .beads/hooks)
+#   2. initializes the vendor/native submodule
+#   3. sanity-checks the toolchain (zig >= 0.16, native CLI)
+set -eu
+cd "$(dirname "$0")/.."
+
+ok=1
+
+echo "==> git hooks"
+current=$(git config --local core.hooksPath 2>/dev/null || true)
+if [ "$current" = ".githooks" ]; then
+  echo "✓ core.hooksPath already .githooks"
+else
+  if [ -n "$current" ]; then
+    echo "  note: hooksPath was '$current' — .githooks hooks chain through to .beads/hooks, nothing is lost"
+  fi
+  git config core.hooksPath .githooks
+  echo "✓ core.hooksPath -> .githooks"
+fi
+
+echo "==> submodules"
+git submodule update --init --recursive
+echo "✓ vendor/native @ $(git -C vendor/native rev-parse --short HEAD) ($(git -C vendor/native describe --tags --always 2>/dev/null || echo 'no tag'))"
+
+echo "==> toolchain"
+if command -v zig >/dev/null 2>&1; then
+  ZV=$(zig version)
+  maj=${ZV%%.*}
+  rest=${ZV#*.}
+  min=${rest%%.*}
+  if [ "$maj" -gt 0 ] 2>/dev/null || [ "$min" -ge 16 ] 2>/dev/null; then
+    echo "✓ zig $ZV"
+  else
+    echo "✗ zig $ZV — this project needs zig >= 0.16 (https://ziglang.org/download/)"
+    ok=0
+  fi
+else
+  echo "✗ zig not found on PATH — install zig >= 0.16 (https://ziglang.org/download/)"
+  ok=0
+fi
+
+if command -v native >/dev/null 2>&1; then
+  echo "✓ $(native --version)"
+else
+  echo "✗ native CLI not found — npm install -g @native-sdk/cli@0.4.0 (keep aligned with vendor/native, see docs/DEVELOPMENT.md)"
+  ok=0
+fi
+
+echo "✓ git $(git --version | sed 's/^git version //')"
+
+echo ""
+if [ "$ok" -eq 1 ]; then
+  echo "setup ✓ ready — dev loop: scripts/verify  (docs/DEVELOPMENT.md)"
+else
+  echo "setup ✗ missing tools above — fix and re-run scripts/setup"
+  exit 1
+fi

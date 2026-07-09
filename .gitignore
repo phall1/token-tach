@@ -4,6 +4,9 @@
 .beads-credential-key
 .beads/proxieddb/
 
+# macOS noise
+.DS_Store
+
 # Native SDK / Zig build artifacts
 .native/
 zig-out/

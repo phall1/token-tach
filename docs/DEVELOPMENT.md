@@ -1,5 +1,15 @@
 # Development
 
+## First run
+
+```sh
+scripts/setup   # git hooks + submodules + toolchain check (idempotent)
+```
+
+Run this once after cloning (and any time after pulling if hooks change).
+It points `core.hooksPath` at the tracked `.githooks/`, initializes
+`vendor/native`, and verifies zig >= 0.16 and the `native` CLI are installed.
+
 ## The loop
 
 ```sh
@@ -61,3 +71,32 @@ git add vendor/native && git commit
 
 Patches are kept small and mechanical; if a rebase fights back, check
 whether the upstream API for trays/windows changed and fix forward.
+
+## Hygiene
+
+Git hooks live in the tracked `.githooks/` directory (activated by
+`scripts/setup` via `core.hooksPath`). Both hooks chain through to the
+beads-managed hooks in `.beads/hooks/` first, so issue-tracker bookkeeping
+keeps working.
+
+**pre-commit** (fast, <2s, staged files only):
+
+- `zig fmt --check` on staged `.zig`/`.zon` files (vendor/ excluded)
+- `native check` — markup + manifest validation, catches broken `app.zon`
+- blocks merge-conflict markers in staged content
+- blocks any staged file over 500KB — large blobs don't belong in history
+- warns (but allows) newly added `TODO`/`FIXME` lines
+
+**pre-push**: runs `scripts/verify --no-smoke` — full build + tests, no GUI
+windows. If it fails, the push is blocked; don't push a broken build.
+
+**Bypassing in an emergency**: `git commit --no-verify` / `git push
+--no-verify` skip the hooks. Reserve this for genuine emergencies (hotfixing
+a broken hook itself, a WIP branch nobody builds from). Every bypass ships
+work the hooks would have caught to CI — or to a teammate's clone — where it
+costs 100x more to notice. CI runs the same `zig fmt --check` and
+`scripts/verify`, so a bypassed failure will still bounce, just slower.
+
+Editor settings are kept honest by `.editorconfig` (4-space Zig, 2-space
+YAML/JSON/Markdown, LF, final newline) and `.gitattributes` (LF
+normalization).

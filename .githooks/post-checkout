@@ -1,0 +1,7 @@
+#!/bin/sh
+# Passthrough to the beads-managed hook (core.hooksPath points at .githooks;
+# without this shim, moving hooksPath would silently disable beads integration).
+cd "$(git rev-parse --show-toplevel)"
+hook=".beads/hooks/$(basename "$0")"
+if [ -x "$hook" ]; then exec "$hook" "$@"; fi
+exit 0
