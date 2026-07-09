@@ -9,6 +9,8 @@ test {
     _ = @import("core/claude.zig");
     _ = @import("core/codex.zig");
     _ = @import("core/pricing.zig");
+    _ = @import("core/oauth.zig");
+    _ = @import("core/keychain.zig");
 }
 
 const canvas = native_sdk.canvas;

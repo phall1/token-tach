@@ -12,5 +12,15 @@ const std = @import("std");
 const native_sdk = @import("native_sdk");
 
 pub fn build(b: *std.Build) void {
-    native_sdk.addApp(b, b.dependency("native_sdk", .{}), .{ .name = "token-tach" });
+    const artifacts = native_sdk.addAppArtifacts(b, b.dependency("native_sdk", .{}), .{ .name = "token-tach" });
+
+    // src/core/keychain.zig calls Security/CoreFoundation directly; the SDK
+    // links those into the app module but not the test module.
+    if (artifacts.tests.rootModuleTarget().os.tag == .macos) {
+        if (b.sysroot) |sysroot| {
+            artifacts.tests.root_module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }) });
+        }
+        artifacts.tests.root_module.linkFramework("Security", .{});
+        artifacts.tests.root_module.linkFramework("CoreFoundation", .{});
+    }
 }
