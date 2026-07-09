@@ -1,0 +1,53 @@
+#!/bin/zsh
+# token-tach verify harness — the dev loop in one command.
+#   1. native check   — markup/manifest/binding validation (ms)
+#   2. native test    — headless unit + model-contract tests
+#   3. native build   — automation-enabled ReleaseFast binary
+#   4. smoke drive    — launch app, snapshot a11y tree, click a widget,
+#                       assert state changed, screenshot, kill
+# Usage: scripts/verify [--no-smoke]
+set -e
+cd "$(dirname "$0")/.."
+
+echo "==> native check"
+native check
+
+echo "==> native test"
+native test
+
+echo "==> native build (-Dautomation=true)"
+native build -Dautomation=true
+
+if [[ "$1" == "--no-smoke" ]]; then
+  echo "==> smoke skipped"
+  exit 0
+fi
+
+echo "==> smoke drive"
+./zig-out/bin/token-tach >/dev/null 2>&1 &
+APP_PID=$!
+cleanup() { kill $APP_PID 2>/dev/null || true }
+trap cleanup EXIT
+
+# wait for automation socket
+for i in {1..20}; do
+  native automate list >/dev/null 2>&1 && break
+  sleep 0.25
+done
+
+SNAP=$(native automate snapshot 2>/dev/null)
+echo "$SNAP" | grep -q 'window @w1' || { echo "FAIL: no window in snapshot"; exit 1 }
+
+# smoke interaction defined by smoke-spec: click widget, expect text
+# format: <view-label> <button-name> <expect-before> <expect-after>
+SPEC_VIEW="main-canvas"; SPEC_BTN="+"; SPEC_AFTER="count: 1"
+echo "$SNAP" | grep -q "count: 0" || { echo "FAIL: initial state missing"; exit 1 }
+BTN_ID=$(echo "$SNAP" | grep "role=button name=\"$SPEC_BTN\"" | grep -o '#[0-9]*' | head -1 | tr -d '#')
+[[ -n "$BTN_ID" ]] || { echo "FAIL: button '$SPEC_BTN' not found"; exit 1 }
+native automate widget-click "$SPEC_VIEW" "$BTN_ID" >/dev/null
+sleep 0.5
+native automate snapshot 2>/dev/null | grep -q "$SPEC_AFTER" || { echo "FAIL: expected '$SPEC_AFTER' after click"; exit 1 }
+native automate screenshot "$SPEC_VIEW" >/dev/null 2>&1 || true
+
+echo "==> smoke drive: PASS"
+echo "VERIFY: ALL GREEN"

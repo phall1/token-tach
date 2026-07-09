@@ -1,6 +1,11 @@
-
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Native SDK / Zig build artifacts
+.native/
+zig-out/
+.zig-cache/
+screenshot-*.png
