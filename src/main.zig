@@ -69,6 +69,13 @@ fn statusItem(model: *const Model, scratch: *TachApp.StatusItemScratch) TachApp.
     return .{ .title = title, .items = scratch.items[0..4] };
 }
 
+/// Shell commands → display Msgs: the popover-open notification keys
+/// the ignition sweep (the rest of the tray traffic stays unmapped).
+fn onCommand(name: []const u8) ?Msg {
+    if (std.mem.eql(u8, name, "tray.popover_opened")) return .popover_opened;
+    return null;
+}
+
 pub fn initialModel() Model {
     return .{};
 }
@@ -87,6 +94,16 @@ pub fn main(init: std.process.Init) !void {
         .view = view.rootView,
         .tokens = theme.tokens(),
         .animations = view.animations,
+        // Raw display-list chrome around the widget span: gradient
+        // bezels + shaded dial face under the widgets, the machined
+        // needle blade + glass glare over them (real vector paths — the
+        // rotation-true primitive the widget grammar lacks).
+        .chrome = .{
+            .prefix_commands = view.chrome_prefix_commands,
+            .suffix_commands = view.chrome_suffix_commands,
+            .build = view.buildChrome,
+        },
+        .on_command = onCommand,
     });
     defer app_state.destroy();
 
@@ -94,6 +111,7 @@ pub fn main(init: std.process.Init) !void {
         .home = init.environ_map.get("HOME") orelse "",
         .claude_config_dir = init.environ_map.get("CLAUDE_CONFIG_DIR"),
         .codex_home = init.environ_map.get("CODEX_HOME"),
+        .xdg_state_home = init.environ_map.get("XDG_STATE_HOME"),
     }) catch |err| {
         std.log.err("engine setup failed: {s} — running with empty state", .{@errorName(err)});
     };

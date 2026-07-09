@@ -20,6 +20,7 @@ test {
     _ = @import("core/oauth.zig");
     _ = @import("core/keychain.zig");
     _ = @import("core/ledger.zig");
+    _ = @import("core/statefile.zig");
     _ = @import("core/predict.zig");
     _ = @import("core/trayfmt.zig");
     _ = @import("engine.zig");
@@ -218,11 +219,12 @@ test "the needle sweep animation replays the pose delta" {
     defer arena_state.deinit();
     const tree = try buildTree(arena_state.allocator(), &model);
 
-    var out: [96]canvas.CanvasRenderAnimation = undefined;
+    var out: [512]canvas.CanvasRenderAnimation = undefined;
     const count = view.animations(&model, &tree, 1_000, &out);
-    // Every needle part sweeps its shadow + fill command; no redline
-    // pulse at these utilizations.
-    try testing.expectEqual(view.needle_part_total * 2, count);
+    // The three chrome needle commands (blade, edge, tip glow) sweep;
+    // no redline pulse at these utilizations.
+    try testing.expectEqual(view.needle_command_ids.len, count);
+    try testing.expectEqual(view.needle_blade_id, out[0].id);
     try testing.expectEqual(@as(f32, -100), out[0].from_rotation.?);
     try testing.expectEqual(@as(f32, 0), out[0].to_rotation.?);
     try testing.expectEqual(view.gauge_cx, out[0].rotation_center.x);
@@ -231,4 +233,62 @@ test "the needle sweep animation replays the pose delta" {
     // At rest (from == to) the needle declares no animation.
     model.needle_from_deg = model.needle_to_deg;
     try testing.expectEqual(@as(usize, 0), view.animations(&model, &tree, 1_000, &out));
+}
+
+test "the ignition sweep anchors both phases on the journaled key-on time" {
+    var model = instrumentedModel();
+    model.needle_from_deg = model.needle_to_deg; // at rest — ignition still sweeps
+    model.ignition_phase = .up;
+    model.ignition_t0_ms = 5_000;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const tree = try buildTree(arena_state.allocator(), &model);
+
+    var out: [512]canvas.CanvasRenderAnimation = undefined;
+    var count = view.animations(&model, &tree, 999_999, &out);
+    // Needle (3 chrome commands) + every LED's dot+glow shadow/fill
+    // opacity pops (56 x 4).
+    try testing.expectEqual(@as(usize, 3 + 56 * 4), count);
+    const t0_ns: u64 = 5_000 * std.time.ns_per_ms;
+    // Phase up: 0-mark → full scale, anchored at key-on (NOT at the
+    // frame timestamp passed in — idempotent re-declaration).
+    try testing.expectEqual(t0_ns, out[0].start_ns);
+    try testing.expectEqual(@as(f32, -120) - model.needle_to_deg, out[0].from_rotation.?);
+    try testing.expectEqual(@as(f32, 120) - model.needle_to_deg, out[0].to_rotation.?);
+    // The first LED pops in at key-on with the needle at the 0 mark.
+    try testing.expectEqual(t0_ns, out[3].start_ns);
+    try testing.expectEqual(@as(f32, 0), out[3].from_opacity.?);
+    try testing.expectEqual(@as(f32, 1), out[3].to_opacity.?);
+
+    // Phase settle: full scale → truth, anchored at key-on + up phase;
+    // only the overshoot LEDs (above the true pose) fade back out.
+    model.ignition_phase = .settle;
+    count = view.animations(&model, &tree, 999_999, &out);
+    try testing.expect(count >= 3);
+    try testing.expectEqual(t0_ns + @as(u64, engine.ignition_up_ms) * std.time.ns_per_ms, out[0].start_ns);
+    try testing.expectEqual(@as(f32, 120) - model.needle_to_deg, out[0].from_rotation.?);
+    try testing.expectEqual(@as(f32, 0), out[0].to_rotation.?);
+    if (count > 3) {
+        try testing.expectEqual(@as(f32, 1), out[3].from_opacity.?);
+        try testing.expectEqual(@as(f32, 0), out[3].to_opacity.?);
+    }
+}
+
+test "the chrome display list emits exactly its declared command counts" {
+    const model = instrumentedModel();
+    var commands: [64]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try view.buildChrome(&model, &builder, .{ .width = view.window_width, .height = view.window_height }, theme.tokens());
+    try testing.expectEqual(
+        view.chrome_prefix_commands + view.chrome_suffix_commands,
+        builder.displayList().commandCount(),
+    );
+    // The needle blade command exists and is a real path (the
+    // rotation-true primitive), not a rect.
+    var found_blade = false;
+    for (builder.displayList().commands) |command| {
+        if (command == .fill_path and command.fill_path.id == view.needle_blade_id) found_blade = true;
+    }
+    try testing.expect(found_blade);
 }

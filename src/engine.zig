@@ -15,6 +15,7 @@ const claude = @import("core/claude.zig");
 const codex = @import("core/codex.zig");
 const pricing = @import("core/pricing.zig");
 const ledger_mod = @import("core/ledger.zig");
+const statefile = @import("core/statefile.zig");
 const predict = @import("core/predict.zig");
 const oauth = @import("core/oauth.zig");
 const keychain = @import("core/keychain.zig");
@@ -28,6 +29,7 @@ pub const oauth_fetch_key: u64 = 3;
 pub const tz_spawn_key: u64 = 4;
 pub const creds_spawn_key: u64 = 5;
 pub const catchup_timer_key: u64 = 6;
+pub const ignition_timer_key: u64 = 7;
 
 pub const sweep_interval_ms: u32 = 2_000;
 pub const oauth_gate_interval_ms: u32 = 30_000;
@@ -44,6 +46,11 @@ pub const Msg = union(enum) {
     creds_done: native_sdk.EffectExit,
     oauth_response: native_sdk.EffectResponse,
     tz_done: native_sdk.EffectExit,
+    /// Display-only: the tray popover just opened (SDK on_command
+    /// `tray.popover_opened`) — replay the ignition sweep.
+    popover_opened,
+    /// Display-only: an ignition phase boundary (one-shot timer).
+    ignition_tick: native_sdk.EffectTimer,
 };
 
 /// One queued history file awaiting its catch-up parse.
@@ -107,6 +114,13 @@ pub const Model = struct {
     catchup_active: bool = false,
     catchup_started_ms: i64 = 0,
 
+    // Persisted tailer/ledger state (statefile.zig): resolved path (owned),
+    // the ledger event count at the last save (idle ticks skip the write),
+    // and the tick countdown to the next save.
+    state_path: []const u8 = "",
+    state_saved_events: u64 = 0,
+    state_save_countdown: u32 = state_save_ticks,
+
     // Display strings bound by app.native — regenerated each sweep, and
     // pointing into the fixed buffers below (never into stack copies).
     glance_text: []const u8 = "",
@@ -132,7 +146,23 @@ pub const Model = struct {
     gauge_peak_tpm: f64 = 0,
     needle_from_deg: f32 = -half_sweep_deg,
     needle_to_deg: f32 = -half_sweep_deg,
+
+    // Ignition sweep (pure display): the key-on needle theatre — 0 →
+    // full scale → settle onto truth — runs at boot and on every
+    // popover open. The phase machine is stepped by one-shot timers;
+    // `ignition_t0_ms` anchors the render animations on the wall
+    // clock so mid-sweep rebuilds replay idempotently instead of
+    // restarting the sweep.
+    ignition_phase: IgnitionPhase = .off,
+    ignition_t0_ms: i64 = 0,
 };
+
+pub const IgnitionPhase = enum { off, up, settle };
+
+/// Ignition tempo: needle 0 → full scale, a beat at the top, then a
+/// settle onto the true reading (~1.3 s total — a car key turn).
+pub const ignition_up_ms: u32 = 700;
+pub const ignition_settle_ms: u32 = 620;
 
 /// The tach sweeps ±120° around 12 o'clock (a classic 240° dial).
 pub const half_sweep_deg: f32 = 120;
@@ -213,7 +243,11 @@ pub const Env = struct {
     home: []const u8 = "",
     claude_config_dir: ?[]const u8 = null,
     codex_home: ?[]const u8 = null,
+    xdg_state_home: ?[]const u8 = null,
 };
+
+/// Persist tailer+ledger state every N sweep ticks (N × 2 s ≈ 60 s).
+pub const state_save_ticks: u32 = 30;
 
 /// Build the engine state: config, roots, tailers, pricing. Called once
 /// on the heap-allocated model before the runtime starts.
@@ -248,6 +282,33 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
     model.codex_tailer = codex.Tailer.init(allocator);
     model.prices = try pricing.Db.init(allocator);
     model.ledger = ledger_mod.Ledger.init(allocator, 0);
+
+    // Warm launch: restore tailer offsets + ledger rollups so history is
+    // never re-parsed. Any doubt about the file -> pristine full catch-up.
+    model.state_path = statefile.defaultPath(allocator, env.xdg_state_home, home) catch "";
+    if (model.state_path.len > 0) {
+        const outcome = statefile.restore(
+            allocator,
+            io,
+            model.state_path,
+            &model.claude_tailer,
+            &model.codex_tailer,
+            &model.ledger,
+        ) catch .invalid; // OOM: hydration may be partial — reset below.
+        switch (outcome) {
+            .restored => model.state_saved_events = model.ledger.all.events,
+            .absent => {},
+            .invalid => {
+                model.claude_tailer.deinit();
+                model.codex_tailer.deinit();
+                model.ledger.deinit();
+                model.claude_tailer = claude.Tailer.init(allocator);
+                model.codex_tailer = codex.Tailer.init(allocator);
+                model.ledger = ledger_mod.Ledger.init(allocator, 0);
+                std.log.warn("state file invalid — falling back to full catch-up", .{});
+            },
+        }
+    }
     model.ready = true;
 }
 
@@ -343,6 +404,21 @@ pub fn boot(model: *Model, fx: *Effects) void {
         .on_exit = Effects.exitMsg(.tz_done),
     });
     refreshDisplay(model);
+    startIgnition(model, fx);
+}
+
+/// Key-on: arm the ignition sweep (display-only) and the one-shot
+/// timer that steps it to the settle phase. Restartable — reopening
+/// the popover mid-sweep re-anchors the whole sequence.
+fn startIgnition(model: *Model, fx: *Effects) void {
+    model.ignition_phase = .up;
+    model.ignition_t0_ms = model.now_ms;
+    fx.startTimer(.{
+        .key = ignition_timer_key,
+        .interval_ms = ignition_up_ms,
+        .mode = .one_shot,
+        .on_fire = Effects.timerMsg(.ignition_tick),
+    });
 }
 
 /// Enumerate history for `only` (a subset of the enabled sources) and,
@@ -399,6 +475,16 @@ fn enumerateHistory(model: *Model, only: config.Sources) !void {
                     model.allocator.free(path);
                     continue;
                 };
+                // Warm launch: a file whose restored offset already sits at
+                // EOF has nothing to say — keep it out of the queue.
+                const known: ?u64 = switch (group.agent) {
+                    .claude => model.claude_tailer.offsetFor(path),
+                    .codex => model.codex_tailer.offsetFor(path),
+                };
+                if (known != null and known.? == stat.size) {
+                    model.allocator.free(path);
+                    continue;
+                }
                 try queue.append(model.allocator, .{ .agent = group.agent, .path = path, .size = stat.size });
             }
         }
@@ -458,8 +544,31 @@ fn processCatchupChunk(model: *Model, fx: *Effects) void {
         model.catchup_next = 0;
         // Limits + a full display pass now that the ledger is complete.
         sweepOnce(model);
+        saveStateNow(model);
     }
     refreshDisplay(model);
+}
+
+/// Save every `state_save_ticks` sweeps, only if the ledger moved.
+fn maybeSaveState(model: *Model) void {
+    if (model.state_save_countdown > 1) {
+        model.state_save_countdown -= 1;
+        return;
+    }
+    model.state_save_countdown = state_save_ticks;
+    if (model.ledger.all.events == model.state_saved_events) return;
+    saveStateNow(model);
+}
+
+fn saveStateNow(model: *Model) void {
+    if (model.state_path.len == 0) return;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    statefile.save(model.allocator, io, model.state_path, &model.claude_tailer, &model.codex_tailer, &model.ledger) catch |err| {
+        std.log.warn("state save failed: {s}", .{@errorName(err)});
+        return;
+    };
+    model.state_saved_events = model.ledger.all.events;
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -482,6 +591,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 sweepOnce(model);
                 const sweep_us = (native_sdk.monotonicNanoseconds() - sweep_start_ns) / std.time.ns_per_us;
                 std.log.debug("sweep: {d} us", .{sweep_us});
+                maybeSaveState(model);
             }
             // First OAuth poll shouldn't wait for the 30 s gate.
             if (!model.first_sweep_done) maybeOauthPoll(model, fx);
@@ -512,6 +622,25 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 }
             }
         },
+        .popover_opened => {
+            model.now_ms = fx.wallMs();
+            startIgnition(model, fx);
+        },
+        .ignition_tick => {
+            model.now_ms = fx.wallMs();
+            switch (model.ignition_phase) {
+                .up => {
+                    model.ignition_phase = .settle;
+                    fx.startTimer(.{
+                        .key = ignition_timer_key,
+                        .interval_ms = ignition_settle_ms,
+                        .mode = .one_shot,
+                        .on_fire = Effects.timerMsg(.ignition_tick),
+                    });
+                },
+                .settle, .off => model.ignition_phase = .off,
+            }
+        },
     }
 }
 
@@ -540,8 +669,9 @@ fn sweepOnce(model: *Model) void {
     if (model.cfg.sources.claude) {
         var sink = claude.ListSink.init(model.allocator);
         defer sink.deinit();
-        model.claude_tailer.sweep(arena, io, model.claude_roots, sink.sink()) catch |err| {
+        _ = model.claude_tailer.sweepIncremental(arena, io, model.claude_roots, sink.sink(), model.now_ms) catch |err| blk: {
             std.log.warn("claude sweep failed: {s}", .{@errorName(err)});
+            break :blk false;
         };
         for (sink.events.items) |ev| ingest(model, ev);
     }
@@ -549,14 +679,20 @@ fn sweepOnce(model: *Model) void {
     if (model.cfg.sources.codex) {
         var events: std.ArrayList(types.UsageEvent) = .empty;
         defer events.deinit(arena);
-        model.codex_tailer.sweep(io, arena, model.codex_roots, &events) catch |err| {
+        _ = model.codex_tailer.sweepIncremental(io, arena, model.codex_roots, &events, model.now_ms) catch |err| blk: {
             std.log.warn("codex sweep failed: {s}", .{@errorName(err)});
+            break :blk false;
         };
         for (events.items) |ev| ingest(model, ev);
 
-        if (codex.latestLimits(arena, io, model.codex_roots) catch null) |snap| {
-            model.walls.observe(snap);
-            storeLimits(model, &model.codex_limits, snap);
+        // Limits ride the tailer now (captured off token_count lines during
+        // parse, restored from the state file) — no per-tick file re-reads.
+        if (model.codex_tailer.lastLimits()) |snap| {
+            const newer = if (model.codex_limits) |cur| snap.read_at_ms > cur.read_at_ms else true;
+            if (newer) {
+                model.walls.observe(snap);
+                storeLimits(model, &model.codex_limits, snap);
+            }
         }
     }
 

@@ -58,6 +58,22 @@ pub const dial_edge = Color.rgba8(110, 235, 180, 26);
 pub const hub = Color.rgb8(17, 24, 27);
 pub const hub_ring = Color.rgba8(255, 255, 255, 40);
 
+// Chrome-layer machining: gradients and glass for the hand-built
+// display-list commands (panel washes, dial shading, needle metal).
+pub const transparent = Color.rgba8(0, 0, 0, 0);
+pub const bezel_top = Color.rgb8(16, 22, 26);
+pub const bezel_bottom = Color.rgb8(9, 13, 16);
+pub const dial_top = Color.rgb8(12, 17, 20);
+pub const dial_bottom = Color.rgb8(4, 7, 9);
+pub const dial_vignette = Color.rgba8(0, 0, 0, 96);
+pub const bezel_ring = Color.rgba8(255, 255, 255, 26);
+pub const glass_glare = Color.rgba8(255, 255, 255, 17);
+pub const needle_edge = Color.rgb8(255, 170, 126);
+pub const hub_top = Color.rgb8(46, 58, 65);
+pub const hub_bottom = Color.rgb8(10, 14, 17);
+pub const cell_shadow = Color.rgba8(0, 0, 0, 150);
+pub const cell_glint = Color.rgba8(255, 255, 255, 12);
+
 pub const green = cluster_colors.accent;
 pub const amber = cluster_colors.warning;
 pub const red = cluster_colors.destructive;
@@ -69,7 +85,7 @@ pub const red_halo = Color.rgba8(255, 73, 89, 38);
 
 pub const needle = Color.rgb8(255, 110, 64);
 pub const needle_glow = Color.rgba8(255, 110, 64, 72);
-pub const needle_halo = Color.rgba8(255, 110, 64, 26);
+pub const needle_halo = Color.rgba8(255, 110, 64, 34);
 
 pub const track = Color.rgb8(22, 30, 34);
 pub const cell = Color.rgb8(4, 7, 8);
