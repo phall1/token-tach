@@ -368,6 +368,13 @@ fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
 // Tailer
 // ---------------------------------------------------------------------------
 
+/// How long the incremental sweep may go without a full tree re-walk.
+/// The safety net for changes invisible to dir mtimes + the hot list
+/// (e.g. an old, cold transcript growing again).
+pub const full_walk_interval_ms: i64 = 30_000;
+/// How many recently-modified files the incremental sweep stats every tick.
+pub const hot_files_max = 8;
+
 /// Incremental NDJSON tailer with per-file byte offsets, per-file partial-line
 /// carry buffers, and a global message dedup set.
 ///
@@ -379,10 +386,31 @@ pub const Tailer = struct {
     allocator: std.mem.Allocator,
     files: std.StringHashMapUnmanaged(FileState) = .empty,
     seen: std.StringHashMapUnmanaged(void) = .empty,
+    inc: Incremental = .{},
 
     const FileState = struct {
         offset: u64 = 0,
         carry: std.ArrayList(u8) = .empty,
+    };
+
+    /// Change-detection state for `sweepIncremental`: every directory in the
+    /// tree with its mtime (a dir's mtime moves when files are added/removed
+    /// in it — NOT when a file inside grows), plus the `hot_files_max` most
+    /// recently modified files, which are the ones that actually grow.
+    const Incremental = struct {
+        dir_mtimes: std.StringHashMapUnmanaged(i96) = .empty,
+        hot: std.ArrayList(HotFile) = .empty,
+        last_full_walk_ms: ?i64 = null,
+
+        const HotFile = struct { path: []u8, mtime_ns: i96 };
+
+        fn deinit(self: *Incremental, gpa: std.mem.Allocator) void {
+            var it = self.dir_mtimes.keyIterator();
+            while (it.next()) |key| gpa.free(key.*);
+            self.dir_mtimes.deinit(gpa);
+            for (self.hot.items) |h| gpa.free(h.path);
+            self.hot.deinit(gpa);
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator) Tailer {
@@ -399,7 +427,34 @@ pub const Tailer = struct {
         var kit = self.seen.keyIterator();
         while (kit.next()) |key| self.allocator.free(key.*);
         self.seen.deinit(self.allocator);
+        self.inc.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// The stored byte offset for `path`, or null if the tailer has never
+    /// touched it. `offset == file size` means fully caught up.
+    pub fn offsetFor(self: *const Tailer, path: []const u8) ?u64 {
+        const state = self.files.get(path) orelse return null;
+        return state.offset;
+    }
+
+    /// Statefile restore: mark `path` as already parsed up to `offset`.
+    /// Any carry is cleared — persisted offsets always sit on a line
+    /// boundary (the saver subtracts the carry length).
+    pub fn restoreFile(self: *Tailer, path: []const u8, offset: u64) !void {
+        const state = try self.fileState(path);
+        state.offset = offset;
+        state.carry.clearAndFree(self.allocator);
+    }
+
+    /// Statefile restore: re-insert one persisted dedup key.
+    pub fn restoreSeen(self: *Tailer, key: []const u8) !void {
+        const gop = try self.seen.getOrPut(self.allocator, key);
+        if (gop.found_existing) return;
+        gop.key_ptr.* = self.allocator.dupe(u8, key) catch |err| {
+            self.seen.removeByPtr(gop.key_ptr);
+            return err;
+        };
     }
 
     /// Feed a raw byte chunk belonging to `file_key` (any stable identifier;
@@ -497,6 +552,118 @@ pub const Tailer = struct {
         }
     }
 
+    /// Cheap steady-state sweep. Instead of re-walking + re-opening the
+    /// whole tree every tick, it:
+    ///
+    /// 1. Full-walks (stat every file, scan grown ones, record every dir
+    ///    mtime + the hottest files) on the first call, whenever any known
+    ///    directory's mtime moved (= files added/removed anywhere), and at
+    ///    least every `full_walk_interval_ms` as a safety net.
+    /// 2. Otherwise stats only the known directories plus the
+    ///    `hot_files_max` most recently modified files, scanning the ones
+    ///    that grew — the active-transcript path, a handful of stats total.
+    ///
+    /// Worst-case detection latency for a change neither pass can see (a
+    /// cold, not-hot file growing without any dir change) is one full-walk
+    /// interval. Returns true when any new bytes were parsed.
+    pub fn sweepIncremental(
+        self: *Tailer,
+        scratch: std.mem.Allocator,
+        io: std.Io,
+        roots: []const []const u8,
+        sink: EventSink,
+        now_ms: i64,
+    ) !bool {
+        const due = if (self.inc.last_full_walk_ms) |last|
+            now_ms - last >= full_walk_interval_ms
+        else
+            true;
+        if (due or self.dirsChanged(io)) return self.fullWalk(scratch, io, roots, sink, now_ms);
+        return self.hotPass(scratch, io, sink);
+    }
+
+    /// Did any known directory's mtime move since the last full walk?
+    /// A vanished directory also counts as changed.
+    fn dirsChanged(self: *Tailer, io: std.Io) bool {
+        var cwd = std.Io.Dir.cwd();
+        var it = self.inc.dir_mtimes.iterator();
+        while (it.next()) |entry| {
+            const stat = cwd.statFile(io, entry.key_ptr.*, .{}) catch return true;
+            if (stat.mtime.nanoseconds != entry.value_ptr.*) return true;
+        }
+        return false;
+    }
+
+    /// Stat only the hot files; scan the ones whose size left the stored
+    /// offset. Unreadable files are skipped (sweeps race live writers).
+    fn hotPass(self: *Tailer, scratch: std.mem.Allocator, io: std.Io, sink: EventSink) !bool {
+        var changed = false;
+        var cwd = std.Io.Dir.cwd();
+        for (self.inc.hot.items) |*h| {
+            const stat = cwd.statFile(io, h.path, .{}) catch continue;
+            const known = self.offsetFor(h.path) orelse 0;
+            if (stat.size == known) continue;
+            self.scanFile(scratch, io, h.path, sink) catch continue;
+            h.mtime_ns = stat.mtime.nanoseconds;
+            changed = true;
+        }
+        return changed;
+    }
+
+    /// Walk everything: stat each *.jsonl (3× cheaper than the open +
+    /// length + close of an unconditional scanFile), scan the changed
+    /// ones, and rebuild the dir-mtime map + hot list for the fast path.
+    fn fullWalk(
+        self: *Tailer,
+        scratch: std.mem.Allocator,
+        io: std.Io,
+        roots: []const []const u8,
+        sink: EventSink,
+        now_ms: i64,
+    ) !bool {
+        var next: Incremental = .{ .last_full_walk_ms = now_ms };
+        errdefer next.deinit(self.allocator);
+        var changed = false;
+
+        var cwd = std.Io.Dir.cwd();
+        for (roots) |root| {
+            if (cwd.statFile(io, root, .{})) |stat| {
+                try putDirMtime(self.allocator, &next.dir_mtimes, root, stat.mtime.nanoseconds);
+            } else |_| continue;
+            var dir = cwd.openDir(io, root, .{ .iterate = true }) catch continue;
+            defer dir.close(io);
+            var walker = try dir.walk(scratch);
+            defer walker.deinit();
+            while (true) {
+                const entry = (walker.next(io) catch break) orelse break;
+                switch (entry.kind) {
+                    .directory => {
+                        const stat = dir.statFile(io, entry.path, .{}) catch continue;
+                        const path = try std.fs.path.join(scratch, &.{ root, entry.path });
+                        defer scratch.free(path);
+                        try putDirMtime(self.allocator, &next.dir_mtimes, path, stat.mtime.nanoseconds);
+                    },
+                    .file => {
+                        if (!std.mem.endsWith(u8, entry.path, ".jsonl")) continue;
+                        const stat = dir.statFile(io, entry.path, .{}) catch continue;
+                        const path = try std.fs.path.join(scratch, &.{ root, entry.path });
+                        defer scratch.free(path);
+                        if (stat.size != (self.offsetFor(path) orelse 0)) {
+                            self.scanFile(scratch, io, path, sink) catch {};
+                            changed = true;
+                        }
+                        try insertHot(self.allocator, &next.hot, path, stat.mtime.nanoseconds);
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        self.inc.deinit(self.allocator);
+        self.inc = next;
+        return changed;
+    }
+
     fn fileState(self: *Tailer, file_key: []const u8) !*FileState {
         if (self.files.getPtr(file_key)) |state| return state;
         const owned = try self.allocator.dupe(u8, file_key);
@@ -543,6 +710,49 @@ pub const Tailer = struct {
         };
     }
 };
+
+/// Insert (path duped) into a map of owned dir paths → mtime.
+fn putDirMtime(
+    gpa: std.mem.Allocator,
+    map: *std.StringHashMapUnmanaged(i96),
+    path: []const u8,
+    mtime_ns: i96,
+) !void {
+    const gop = try map.getOrPut(gpa, path);
+    if (gop.found_existing) {
+        gop.value_ptr.* = mtime_ns;
+        return;
+    }
+    gop.key_ptr.* = gpa.dupe(u8, path) catch |err| {
+        map.removeByPtr(gop.key_ptr);
+        return err;
+    };
+    gop.value_ptr.* = mtime_ns;
+}
+
+/// Keep a small list of the most recently modified files, newest first.
+fn insertHot(
+    gpa: std.mem.Allocator,
+    hot: *std.ArrayList(Tailer.Incremental.HotFile),
+    path: []const u8,
+    mtime_ns: i96,
+) !void {
+    var at: usize = hot.items.len;
+    for (hot.items, 0..) |h, i| {
+        if (mtime_ns > h.mtime_ns) {
+            at = i;
+            break;
+        }
+    }
+    if (at >= hot_files_max) return;
+    const owned = try gpa.dupe(u8, path);
+    errdefer gpa.free(owned);
+    try hot.insert(gpa, at, .{ .path = owned, .mtime_ns = mtime_ns });
+    if (hot.items.len > hot_files_max) {
+        const evicted = hot.pop().?;
+        gpa.free(evicted.path);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -882,3 +1092,87 @@ test "sweep finds nested jsonl files and scanFile resumes at the stored offset" 
     try tailer.sweep(testing.allocator, io, &roots, sink.sink());
     try testing.expectEqual(@as(usize, 11), sink.events.items.len);
 }
+
+test "sweepIncremental: hot appends, dir changes, and the full-walk safety net" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const slug_dir = "projects/-home-dev-example-project";
+    const session_rel = slug_dir ++ "/" ++ fixture_session_id ++ ".jsonl";
+    try tmp.dir.createDirPath(io, slug_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = session_rel, .data = session1_fixture });
+
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "{s}/projects", .{base});
+    const roots = [_][]const u8{root};
+
+    var tailer = Tailer.init(testing.allocator);
+    defer tailer.deinit();
+    var sink = ListSink.init(testing.allocator);
+    defer sink.deinit();
+
+    var now: i64 = 1_000_000;
+    // First call always full-walks and parses history.
+    try testing.expect(try tailer.sweepIncremental(testing.allocator, io, &roots, sink.sink(), now));
+    try testing.expectEqual(@as(usize, 8), sink.events.items.len);
+    try testing.expectEqual(@as(usize, 1), tailer.inc.hot.items.len);
+    try testing.expect(tailer.inc.dir_mtimes.count() >= 2); // root + slug dir
+
+    // Quiet fast tick: nothing changed, nothing read.
+    now += sweep_test_tick_ms;
+    try testing.expect(!try tailer.sweepIncremental(testing.allocator, io, &roots, sink.sink(), now));
+    try testing.expectEqual(@as(usize, 8), sink.events.items.len);
+
+    // Append to the (hot) active transcript: caught on the next fast tick.
+    const appended =
+        "{\"type\":\"assistant\",\"timestamp\":\"2026-07-08T03:05:00.000Z\"," ++
+        "\"requestId\":\"req_inc0000000000000000001\",\"sessionId\":\"" ++ fixture_session_id ++ "\"," ++
+        "\"message\":{\"model\":\"claude-fable-5\",\"id\":\"msg_inc0000000000000000001\"," ++
+        "\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"cache_creation_input_tokens\":0," ++
+        "\"cache_read_input_tokens\":0}}}\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = session_rel, .data = session1_fixture ++ appended });
+    now += sweep_test_tick_ms;
+    try testing.expect(try tailer.sweepIncremental(testing.allocator, io, &roots, sink.sink(), now));
+    try testing.expectEqual(@as(usize, 9), sink.events.items.len);
+    try testing.expectEqual(@as(u64, 10), sink.events.items[8].input_tokens);
+
+    // A NEW file (subagent) changes its parent dirs' mtimes → full walk
+    // this tick picks it up: +2 events (2 of its 4 lines are re-logs).
+    try tmp.dir.createDirPath(io, slug_dir ++ "/" ++ fixture_session_id ++ "/subagents");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = slug_dir ++ "/" ++ fixture_session_id ++ "/subagents/agent-sub1.jsonl",
+        .data = sub1_fixture,
+    });
+    now += sweep_test_tick_ms;
+    try testing.expect(try tailer.sweepIncremental(testing.allocator, io, &roots, sink.sink(), now));
+    try testing.expectEqual(@as(usize, 11), sink.events.items.len);
+
+    // A grown file that is neither hot nor announced by any dir change is
+    // invisible to fast ticks — that's the documented trade — but the
+    // periodic full walk catches it.
+    for (tailer.inc.hot.items) |h| testing.allocator.free(h.path);
+    tailer.inc.hot.clearRetainingCapacity(); // simulate "cold file"
+    const appended2 =
+        "{\"type\":\"assistant\",\"timestamp\":\"2026-07-08T03:06:00.000Z\"," ++
+        "\"requestId\":\"req_inc0000000000000000002\",\"sessionId\":\"" ++ fixture_session_id ++ "\"," ++
+        "\"message\":{\"model\":\"claude-fable-5\",\"id\":\"msg_inc0000000000000000002\"," ++
+        "\"usage\":{\"input_tokens\":20,\"output_tokens\":2,\"cache_creation_input_tokens\":0," ++
+        "\"cache_read_input_tokens\":0}}}\n";
+    try tmp.dir.writeFile(io, .{
+        .sub_path = session_rel,
+        .data = session1_fixture ++ appended ++ appended2,
+    });
+    now += sweep_test_tick_ms;
+    try testing.expect(!try tailer.sweepIncremental(testing.allocator, io, &roots, sink.sink(), now));
+    try testing.expectEqual(@as(usize, 11), sink.events.items.len);
+    now += full_walk_interval_ms;
+    try testing.expect(try tailer.sweepIncremental(testing.allocator, io, &roots, sink.sink(), now));
+    try testing.expectEqual(@as(usize, 12), sink.events.items.len);
+    try testing.expectEqual(@as(u64, 20), sink.events.items[11].input_tokens);
+}
+
+/// A 2 s engine tick, well under `full_walk_interval_ms`.
+const sweep_test_tick_ms: i64 = 2_000;

@@ -102,7 +102,13 @@ pub fn freeLimitSnapshot(allocator: Allocator, snap: types.LimitSnapshot) void {
 // ---------------------------------------------------------------------------
 
 /// Cumulative token counters as logged in `total_token_usage`.
-const Cum = struct { input: u64 = 0, cached: u64 = 0, output: u64 = 0 };
+/// Pub so statefile.zig can persist/restore per-file baselines.
+pub const Cum = struct { input: u64 = 0, cached: u64 = 0, output: u64 = 0 };
+
+/// How long the incremental sweep may go without a full tree re-walk.
+pub const full_walk_interval_ms: i64 = 30_000;
+/// How many recently-modified rollouts the incremental sweep stats per tick.
+pub const hot_files_max = 8;
 
 /// Incremental rollout tailer. Per file it keeps the byte offset, a
 /// partial-line carry buffer, the last-seen cumulative totals (per-turn =
@@ -111,6 +117,37 @@ const Cum = struct { input: u64 = 0, cached: u64 = 0, output: u64 = 0 };
 pub const Tailer = struct {
     allocator: Allocator,
     files: std.StringHashMapUnmanaged(FileState) = .empty,
+    inc: Incremental = .{},
+    /// Freshest rate_limits reading seen while parsing token_count lines
+    /// (plan owned by the tailer allocator). Kept current by feed/poll/
+    /// sweep so the caller never has to re-read rollout files for limits.
+    limits: ?Limits = null,
+
+    pub const Limits = struct {
+        read_at_ms: i64,
+        plan: []const u8 = "",
+        windows: [2]types.LimitWindow = undefined,
+        window_count: u8 = 0,
+    };
+
+    /// Change-detection state for `sweepIncremental` (see claude.zig's
+    /// twin for the full rationale: dir mtimes catch adds/removals, the
+    /// hot list catches appends, a periodic full walk catches the rest).
+    const Incremental = struct {
+        dir_mtimes: std.StringHashMapUnmanaged(i96) = .empty,
+        hot: std.ArrayList(HotFile) = .empty,
+        last_full_walk_ms: ?i64 = null,
+
+        const HotFile = struct { path: []u8, mtime_ns: i96 };
+
+        fn deinit(self: *Incremental, gpa: Allocator) void {
+            var it = self.dir_mtimes.keyIterator();
+            while (it.next()) |key| gpa.free(key.*);
+            self.dir_mtimes.deinit(gpa);
+            for (self.hot.items) |h| gpa.free(h.path);
+            self.hot.deinit(gpa);
+        }
+    };
 
     const FileState = struct {
         offset: u64 = 0,
@@ -141,7 +178,75 @@ pub const Tailer = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.files.deinit(self.allocator);
+        self.inc.deinit(self.allocator);
+        if (self.limits) |l| {
+            if (l.plan.len > 0) self.allocator.free(l.plan);
+        }
         self.* = undefined;
+    }
+
+    /// The stored byte offset for `path`, or null if never touched.
+    /// `offset == file size` means fully caught up.
+    pub fn offsetFor(self: *const Tailer, path: []const u8) ?u64 {
+        const state = self.files.get(path) orelse return null;
+        return state.offset;
+    }
+
+    /// Borrow the freshest limits reading as a snapshot. The plan string
+    /// and windows point into tailer-owned memory — copy before the next
+    /// feed/poll/sweep/restore if you need them to survive.
+    pub fn lastLimits(self: *const Tailer) ?types.LimitSnapshot {
+        if (self.limits) |*l| {
+            return .{
+                .agent = .codex,
+                .read_at_ms = l.read_at_ms,
+                .plan = l.plan,
+                .windows = l.windows[0..l.window_count],
+            };
+        }
+        return null;
+    }
+
+    /// Statefile restore: everything the diffing logic needs to continue
+    /// a file mid-stream — parse offset (always on a line boundary), the
+    /// last cumulative totals, and the session attribution strings.
+    pub const RestoredFile = struct {
+        offset: u64,
+        baseline: ?Cum = null,
+        session_id: []const u8 = "",
+        cwd: []const u8 = "",
+        model: []const u8 = "",
+    };
+
+    pub fn restoreFile(self: *Tailer, path: []const u8, restored: RestoredFile) !void {
+        const state = try self.stateFor(path);
+        state.offset = restored.offset;
+        state.carry.clearAndFree(self.allocator);
+        state.baseline = restored.baseline;
+        if (restored.session_id.len > 0) try setOwned(self.allocator, &state.session_id, restored.session_id);
+        if (restored.cwd.len > 0) try setOwned(self.allocator, &state.cwd, restored.cwd);
+        if (restored.model.len > 0) try setOwned(self.allocator, &state.model, restored.model);
+    }
+
+    /// Statefile restore: re-seed the freshest limits reading. Ignored when
+    /// `windows` is empty or the tailer already holds a newer reading.
+    pub fn restoreLimits(
+        self: *Tailer,
+        read_at_ms: i64,
+        plan: []const u8,
+        windows: []const types.LimitWindow,
+    ) !void {
+        if (windows.len == 0 or windows.len > 2) return;
+        if (self.limits) |l| {
+            if (l.read_at_ms > read_at_ms) return;
+        }
+        var next = Limits{ .read_at_ms = read_at_ms, .window_count = @intCast(windows.len) };
+        @memcpy(next.windows[0..windows.len], windows);
+        if (plan.len > 0) next.plan = try self.allocator.dupe(u8, plan);
+        if (self.limits) |l| {
+            if (l.plan.len > 0) self.allocator.free(l.plan);
+        }
+        self.limits = next;
     }
 
     fn stateFor(self: *Tailer, path: []const u8) !*FileState {
@@ -223,6 +328,121 @@ pub const Tailer = struct {
         try self.feed(event_allocator, path, data, out);
     }
 
+    /// Remember the freshest rate_limits reading (newest timestamp wins).
+    fn captureLimits(self: *Tailer, limits_value: std.json.Value, ts_ms: i64) Allocator.Error!void {
+        if (self.limits) |prev| {
+            if (ts_ms < prev.read_at_ms) return;
+        }
+        var next = Limits{ .read_at_ms = ts_ms };
+        if (limitWindow(limits_value, "primary", .five_hour)) |w| {
+            next.windows[next.window_count] = w;
+            next.window_count += 1;
+        }
+        if (limitWindow(limits_value, "secondary", .weekly)) |w| {
+            next.windows[next.window_count] = w;
+            next.window_count += 1;
+        }
+        if (next.window_count == 0) return;
+        // Keep ownership of the previous plan string when the newer line
+        // lacks one (same defensive stance as latestLimits).
+        next.plan = if (self.limits) |prev| prev.plan else "";
+        if (getString(limits_value, "plan_type")) |plan| {
+            const dup = try self.allocator.dupe(u8, plan);
+            if (next.plan.len > 0) self.allocator.free(next.plan);
+            next.plan = dup;
+        }
+        self.limits = next;
+    }
+
+    /// Cheap steady-state sweep — the codex twin of claude.zig's
+    /// `sweepIncremental` (same three-tier strategy: dir mtimes, hot
+    /// files, periodic full walk; see that doc comment). Full walks poll
+    /// changed rollouts in chronological order, matching `sweep`.
+    /// Returns true when any new bytes were parsed.
+    pub fn sweepIncremental(
+        self: *Tailer,
+        io: std.Io,
+        event_allocator: Allocator,
+        sessions_roots: []const []const u8,
+        out: *std.ArrayList(types.UsageEvent),
+        now_ms: i64,
+    ) Allocator.Error!bool {
+        const due = if (self.inc.last_full_walk_ms) |last|
+            now_ms - last >= full_walk_interval_ms
+        else
+            true;
+        if (due or self.dirsChanged(io)) return self.fullWalk(io, event_allocator, sessions_roots, out, now_ms);
+        return self.hotPass(io, event_allocator, out);
+    }
+
+    fn dirsChanged(self: *Tailer, io: std.Io) bool {
+        var cwd = std.Io.Dir.cwd();
+        var it = self.inc.dir_mtimes.iterator();
+        while (it.next()) |entry| {
+            const stat = cwd.statFile(io, entry.key_ptr.*, .{}) catch return true;
+            if (stat.mtime.nanoseconds != entry.value_ptr.*) return true;
+        }
+        return false;
+    }
+
+    fn hotPass(
+        self: *Tailer,
+        io: std.Io,
+        event_allocator: Allocator,
+        out: *std.ArrayList(types.UsageEvent),
+    ) Allocator.Error!bool {
+        var changed = false;
+        var cwd = std.Io.Dir.cwd();
+        for (self.inc.hot.items) |*h| {
+            const stat = cwd.statFile(io, h.path, .{}) catch continue;
+            const known = self.offsetFor(h.path) orelse 0;
+            if (stat.size == known) continue;
+            try self.poll(io, event_allocator, h.path, out);
+            h.mtime_ns = stat.mtime.nanoseconds;
+            changed = true;
+        }
+        return changed;
+    }
+
+    fn fullWalk(
+        self: *Tailer,
+        io: std.Io,
+        event_allocator: Allocator,
+        sessions_roots: []const []const u8,
+        out: *std.ArrayList(types.UsageEvent),
+        now_ms: i64,
+    ) Allocator.Error!bool {
+        var next: Incremental = .{ .last_full_walk_ms = now_ms };
+        errdefer next.deinit(self.allocator);
+
+        var entries: std.ArrayList(StatPathEntry) = .empty;
+        defer freeStatPathEntries(self.allocator, &entries);
+        var cwd = std.Io.Dir.cwd();
+        for (sessions_roots) |root| {
+            if (cwd.statFile(io, root, .{})) |stat| {
+                try putDirMtime(self.allocator, &next.dir_mtimes, root, stat.mtime.nanoseconds);
+            } else |_| continue;
+            collectRolloutsStat(self.allocator, io, root, &entries, &next.dir_mtimes) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+        }
+        std.mem.sort(StatPathEntry, entries.items, {}, StatPathEntry.lessThan);
+
+        var changed = false;
+        for (entries.items) |entry| {
+            if (entry.size != (self.offsetFor(entry.abs) orelse 0)) {
+                try self.poll(io, event_allocator, entry.abs, out);
+                changed = true;
+            }
+            try insertHot(self.allocator, &next.hot, entry.abs, entry.mtime_ns);
+        }
+
+        self.inc.deinit(self.allocator);
+        self.inc = next;
+        return changed;
+    }
+
     /// Scan every rollout file under the given sessions roots (in
     /// chronological YYYY/MM/DD + filename order) and poll each one,
     /// appending new events to `out`. Missing roots are skipped.
@@ -284,13 +504,18 @@ pub const Tailer = struct {
         const payload_type = getString(payload, "type") orelse return;
         if (!std.mem.eql(u8, payload_type, "token_count")) return;
 
+        const ts_str = getString(root, "timestamp") orelse return;
+        const ts_ms = parseIso8601Ms(ts_str) orelse return;
+
+        // Every token_count line embeds the account's current rate_limits;
+        // capture them here so limits never require a separate file read.
+        if (payload.object.get("rate_limits")) |rl| try self.captureLimits(rl, ts_ms);
+
         const info = getObject(payload, "info") orelse return;
         const usage = getObject(info, "total_token_usage") orelse return;
         const input = getU64(usage, "input_tokens") orelse return;
         const output = getU64(usage, "output_tokens") orelse return;
         const cached = getU64(usage, "cached_input_tokens") orelse 0;
-        const ts_str = getString(root, "timestamp") orelse return;
-        const ts_ms = parseIso8601Ms(ts_str) orelse return;
 
         const cum = Cum{ .input = input, .cached = cached, .output = output };
         const base: Cum = if (state.baseline) |b|
@@ -487,6 +712,110 @@ fn freePathEntries(allocator: Allocator, entries: *std.ArrayList(PathEntry)) voi
         allocator.free(entry.abs);
     }
     entries.deinit(allocator);
+}
+
+/// A rollout path plus the stat facts the incremental sweep needs.
+const StatPathEntry = struct {
+    rel: []u8,
+    abs: []u8,
+    size: u64,
+    mtime_ns: i96,
+
+    fn lessThan(_: void, a: StatPathEntry, b: StatPathEntry) bool {
+        return std.mem.order(u8, a.rel, b.rel) == .lt;
+    }
+};
+
+fn freeStatPathEntries(allocator: Allocator, entries: *std.ArrayList(StatPathEntry)) void {
+    for (entries.items) |entry| {
+        allocator.free(entry.rel);
+        allocator.free(entry.abs);
+    }
+    entries.deinit(allocator);
+}
+
+/// Like collectRollouts, but stats every rollout file (one syscall each)
+/// and records every directory's mtime into `dir_mtimes`.
+fn collectRolloutsStat(
+    allocator: Allocator,
+    io: std.Io,
+    root: []const u8,
+    out: *std.ArrayList(StatPathEntry),
+    dir_mtimes: *std.StringHashMapUnmanaged(i96),
+) !void {
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                const stat = dir.statFile(io, entry.path, .{}) catch continue;
+                const path = try std.fs.path.join(allocator, &.{ root, entry.path });
+                defer allocator.free(path);
+                try putDirMtime(allocator, dir_mtimes, path, stat.mtime.nanoseconds);
+            },
+            .file => {
+                if (!std.mem.startsWith(u8, entry.basename, "rollout-")) continue;
+                if (!std.mem.endsWith(u8, entry.basename, ".jsonl")) continue;
+                const stat = dir.statFile(io, entry.path, .{}) catch continue;
+                const rel = try allocator.dupe(u8, entry.path);
+                errdefer allocator.free(rel);
+                const abs = try std.fs.path.join(allocator, &.{ root, entry.path });
+                errdefer allocator.free(abs);
+                try out.append(allocator, .{
+                    .rel = rel,
+                    .abs = abs,
+                    .size = stat.size,
+                    .mtime_ns = stat.mtime.nanoseconds,
+                });
+            },
+            else => {},
+        }
+    }
+}
+
+/// Insert (path duped) into a map of owned dir paths → mtime.
+fn putDirMtime(
+    gpa: Allocator,
+    map: *std.StringHashMapUnmanaged(i96),
+    path: []const u8,
+    mtime_ns: i96,
+) !void {
+    const gop = try map.getOrPut(gpa, path);
+    if (gop.found_existing) {
+        gop.value_ptr.* = mtime_ns;
+        return;
+    }
+    gop.key_ptr.* = gpa.dupe(u8, path) catch |err| {
+        map.removeByPtr(gop.key_ptr);
+        return err;
+    };
+    gop.value_ptr.* = mtime_ns;
+}
+
+/// Keep a small list of the most recently modified files, newest first.
+fn insertHot(
+    gpa: Allocator,
+    hot: *std.ArrayList(Tailer.Incremental.HotFile),
+    path: []const u8,
+    mtime_ns: i96,
+) !void {
+    var at: usize = hot.items.len;
+    for (hot.items, 0..) |h, i| {
+        if (mtime_ns > h.mtime_ns) {
+            at = i;
+            break;
+        }
+    }
+    if (at >= hot_files_max) return;
+    const owned = try gpa.dupe(u8, path);
+    errdefer gpa.free(owned);
+    try hot.insert(gpa, at, .{ .path = owned, .mtime_ns = mtime_ns });
+    if (hot.items.len > hot_files_max) {
+        const evicted = hot.pop().?;
+        gpa.free(evicted.path);
+    }
 }
 
 fn collectRollouts(
@@ -878,6 +1207,144 @@ test "latestLimits reads the last token_count of the newest rollout across roots
 
     // No usable roots → null.
     try testing.expectEqual(@as(?types.LimitSnapshot, null), try latestLimits(testing.allocator, io, &.{missing}));
+}
+
+test "feed captures the freshest embedded rate limits" {
+    var tailer = Tailer.init(testing.allocator);
+    defer tailer.deinit();
+    var out: std.ArrayList(types.UsageEvent) = .empty;
+    defer {
+        freeEvents(testing.allocator, out.items);
+        out.deinit(testing.allocator);
+    }
+
+    try testing.expectEqual(@as(?types.LimitSnapshot, null), tailer.lastLimits());
+    try tailer.feed(testing.allocator, "rollout-basic.jsonl", fixture_basic, &out);
+
+    // The LAST token_count line of the fixture wins: primary 14.0,
+    // secondary 3.5, plan "pro" (same truth latestLimits extracts).
+    const snap = tailer.lastLimits().?;
+    try testing.expectEqual(types.Agent.codex, snap.agent);
+    try testing.expectEqualStrings("pro", snap.plan);
+    try testing.expectEqual(@as(usize, 2), snap.windows.len);
+    try testing.expectEqual(types.LimitWindow.Kind.five_hour, snap.windows[0].kind);
+    try testing.expectEqual(@as(f64, 14.0), snap.windows[0].used_percent);
+    try testing.expectEqual(@as(i64, 1760014800000), snap.windows[0].resets_at_ms);
+    try testing.expectEqual(types.LimitWindow.Kind.weekly, snap.windows[1].kind);
+    try testing.expectEqual(@as(f64, 3.5), snap.windows[1].used_percent);
+
+    // Older lines never regress the reading.
+    const stale_line =
+        \\{"timestamp":"2025-10-09T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2}},"rate_limits":{"primary":{"used_percent":99.0,"window_minutes":300,"resets_at":1760000000},"plan_type":"free"}}}
+        \\
+    ;
+    try tailer.feed(testing.allocator, "rollout-stale.jsonl", stale_line, &out);
+    try testing.expectEqual(@as(f64, 14.0), tailer.lastLimits().?.windows[0].used_percent);
+    try testing.expectEqualStrings("pro", tailer.lastLimits().?.plan);
+}
+
+test "restoreLimits seeds lastLimits and keeps newer readings" {
+    var tailer = Tailer.init(testing.allocator);
+    defer tailer.deinit();
+
+    const windows = [_]types.LimitWindow{
+        .{ .kind = .five_hour, .used_percent = 20.0, .resets_at_ms = 1_000 },
+        .{ .kind = .weekly, .used_percent = 5.0, .resets_at_ms = 2_000 },
+    };
+    try tailer.restoreLimits(500, "plus", &windows);
+    const snap = tailer.lastLimits().?;
+    try testing.expectEqualStrings("plus", snap.plan);
+    try testing.expectEqual(@as(f64, 20.0), snap.windows[0].used_percent);
+
+    // An older restore does not clobber a newer reading.
+    try tailer.restoreLimits(400, "free", windows[0..1]);
+    try testing.expectEqualStrings("plus", tailer.lastLimits().?.plan);
+    try testing.expectEqual(@as(usize, 2), tailer.lastLimits().?.windows.len);
+
+    // Degenerate inputs are ignored.
+    try tailer.restoreLimits(900, "x", &.{});
+    try testing.expectEqualStrings("plus", tailer.lastLimits().?.plan);
+}
+
+test "sweepIncremental: hot appends, new rollouts via dir mtimes, safety net" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "sessions/2025/10/09");
+    const basic_rel = "sessions/2025/10/09/rollout-2025-10-09T12-00-00-0199aaaa-1111-7222-8333-444455556666.jsonl";
+    try tmp.dir.writeFile(io, .{ .sub_path = basic_rel, .data = fixture_basic });
+
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "{s}/sessions", .{base});
+    const roots = [_][]const u8{root};
+
+    var tailer = Tailer.init(testing.allocator);
+    defer tailer.deinit();
+    var out: std.ArrayList(types.UsageEvent) = .empty;
+    defer {
+        freeEvents(testing.allocator, out.items);
+        out.deinit(testing.allocator);
+    }
+
+    var now: i64 = 1_000_000;
+    // First call full-walks: 3 events, limits captured, tree mapped.
+    try testing.expect(try tailer.sweepIncremental(io, testing.allocator, &roots, &out, now));
+    try testing.expectEqual(@as(usize, 3), out.items.len);
+    try testing.expect(tailer.lastLimits() != null);
+    try testing.expectEqual(@as(usize, 1), tailer.inc.hot.items.len);
+    try testing.expect(tailer.inc.dir_mtimes.count() >= 4); // root + 2025 + 10 + 09
+
+    // Quiet fast tick.
+    now += 2_000;
+    try testing.expect(!try tailer.sweepIncremental(io, testing.allocator, &roots, &out, now));
+    try testing.expectEqual(@as(usize, 3), out.items.len);
+
+    // Append to the hot rollout: caught on the next fast tick, diffed
+    // against the running baseline.
+    const appendix =
+        \\{"timestamp":"2025-10-09T12:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":60000,"cached_input_tokens":45000,"output_tokens":3000,"reasoning_output_tokens":1000,"total_tokens":63000},"last_token_usage":{"input_tokens":5000,"cached_input_tokens":4000,"output_tokens":400,"reasoning_output_tokens":100,"total_tokens":5400},"model_context_window":258400},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":15.0,"window_minutes":300,"resets_at":1760014800},"secondary":{"used_percent":3.75,"window_minutes":10080,"resets_at":1760400000},"credits":null,"individual_limit":null,"plan_type":"pro","rate_limit_reached_type":null}}}
+        \\
+    ;
+    const grown = try std.mem.concat(testing.allocator, u8, &.{ fixture_basic, appendix });
+    defer testing.allocator.free(grown);
+    try tmp.dir.writeFile(io, .{ .sub_path = basic_rel, .data = grown });
+    now += 2_000;
+    try testing.expect(try tailer.sweepIncremental(io, testing.allocator, &roots, &out, now));
+    try testing.expectEqual(@as(usize, 4), out.items.len);
+    try testing.expectEqual(@as(u64, 1000), out.items[3].input_tokens);
+    try testing.expectEqual(@as(f64, 15.0), tailer.lastLimits().?.windows[0].used_percent);
+
+    // A brand-new rollout in a NEW date dir: the parent dir's mtime moved,
+    // so the next tick full-walks and finds it.
+    try tmp.dir.createDirPath(io, "sessions/2025/10/10");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "sessions/2025/10/10/rollout-2025-10-10T09-00-00-0199bbbb-1111-7222-8333-444455556666.jsonl",
+        .data = fixture_reset,
+    });
+    now += 2_000;
+    try testing.expect(try tailer.sweepIncremental(io, testing.allocator, &roots, &out, now));
+    try testing.expectEqual(@as(usize, 8), out.items.len); // +4 from the reset fixture
+
+    // Cold-file growth (hot list emptied) waits for the periodic full walk.
+    for (tailer.inc.hot.items) |h| testing.allocator.free(h.path);
+    tailer.inc.hot.clearRetainingCapacity();
+    const grown2 = try std.mem.concat(testing.allocator, u8, &.{
+        grown,
+        \\{"timestamp":"2025-10-09T12:07:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":61000,"cached_input_tokens":45500,"output_tokens":3100,"reasoning_output_tokens":1000,"total_tokens":64100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":500,"output_tokens":100,"reasoning_output_tokens":0,"total_tokens":1100},"model_context_window":258400}}}
+        \\
+    });
+    defer testing.allocator.free(grown2);
+    try tmp.dir.writeFile(io, .{ .sub_path = basic_rel, .data = grown2 });
+    now += 2_000;
+    try testing.expect(!try tailer.sweepIncremental(io, testing.allocator, &roots, &out, now));
+    try testing.expectEqual(@as(usize, 8), out.items.len);
+    now += full_walk_interval_ms;
+    try testing.expect(try tailer.sweepIncremental(io, testing.allocator, &roots, &out, now));
+    try testing.expectEqual(@as(usize, 9), out.items.len);
+    try testing.expectEqual(@as(u64, 500), out.items[8].input_tokens); // Δ1000 − Δ500 cached
 }
 
 test "sweep tails rollout files incrementally" {

@@ -85,6 +85,37 @@ pub const Ledger = struct {
         gop.value_ptr.add(ev, cost);
     }
 
+    /// Statefile restore: seed one day bucket wholesale (overwrites).
+    pub fn putDay(self: *Ledger, day: i64, totals: Totals) !void {
+        try self.per_day.put(self.allocator, day, totals);
+    }
+
+    /// Statefile restore: seed one model rollup wholesale (overwrites).
+    pub fn putModel(self: *Ledger, model: []const u8, totals: Totals) !void {
+        try putKeyed(self.allocator, &self.per_model, model, totals);
+    }
+
+    /// Statefile restore: seed one project rollup wholesale (overwrites).
+    pub fn putProject(self: *Ledger, project: []const u8, totals: Totals) !void {
+        try putKeyed(self.allocator, &self.per_project, project, totals);
+    }
+
+    fn putKeyed(
+        allocator: std.mem.Allocator,
+        map: *std.StringArrayHashMapUnmanaged(Totals),
+        key: []const u8,
+        totals: Totals,
+    ) !void {
+        const gop = try map.getOrPut(allocator, key);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = allocator.dupe(u8, key) catch |err| {
+                _ = map.orderedRemove(key);
+                return err;
+            };
+        }
+        gop.value_ptr.* = totals;
+    }
+
     pub fn today(self: *const Ledger, now_ms: i64) Totals {
         return self.per_day.get(dayKey(now_ms, self.tz_offset_min)) orelse .{};
     }
