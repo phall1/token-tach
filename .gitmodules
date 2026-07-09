@@ -1,0 +1,3 @@
+[submodule "vendor/native"]
+	path = vendor/native
+	url = https://github.com/phall1/native
