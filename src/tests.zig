@@ -5,6 +5,7 @@ const engine = @import("engine.zig");
 const view = @import("view.zig");
 const theme = @import("theme.zig");
 const types = @import("core/types.zig");
+const ledger_mod = @import("core/ledger.zig");
 
 const canvas = native_sdk.canvas;
 const testing = std.testing;
@@ -75,6 +76,9 @@ fn instrumentedModel() Model {
         .gauge_peak_tpm = 4_200,
         .needle_from_deg = -120,
         .needle_to_deg = engine.needleDeg(4_200, engine.gaugeScaleTpm(4_200)),
+        // An initialized-but-empty ledger never allocates, so no deinit
+        // is owed; the view reads real zeros instead of undefined memory.
+        .ledger = ledger_mod.Ledger.init(testing.allocator, 0),
     };
     model.claude_limits = .{
         .agent = .claude,
@@ -116,6 +120,68 @@ test "the instrument cluster binds the engine's structured state" {
     // Dial furniture: unit caption and the sparkline caption.
     try testing.expect(containsText(tree.root, "tok/min ×1000"));
     try testing.expect(containsText(tree.root, "burn · last 15 min"));
+}
+
+test "a disabled source says so instead of showing dead bars" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = instrumentedModel();
+    model.cfg.sources = .{ .claude = false, .codex = true };
+    const tree = try buildTree(arena_state.allocator(), &model);
+
+    try testing.expect(containsText(tree.root, "disabled"));
+    // Claude's limit rows are suppressed along with the fake totals…
+    try testing.expect(!containsText(tree.root, "67%"));
+    // …while the still-enabled codex group renders normally.
+    try testing.expect(containsText(tree.root, "9%"));
+}
+
+test "an agent with no history and no limits says no sessions found" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = instrumentedModel();
+    model.claude_limits = null;
+    model.codex_limits = null;
+    const tree = try buildTree(arena_state.allocator(), &model);
+
+    try testing.expect(containsText(tree.root, "no sessions found"));
+    // No zero-totals line and no limit-data hint for an absent agent.
+    try testing.expect(!containsText(tree.root, "0 · $0.00"));
+    try testing.expect(!containsText(tree.root, "no limit data"));
+}
+
+test "catch-up renders a scanning treatment instead of confident zeros" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = instrumentedModel();
+    model.claude_limits = null;
+    model.codex_limits = null;
+    model.catchup_active = true;
+    model.status_text = "scanning history… 3/12 files";
+    const tree = try buildTree(arena_state.allocator(), &model);
+
+    // Both the dial readout and the empty agent rows say "scanning…".
+    try testing.expect(containsText(tree.root, "scanning…"));
+    try testing.expect(!containsText(tree.root, "no sessions found"));
+}
+
+test "stale oauth tags the claude group and mutes its bars" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = instrumentedModel();
+    // Last successful poll 7 minutes ago; threshold is 5.
+    model.oauth_last_success_ms = model.now_ms - 7 * 60_000;
+    const tree = try buildTree(arena_state.allocator(), &model);
+
+    try testing.expect(containsText(tree.root, "stale 7m"));
+    // The staleness warning replaces the plan nicety on the name row.
+    try testing.expect(!containsText(tree.root, "max"));
+    // The (dimmed) window rows still show the last known utilization.
+    try testing.expect(containsText(tree.root, "67%"));
 }
 
 test "the view lays out through the canvas engine" {

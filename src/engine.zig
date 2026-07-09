@@ -60,6 +60,13 @@ pub const Model = struct {
     ready: bool = false,
 
     cfg: config.Config = .{},
+    /// Config live-reload state: the resolved config path (owned), the
+    /// mtime of the last text we parsed, and the arena that owns every
+    /// slice inside `cfg`. A reload builds a fresh arena, swaps `cfg`,
+    /// then frees the old one — nothing else may alias config strings.
+    config_path: []const u8 = "",
+    config_mtime_ns: ?i128 = null,
+    cfg_arena: ?std.heap.ArenaAllocator = null,
 
     claude_tailer: claude.Tailer = undefined,
     codex_tailer: codex.Tailer = undefined,
@@ -166,6 +173,40 @@ pub fn dangerState(model: *const Model) bool {
     return false;
 }
 
+/// Minutes since the last successful Claude OAuth poll, once that
+/// reading has gone stale (older than `oauth.stale_after_ms`). Null
+/// while fresh, before the first success, or when there is no snapshot
+/// to be stale about. Note: deliberately NOT gated on
+/// `cfg.claude_oauth` — when live-reload disables polling we keep the
+/// last snapshot, and this tag is what keeps it honest.
+pub fn oauthStaleMin(model: *const Model) ?u64 {
+    if (model.claude_limits == null) return null;
+    if (model.oauth_last_success_ms <= 0) return null;
+    const age_ms = model.now_ms - model.oauth_last_success_ms;
+    if (age_ms <= oauth.stale_after_ms) return null;
+    return @intCast(@divFloor(age_ms, 60_000));
+}
+
+/// Is this agent's source enabled in config?
+pub fn sourceEnabled(sources: config.Sources, agent: types.Agent) bool {
+    return switch (agent) {
+        .claude => sources.claude,
+        .codex => sources.codex,
+    };
+}
+
+/// True when an agent has nothing to report: source enabled but zero
+/// ledger events and no limit snapshot. During catch-up the question is
+/// still open; afterwards it means "no sessions found".
+pub fn agentIsEmpty(model: *const Model, agent: types.Agent) bool {
+    if (model.ledger.forAgent(agent).events != 0) return false;
+    const limits = switch (agent) {
+        .claude => model.claude_limits,
+        .codex => model.codex_limits,
+    };
+    return limits == null;
+}
+
 /// Environment facts setup needs — extracted from the runner's
 /// `init.environ_map` by main (keeps setup unit-testable).
 pub const Env = struct {
@@ -181,12 +222,12 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
 
     const home = env.home;
 
-    // Config: absent file or bad lines never block startup.
+    // Config: absent file or bad lines never block startup. The path and
+    // mtime stick around on the model so the 2 s sweep can live-reload.
     if (config.defaultPath(allocator, home)) |path| {
-        defer allocator.free(path);
-        if (config.load(allocator, path) catch null) |result| {
-            model.cfg = result.config;
-        }
+        model.config_path = path;
+        model.config_mtime_ns = config.fileMtimeNs(path);
+        _ = loadConfigFromDisk(model);
     } else |_| {}
 
     var threaded: std.Io.Threaded = .init_single_threaded;
@@ -224,26 +265,65 @@ fn appendProjects(allocator: std.mem.Allocator, dirs: []const []const u8) ![]con
     return try out.toOwnedSlice(allocator);
 }
 
+/// Read + parse the config file into a fresh arena and swap it in
+/// (freeing the previous arena). A missing or unreadable file keeps the
+/// current config untouched. Parse never hard-fails, so any readable
+/// file yields a config (bad lines degrade to warnings/defaults).
+fn loadConfigFromDisk(model: *Model) bool {
+    if (model.config_path.len == 0) return false;
+    var arena = std.heap.ArenaAllocator.init(model.allocator);
+    const result = (config.load(arena.allocator(), model.config_path) catch null) orelse {
+        arena.deinit();
+        return false;
+    };
+    for (result.warnings) |w| {
+        std.log.warn("config:{d}: {s}", .{ w.line, w.message });
+    }
+    model.cfg = result.config;
+    if (model.cfg_arena) |*old| old.deinit();
+    model.cfg_arena = arena;
+    return true;
+}
+
+/// Live-reload poll, called from the 2 s sweep tick: stat the config
+/// file and re-load when its mtime moved. Returns the sources that this
+/// reload newly ENABLED (they need a history catch-up pass), or null
+/// when nothing was reloaded. Applied live: `tray-format` (next tray
+/// render), `source` (panels + sweeps), `claude-oauth` (enable polls on
+/// the next gate; disable stops polling but KEEPS the last limit
+/// snapshots — the staleness tag marks them honestly), and
+/// `alert-threshold` (stored for the future notifier). Root-path keys
+/// (`claude-config-dir`, `codex-home`) still require a restart.
+pub fn maybeReloadConfig(model: *Model) ?config.Sources {
+    if (model.config_path.len == 0) return null;
+    // A deleted config keeps the old values (ghostty behavior).
+    const mtime = config.fileMtimeNs(model.config_path) orelse return null;
+    if (model.config_mtime_ns) |old| {
+        if (mtime == old) return null;
+    }
+    model.config_mtime_ns = mtime;
+    const old_sources = model.cfg.sources;
+    const old_oauth = model.cfg.claude_oauth;
+    if (!loadConfigFromDisk(model)) return null;
+    std.log.info("config reloaded from {s}", .{model.config_path});
+    if (model.cfg.claude_oauth and !old_oauth) {
+        // Freshly opted in: poll at the next gate, not after a stale
+        // backoff window left over from before the opt-in.
+        model.oauth_backoff = .{};
+        model.oauth_next_ms = model.now_ms;
+    }
+    return .{
+        .claude = model.cfg.sources.claude and !old_sources.claude,
+        .codex = model.cfg.sources.codex and !old_sources.codex,
+    };
+}
+
 pub fn boot(model: *Model, fx: *Effects) void {
     // Enumerate the historical file queue (directory walk only — fast)
     // and chew through it on the fast catch-up timer. The window shows
     // live scanning progress instead of freezing behind the parse.
     model.now_ms = fx.wallMs();
-    if (model.ready) {
-        enumerateHistory(model) catch |err| {
-            std.log.warn("history enumeration failed: {s}", .{@errorName(err)});
-        };
-    }
-    if (model.catchup_queue.len > 0) {
-        model.catchup_active = true;
-        model.catchup_started_ms = model.now_ms;
-        fx.startTimer(.{
-            .key = catchup_timer_key,
-            .interval_ms = catchup_interval_ms,
-            .mode = .repeating,
-            .on_fire = Effects.timerMsg(.catchup_tick),
-        });
-    }
+    if (model.ready) startCatchup(model, model.cfg.sources, fx);
     fx.startTimer(.{
         .key = sweep_timer_key,
         .interval_ms = sweep_interval_ms,
@@ -265,8 +345,28 @@ pub fn boot(model: *Model, fx: *Effects) void {
     refreshDisplay(model);
 }
 
-/// Walk every root collecting *.jsonl paths + sizes (no parsing).
-fn enumerateHistory(model: *Model) !void {
+/// Enumerate history for `only` (a subset of the enabled sources) and,
+/// if anything queued, start the catch-up timer. Used at boot for every
+/// enabled source and by config live-reload for newly enabled ones.
+fn startCatchup(model: *Model, only: config.Sources, fx: *Effects) void {
+    enumerateHistory(model, only) catch |err| {
+        std.log.warn("history enumeration failed: {s}", .{@errorName(err)});
+    };
+    if (model.catchup_queue.len > 0) {
+        model.catchup_active = true;
+        model.catchup_started_ms = model.now_ms;
+        fx.startTimer(.{
+            .key = catchup_timer_key,
+            .interval_ms = catchup_interval_ms,
+            .mode = .repeating,
+            .on_fire = Effects.timerMsg(.catchup_tick),
+        });
+    }
+}
+
+/// Walk the given sources' roots collecting *.jsonl paths + sizes (no
+/// parsing).
+fn enumerateHistory(model: *Model, only: config.Sources) !void {
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
 
@@ -280,8 +380,8 @@ fn enumerateHistory(model: *Model) !void {
     defer walk_arena.deinit();
 
     const groups = [_]struct { agent: types.Agent, roots: []const []const u8, enabled: bool }{
-        .{ .agent = .claude, .roots = model.claude_roots, .enabled = model.cfg.sources.claude },
-        .{ .agent = .codex, .roots = model.codex_roots, .enabled = model.cfg.sources.codex },
+        .{ .agent = .claude, .roots = model.claude_roots, .enabled = only.claude },
+        .{ .agent = .codex, .roots = model.codex_roots, .enabled = only.codex },
     };
     for (groups) |group| {
         if (!group.enabled) continue;
@@ -366,9 +466,23 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .tick => {
             model.now_ms = fx.wallMs();
+            // Config live-reload rides the sweep tick: an mtime stat per
+            // 2 s is free, and a newly enabled source gets the same
+            // chunked history catch-up boot gives it.
+            if (maybeReloadConfig(model)) |newly_enabled| {
+                if (newly_enabled.any() and !model.catchup_active) {
+                    startCatchup(model, newly_enabled, fx);
+                }
+                refreshDisplay(model);
+            }
             // While catch-up owns the tailers, the steady sweep stands
             // down (offsets make overlap safe, but it's wasted work).
-            if (!model.catchup_active) sweepOnce(model);
+            if (!model.catchup_active) {
+                const sweep_start_ns = native_sdk.monotonicNanoseconds();
+                sweepOnce(model);
+                const sweep_us = (native_sdk.monotonicNanoseconds() - sweep_start_ns) / std.time.ns_per_us;
+                std.log.debug("sweep: {d} us", .{sweep_us});
+            }
             // First OAuth poll shouldn't wait for the 30 s gate.
             if (!model.first_sweep_done) maybeOauthPoll(model, fx);
             model.first_sweep_done = true;
@@ -636,9 +750,24 @@ fn agentLine(buf: []u8, model: *const Model, agent: types.Agent, limits: ?types.
     var w = std.Io.Writer.fixed(buf);
     w.writeAll(agent.label()) catch {};
     w.writeAll("  ") catch {};
+    if (!sourceEnabled(model.cfg.sources, agent)) {
+        w.writeAll("disabled") catch {};
+        return w.buffered();
+    }
+    if (agentIsEmpty(model, agent)) {
+        w.writeAll(if (model.catchup_active) "scanning…" else "no sessions found") catch {};
+        return w.buffered();
+    }
     trayfmt.writeHumanTokens(&w, totals.totalTokens()) catch {};
     w.writeAll(" tok · ") catch {};
     trayfmt.writeCost(&w, totals.cost_usd) catch {};
+    if (agent == .claude) {
+        if (oauthStaleMin(model)) |mins| {
+            w.writeAll(" · stale ") catch {};
+            w.printInt(mins, 10, .lower, .{}) catch {};
+            w.writeByte('m') catch {};
+        }
+    }
     if (limits) |snap| {
         for (snap.windows) |win| {
             const label: []const u8 = switch (win.kind) {
@@ -700,6 +829,82 @@ test "oauth response drives backoff and snapshot state" {
     handleOauthResponse(&model, .{ .key = oauth_fetch_key, .outcome = .ok, .status = 429 });
     try testing.expect(model.oauth_next_ms >= model.now_ms + 180_000);
     try testing.expectEqual(@as(usize, 1), model.claude_limits.?.windows.len);
+}
+
+test "oauth staleness: fresh, stale, and no-snapshot cases" {
+    var model = Model{ .allocator = testing.allocator };
+    model.now_ms = 60 * 60_000;
+
+    // No snapshot: nothing to be stale about.
+    model.oauth_last_success_ms = 1;
+    try testing.expectEqual(@as(?u64, null), oauthStaleMin(&model));
+
+    const windows = [_]types.LimitWindow{.{ .kind = .five_hour, .used_percent = 10 }};
+    model.claude_limits = .{ .agent = .claude, .read_at_ms = 0, .windows = &windows };
+
+    // Exactly at the threshold is still fresh.
+    model.oauth_last_success_ms = model.now_ms - oauth.stale_after_ms;
+    try testing.expectEqual(@as(?u64, null), oauthStaleMin(&model));
+    // Seven minutes old (threshold is five): stale, reported in minutes.
+    model.oauth_last_success_ms = model.now_ms - 7 * 60_000;
+    try testing.expectEqual(@as(?u64, 7), oauthStaleMin(&model));
+    // Never succeeded: no tag (the "no limit data" row covers it).
+    model.oauth_last_success_ms = 0;
+    try testing.expectEqual(@as(?u64, null), oauthStaleMin(&model));
+}
+
+test "config live-reload: mtime change reapplies, unchanged mtime does not" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "config",
+        .data = "tray-format = AAA\nsource = codex\n",
+    });
+
+    var model = Model{ .allocator = testing.allocator };
+    model.ledger = ledger_mod.Ledger.init(testing.allocator, 0);
+    defer model.ledger.deinit();
+    defer if (model.cfg_arena) |*a| a.deinit();
+    // tmpDir paths are cwd-relative, same contract as config.load's test.
+    model.config_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/config", .{tmp.sub_path});
+    defer testing.allocator.free(model.config_path);
+
+    // First observation (mtime unknown at setup): reload. Claude was
+    // already enabled by default, so nothing is NEWLY enabled by v1.
+    const first = maybeReloadConfig(&model) orelse return error.TestUnexpectedResult;
+    try testing.expect(!first.claude and !first.codex);
+    try testing.expectEqualStrings("AAA", model.cfg.tray_format);
+    try testing.expect(!model.cfg.sources.claude);
+    try testing.expect(model.cfg.sources.codex);
+
+    // Unchanged mtime: no reload, no churn.
+    try testing.expectEqual(@as(?config.Sources, null), maybeReloadConfig(&model));
+
+    // v2 re-enables claude and opts into OAuth. Rewrite until the mtime
+    // observably moves (APFS is ns-resolution; one write suffices in
+    // practice, the loop just removes the timing assumption).
+    model.now_ms = 123_456;
+    model.oauth_next_ms = 999_999_999;
+    var tries: usize = 0;
+    while (config.fileMtimeNs(model.config_path).? == model.config_mtime_ns.?) : (tries += 1) {
+        if (tries > 10_000) return error.TestUnexpectedResult;
+        try tmp.dir.writeFile(testing.io, .{
+            .sub_path = "config",
+            .data = "tray-format = BBB\nsource = claude, codex\nclaude-oauth = true\n",
+        });
+    }
+    const second = maybeReloadConfig(&model) orelse return error.TestUnexpectedResult;
+    try testing.expect(second.claude);
+    try testing.expect(!second.codex);
+    try testing.expectEqualStrings("BBB", model.cfg.tray_format);
+    try testing.expect(model.cfg.claude_oauth);
+    // Fresh opt-in reopens the poll gate immediately.
+    try testing.expectEqual(model.now_ms, model.oauth_next_ms);
+
+    // Deleted config: keep the last good values, report no reload.
+    try tmp.dir.deleteFile(testing.io, "config");
+    try testing.expectEqual(@as(?config.Sources, null), maybeReloadConfig(&model));
+    try testing.expectEqualStrings("BBB", model.cfg.tray_format);
 }
 
 test "glance state reflects ledger and burn" {

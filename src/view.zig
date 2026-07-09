@@ -248,12 +248,20 @@ fn gaugeCluster(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) vo
         .style = .{ .background = theme.needle, .radius = 3, .stroke_width = 0 },
     }, .{}));
 
-    // In-dial readout: the burn number, then the wall/reset line.
-    const burn_text = if (glance.idle)
+    // In-dial readout: the burn number, then the wall/reset line. While
+    // history catch-up is chewing, the numbers aren't truth yet — dim
+    // the readout and say "scanning" instead of asserting a confident 0.
+    const scanning = model.catchup_active;
+    const burn_text = if (glance.idle and !scanning)
         "0"
     else
         fmtTokens(ui, @intFromFloat(@max(glance.burn_tokens_per_min, 0)));
-    const burn_ink: Color = if (danger) theme.red else if (glance.idle) theme.cluster_colors.text_muted else theme.green;
+    const burn_ink: Color = if (scanning or glance.idle)
+        theme.cluster_colors.text_muted
+    else if (danger)
+        theme.red
+    else
+        theme.green;
     push(ui, nodes, ui.paragraph(.{
         .frame = rect(gauge_cx - 60, gauge_cy + 24, 120, 36),
         .text_alignment = .center,
@@ -261,7 +269,10 @@ fn gaugeCluster(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) vo
         .semantics = .{ .label = ui.fmt("burn {s} tokens per minute", .{burn_text}) },
     }, &.{.{ .text = burn_text, .weight = .bold, .monospace = true, .scale = 2.2 }}));
 
-    const eta = etaLine(ui, glance, danger);
+    const eta = if (scanning)
+        EtaLine{ .text = "scanning…", .ink = theme.cluster_colors.text_muted }
+    else
+        etaLine(ui, glance, danger);
     push(ui, nodes, ui.paragraph(.{
         .frame = rect(gauge_cx - 80, gauge_cy + 64, 160, 16),
         .text_alignment = .center,
@@ -369,34 +380,61 @@ fn agentGroup(
 ) f32 {
     var y = y0;
     const totals = model.ledger.forAgent(agent);
+    const enabled = engine.sourceEnabled(model.cfg.sources, agent);
+    const empty = enabled and engine.agentIsEmpty(model, agent);
+    const stale_min: ?u64 = if (agent == .claude) engine.oauthStaleMin(model) else null;
     const name: []const u8 = switch (agent) {
         .claude => "CLAUDE",
         .codex => "CODEX",
     };
 
-    var name_spans: [2]canvas.TextSpan = .{
+    var name_spans: [3]canvas.TextSpan = .{
         .{ .text = name, .weight = .bold, .monospace = true },
         .{ .text = "", .color = .text_muted, .monospace = true },
+        .{ .text = "", .color = .warning, .monospace = true },
     };
-    if (limits) |snap| {
-        if (snap.plan.len > 0) name_spans[1].text = ui.fmt("  {s}", .{snap.plan});
+    if (enabled and !empty) {
+        if (stale_min) |mins| {
+            // The staleness warning outranks the plan nicety — showing
+            // both would crowd into the totals column.
+            name_spans[2].text = ui.fmt("  stale {d}m", .{mins});
+        } else if (limits) |snap| {
+            if (snap.plan.len > 0) name_spans[1].text = ui.fmt("  {s}", .{snap.plan});
+        }
     }
     push(ui, nodes, ui.paragraph(.{
-        .frame = rect(bars_x, y, 130, 16),
+        .frame = rect(bars_x, y, 170, 16),
         .semantics = .{ .label = ui.fmt("{s} usage", .{name}) },
     }, &name_spans));
+
+    // Right column of the name row: totals when there is anything to
+    // total, otherwise the honest one-liner ("disabled" for a source
+    // switched off in config, "no sessions found" for an agent with no
+    // history and no limits, "scanning…" while catch-up may yet find some).
+    const right_text: []const u8 = if (!enabled)
+        "disabled"
+    else if (empty and model.catchup_active)
+        "scanning…"
+    else if (empty)
+        "no sessions found"
+    else
+        ui.fmt("{s} · {s}", .{ fmtTokens(ui, totals.totalTokens()), fmtCost(ui, totals.cost_usd) });
     push(ui, nodes, ui.text(.{
-        .frame = rect(bars_right - 120, y + 1, 120, 14),
+        .frame = rect(bars_right - 140, y + 1, 140, 14),
         .size = .sm,
         .text_alignment = .end,
         .style_tokens = .{ .foreground = .text_muted },
-    }, ui.fmt("{s} · {s}", .{ fmtTokens(ui, totals.totalTokens()), fmtCost(ui, totals.cost_usd) })));
+    }, right_text));
     y += row_h;
+
+    // Disabled and empty agents get no bars and no limit-data hint —
+    // empty tracks under a "0 tok" line would just be lies in green.
+    if (!enabled or empty) return y + 4;
 
     if (limits) |snap| {
         const shown = @min(snap.windows.len, 4);
         for (snap.windows[0..shown]) |window| {
-            windowRow(ui, nodes, window, model.now_ms, y);
+            windowRow(ui, nodes, window, model.now_ms, y, stale_min != null);
             y += row_h;
         }
     } else {
@@ -413,7 +451,7 @@ fn agentGroup(
     return y + 4;
 }
 
-fn windowRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), window: types.LimitWindow, now_ms: i64, y: f32) void {
+fn windowRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), window: types.LimitWindow, now_ms: i64, y: f32, stale: bool) void {
     const label: []const u8 = switch (window.kind) {
         .five_hour => "5h",
         .weekly => "wk",
@@ -428,7 +466,9 @@ fn windowRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), window: types.LimitWindow,
     }, label));
 
     const pct = std.math.clamp(window.used_percent, 0, 100);
-    const ink = barColor(pct);
+    // Stale readings render at half strength, no tip glow — the bar is
+    // the last known value, not the current one.
+    const ink = if (stale) withAlpha(barColor(pct), 0.45) else barColor(pct);
     const track_x: f32 = bars_x + 46;
     const track_w: f32 = 78;
     push(ui, nodes, ui.panel(.{
@@ -441,11 +481,13 @@ fn windowRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), window: types.LimitWindow,
             .frame = rect(track_x, y + 4, fill_w, 6),
             .style = .{ .background = ink, .radius = 3, .stroke_width = 0 },
         }, .{}));
-        // LED tip glow at the leading edge.
-        push(ui, nodes, ui.panel(.{
-            .frame = rect(track_x + fill_w - 4, y + 2, 10, 10),
-            .style = .{ .background = withAlpha(ink, 0.35), .radius = 5, .stroke_width = 0 },
-        }, .{}));
+        if (!stale) {
+            // LED tip glow at the leading edge.
+            push(ui, nodes, ui.panel(.{
+                .frame = rect(track_x + fill_w - 4, y + 2, 10, 10),
+                .style = .{ .background = withAlpha(ink, 0.35), .radius = 5, .stroke_width = 0 },
+            }, .{}));
+        }
     }
 
     push(ui, nodes, ui.paragraph(.{

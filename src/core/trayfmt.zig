@@ -55,8 +55,11 @@ fn writeToken(w: *std.Io.Writer, token: []const u8, state: GlanceState) !void {
         if (state.idle) {
             try w.writeAll("idle");
         } else {
+            // Fixed-width form: the tray title re-renders every sweep and
+            // the menu bar reflows on every width change — "4.2k" jumping
+            // to "980" to "12k" makes the whole status area shiver.
             try w.writeAll("⚡ ");
-            try writeHumanTokens(w, @intFromFloat(@max(state.burn_tokens_per_min, 0)));
+            try writeHumanTokensFixed(w, @intFromFloat(@max(state.burn_tokens_per_min, 0)));
             try w.writeAll("/m");
         }
     } else if (std.mem.eql(u8, token, "eta")) {
@@ -100,6 +103,30 @@ pub fn writeHumanTokens(w: *std.Io.Writer, tokens: u64) !void {
     } else {
         try w.printInt(tokens, 10, .lower, .{});
     }
+}
+
+/// Width-stable variant for the tray burn figure: always one decimal and
+/// a k/M unit — "0.9k", "4.2k", "812.3k", "8.2M" — so the rendered width
+/// only moves when the burn rate genuinely changes decade, not on every
+/// sweep. (writeHumanTokens drops the decimal and the unit situationally,
+/// which is right for panels and wrong for a menu-bar title.)
+pub fn writeHumanTokensFixed(w: *std.Io.Writer, tokens: u64) !void {
+    // 999_950 rounds up to 1000.0k; hand it to the M branch instead.
+    if (tokens < 999_950) {
+        try writeTenths(w, tokens, 1_000);
+        try w.writeByte('k');
+    } else {
+        try writeTenths(w, tokens, 1_000_000);
+        try w.writeByte('M');
+    }
+}
+
+/// "<whole>.<tenth>" of value/unit, rounded, decimal always present.
+fn writeTenths(w: *std.Io.Writer, value: u64, unit: u64) !void {
+    const tenths = (value * 10 + unit / 2) / unit;
+    try w.printInt(tenths / 10, 10, .lower, .{});
+    try w.writeByte('.');
+    try w.printInt(tenths % 10, 10, .lower, .{});
 }
 
 fn writeScaled(w: *std.Io.Writer, value: u64, unit: u64) !void {
@@ -194,6 +221,37 @@ test "pct, tok, cost tokens" {
 test "unknown token renders verbatim; empty eta collapses" {
     const got = renderTest("{nope} x {eta}", .{ .now_ms = 0, .idle = true });
     try testing.expectEqualStrings("{nope} x ", got);
+}
+
+test "fixed-width burn keeps one decimal and a unit at every magnitude" {
+    var buf: [32]u8 = undefined;
+    const cases = [_]struct { v: u64, want: []const u8 }{
+        .{ .v = 0, .want = "0.0k" },
+        .{ .v = 940, .want = "0.9k" },
+        .{ .v = 950, .want = "1.0k" },
+        .{ .v = 4_230, .want = "4.2k" },
+        .{ .v = 12_400, .want = "12.4k" },
+        .{ .v = 812_340, .want = "812.3k" },
+        .{ .v = 999_949, .want = "999.9k" },
+        .{ .v = 999_950, .want = "1.0M" },
+        .{ .v = 8_230_000, .want = "8.2M" },
+        .{ .v = 123_449_999, .want = "123.4M" },
+    };
+    for (cases) |case| {
+        var w = std.Io.Writer.fixed(&buf);
+        try writeHumanTokensFixed(&w, case.v);
+        try testing.expectEqualStrings(case.want, w.buffered());
+    }
+}
+
+test "tray burn token renders width-stable across sub-k rates" {
+    // 900/m used to render "⚡ 900/m" (7 cols) next to "⚡ 4.2k/m" (8);
+    // the fixed form pins both to the same shape.
+    const low = renderTest("{burn}", .{ .now_ms = 0, .burn_tokens_per_min = 900, .idle = false });
+    try testing.expectEqualStrings("⚡ 0.9k/m", low);
+    const mid = renderTest("{burn}", .{ .now_ms = 0, .burn_tokens_per_min = 4_200, .idle = false });
+    try testing.expectEqualStrings("⚡ 4.2k/m", mid);
+    try testing.expectEqual(low.len, mid.len);
 }
 
 test "human token scaling" {

@@ -17,7 +17,7 @@ codex   188M tok · $154.16 · 5h 3%  · wk 8%  · pro
 today   $114.85 · 116M tok
 ```
 
-<!-- screenshot: docs/assets/popover.png (tach cluster) -->
+![the tach cluster](docs/assets/cluster.png)
 
 ## What it shows
 
