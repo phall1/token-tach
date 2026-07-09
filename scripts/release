@@ -1,0 +1,53 @@
+#!/bin/zsh
+# token-tach release build: verify -> package -> sign -> (optionally) notarize.
+#
+# Usage:
+#   scripts/release                     # adhoc-signed .app + dmg (local use)
+#   scripts/release --identity "Developer ID Application: ..." [--team-id XXX] [--notarize]
+#
+# Notarization needs a notarytool keychain profile named "token-tach"
+# (xcrun notarytool store-credentials token-tach --apple-id ... --team-id ...).
+set -e
+cd "$(dirname "$0")/.."
+
+IDENTITY=""
+TEAM_ID=""
+NOTARIZE=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --identity) IDENTITY="$2"; shift 2 ;;
+    --team-id)  TEAM_ID="$2"; shift 2 ;;
+    --notarize) NOTARIZE=1; shift ;;
+    *) echo "unknown arg: $1"; exit 2 ;;
+  esac
+done
+
+echo "==> verify (no smoke)"
+scripts/verify --no-smoke
+
+echo "==> package"
+ARGS=(--target macos --archive)
+if [[ -n "$IDENTITY" ]]; then
+  ARGS+=(--signing identity --identity "$IDENTITY")
+  [[ -n "$TEAM_ID" ]] && ARGS+=(--team-id "$TEAM_ID")
+else
+  ARGS+=(--signing adhoc)
+  echo "    (adhoc signing — pass --identity for a distributable build)"
+fi
+native package "${ARGS[@]}"
+
+APP=$(ls -d zig-out/package/*.app 2>/dev/null | head -1 || true)
+DMG=$(ls zig-out/package/*.dmg 2>/dev/null | head -1 || true)
+[[ -n "$APP" ]] && echo "==> app: $APP"
+[[ -n "$DMG" ]] && echo "==> dmg: $DMG"
+
+if [[ "$NOTARIZE" == 1 ]]; then
+  [[ -n "$IDENTITY" ]] || { echo "FAIL: --notarize requires --identity"; exit 1 }
+  [[ -n "$DMG" ]] || { echo "FAIL: no dmg produced to notarize"; exit 1 }
+  echo "==> notarize"
+  xcrun notarytool submit "$DMG" --keychain-profile token-tach --wait
+  xcrun stapler staple "$DMG"
+  echo "==> notarized + stapled"
+fi
+
+echo "RELEASE: done"
