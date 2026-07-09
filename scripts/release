@@ -29,6 +29,13 @@ done
 echo "==> verify (no smoke)"
 scripts/verify --no-smoke
 
+# verify leaves an automation-enabled binary in zig-out/bin — that build
+# writes its automation socket to a RELATIVE path and dies with
+# ReadOnlyFileSystem when launched from Finder (cwd=/). Package a clean
+# production build instead.
+echo "==> production build (no automation)"
+$NATIVE build
+
 echo "==> package"
 ARGS=(--target macos --archive)
 if [[ -n "$IDENTITY" ]]; then
@@ -44,6 +51,21 @@ APP=$(ls -d zig-out/package/*.app 2>/dev/null | head -1 || true)
 DMG=$(ls zig-out/package/*.dmg 2>/dev/null | head -1 || true)
 [[ -n "$APP" ]] && echo "==> app: $APP"
 [[ -n "$DMG" ]] && echo "==> dmg: $DMG"
+
+# Launch sanity: Finder launches with cwd=/ — the packaged app must
+# survive that (an automation build dies on its relative socket path).
+echo "==> launch check (cwd=/)"
+BIN="$(pwd)/$(ls "$APP"/Contents/MacOS/* | head -1)"
+( cd / && "$BIN" >/dev/null 2>&1 ) &
+CHECK_PID=$!
+sleep 3
+if kill -0 $CHECK_PID 2>/dev/null; then
+  kill $CHECK_PID 2>/dev/null || true
+  echo "==> launch check: PASS"
+else
+  echo "FAIL: packaged app exited within 3s when launched from cwd=/"
+  exit 1
+fi
 
 if [[ "$NOTARIZE" == 1 ]]; then
   [[ -n "$IDENTITY" ]] || { echo "FAIL: --notarize requires --identity"; exit 1 }
