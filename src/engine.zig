@@ -258,7 +258,7 @@ fn sweepOnce(model: *Model) void {
 fn ingest(model: *Model, ev: types.UsageEvent) void {
     const cost = model.prices.costOf(ev);
     model.ledger.add(ev, cost) catch return;
-    model.burn.addTokens(ev.timestamp_ms, ev.totalTokens());
+    model.burn.addTokens(ev.timestamp_ms, predict.limitWeightedTokens(ev));
 }
 
 /// Keep our own copy of a limit snapshot (arena-born snapshots die with

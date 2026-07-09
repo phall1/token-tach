@@ -15,6 +15,15 @@ const types = @import("types.zig");
 /// After this long without an event, the burn display goes idle.
 pub const idle_after_ms: i64 = 5 * 60 * 1000;
 
+/// Tokens weighted by how hard they press on plan limits. Cache reads
+/// are billed (and rate-limited) at roughly a tenth of input tokens;
+/// counting them raw made the tach read 1.8M/m during ordinary cached
+/// sessions — technically true, practically noise.
+pub fn limitWeightedTokens(ev: types.UsageEvent) u64 {
+    return ev.input_tokens + ev.output_tokens +
+        ev.cache_creation_tokens + ev.cache_read_tokens / 10;
+}
+
 /// Token velocity over a decayed minute-bucket window.
 /// Fixed memory: `bucket_count` one-minute buckets.
 pub const BurnRate = struct {
@@ -284,4 +293,16 @@ test "wall tracker: nearest wall across agents and windows" {
 
     const hot = tracker.maxUtilization().?;
     try testing.expectEqual(@as(f64, 82), hot.used_percent);
+}
+
+test "limit-weighted tokens discount cache reads" {
+    try testing.expectEqual(@as(u64, 1000 + 200 + 300 + 50), limitWeightedTokens(.{
+        .agent = .claude,
+        .timestamp_ms = 0,
+        .model = "m",
+        .input_tokens = 1000,
+        .output_tokens = 200,
+        .cache_creation_tokens = 300,
+        .cache_read_tokens = 500,
+    }));
 }
