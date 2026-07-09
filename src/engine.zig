@@ -27,16 +27,30 @@ pub const oauth_gate_timer_key: u64 = 2;
 pub const oauth_fetch_key: u64 = 3;
 pub const tz_spawn_key: u64 = 4;
 pub const creds_spawn_key: u64 = 5;
+pub const catchup_timer_key: u64 = 6;
 
 pub const sweep_interval_ms: u32 = 2_000;
 pub const oauth_gate_interval_ms: u32 = 30_000;
+/// Historical catch-up cadence: fast enough to feel instant, spaced
+/// enough that render frames land between chunks.
+pub const catchup_interval_ms: u32 = 30;
+/// Per-chunk byte budget for catch-up file parsing (~a few ms of work).
+pub const catchup_chunk_bytes: u64 = 3 * 1024 * 1024;
 
 pub const Msg = union(enum) {
     tick: native_sdk.EffectTimer,
+    catchup_tick: native_sdk.EffectTimer,
     oauth_tick: native_sdk.EffectTimer,
     creds_done: native_sdk.EffectExit,
     oauth_response: native_sdk.EffectResponse,
     tz_done: native_sdk.EffectExit,
+};
+
+/// One queued history file awaiting its catch-up parse.
+pub const CatchupFile = struct {
+    agent: types.Agent,
+    path: []const u8,
+    size: u64,
 };
 
 const text_buf_len = 192;
@@ -78,6 +92,14 @@ pub const Model = struct {
     claude_plan: []const u8 = "",
     claude_plan_buf: [32]u8 = undefined,
 
+    // Historical catch-up: the file queue boot enumerated, chewed through
+    // in byte-budgeted chunks on a fast timer so the dispatch loop (and
+    // the window) never freezes behind months of JSONL.
+    catchup_queue: []CatchupFile = &.{},
+    catchup_next: usize = 0,
+    catchup_active: bool = false,
+    catchup_started_ms: i64 = 0,
+
     // Display strings bound by app.native — regenerated each sweep, and
     // pointing into the fixed buffers below (never into stack copies).
     glance_text: []const u8 = "",
@@ -91,6 +113,10 @@ pub const Model = struct {
     codex_buf: [text_buf_len]u8 = undefined,
     today_buf: [text_buf_len]u8 = undefined,
     status_buf: [text_buf_len]u8 = undefined,
+
+    /// An error status stays visible until the failing path succeeds;
+    /// the routine "N events" line never overwrites it.
+    status_error: bool = false,
 
     // Instrument display state (pure display, refreshed each sweep):
     // the tach needs a stable scale (a ratcheted, slowly decaying burn
@@ -199,6 +225,25 @@ fn appendProjects(allocator: std.mem.Allocator, dirs: []const []const u8) ![]con
 }
 
 pub fn boot(model: *Model, fx: *Effects) void {
+    // Enumerate the historical file queue (directory walk only — fast)
+    // and chew through it on the fast catch-up timer. The window shows
+    // live scanning progress instead of freezing behind the parse.
+    model.now_ms = fx.wallMs();
+    if (model.ready) {
+        enumerateHistory(model) catch |err| {
+            std.log.warn("history enumeration failed: {s}", .{@errorName(err)});
+        };
+    }
+    if (model.catchup_queue.len > 0) {
+        model.catchup_active = true;
+        model.catchup_started_ms = model.now_ms;
+        fx.startTimer(.{
+            .key = catchup_timer_key,
+            .interval_ms = catchup_interval_ms,
+            .mode = .repeating,
+            .on_fire = Effects.timerMsg(.catchup_tick),
+        });
+    }
     fx.startTimer(.{
         .key = sweep_timer_key,
         .interval_ms = sweep_interval_ms,
@@ -217,7 +262,103 @@ pub fn boot(model: *Model, fx: *Effects) void {
         .output = .collect,
         .on_exit = Effects.exitMsg(.tz_done),
     });
-    model.now_ms = fx.wallMs();
+    refreshDisplay(model);
+}
+
+/// Walk every root collecting *.jsonl paths + sizes (no parsing).
+fn enumerateHistory(model: *Model) !void {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+
+    var queue: std.ArrayList(CatchupFile) = .empty;
+    errdefer {
+        for (queue.items) |f| model.allocator.free(f.path);
+        queue.deinit(model.allocator);
+    }
+
+    var walk_arena = std.heap.ArenaAllocator.init(model.allocator);
+    defer walk_arena.deinit();
+
+    const groups = [_]struct { agent: types.Agent, roots: []const []const u8, enabled: bool }{
+        .{ .agent = .claude, .roots = model.claude_roots, .enabled = model.cfg.sources.claude },
+        .{ .agent = .codex, .roots = model.codex_roots, .enabled = model.cfg.sources.codex },
+    };
+    for (groups) |group| {
+        if (!group.enabled) continue;
+        for (group.roots) |root| {
+            var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch continue;
+            defer dir.close(io);
+            var walker = try dir.walk(walk_arena.allocator());
+            defer walker.deinit();
+            while (true) {
+                const entry = (walker.next(io) catch break) orelse break;
+                if (entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, entry.path, ".jsonl")) continue;
+                const path = try std.fs.path.join(model.allocator, &.{ root, entry.path });
+                const stat = dir.statFile(io, entry.path, .{}) catch {
+                    model.allocator.free(path);
+                    continue;
+                };
+                try queue.append(model.allocator, .{ .agent = group.agent, .path = path, .size = stat.size });
+            }
+        }
+    }
+    // Oldest-first so burn/pace see history in causal order (claude
+    // session files aren't date-named, but rough order beats none;
+    // codex paths ARE date-ordered).
+    std.mem.sort(CatchupFile, queue.items, {}, struct {
+        fn lt(_: void, a: CatchupFile, b: CatchupFile) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lt);
+    model.catchup_queue = try queue.toOwnedSlice(model.allocator);
+}
+
+/// Parse queued history files until the byte budget is spent. Runs on
+/// the 30 ms catch-up timer; each chunk is a few ms of work, so frames
+/// land in between and the needle stays alive.
+fn processCatchupChunk(model: *Model, fx: *Effects) void {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+
+    var arena_state = std.heap.ArenaAllocator.init(model.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var budget: u64 = catchup_chunk_bytes;
+    while (model.catchup_next < model.catchup_queue.len) {
+        const file = model.catchup_queue[model.catchup_next];
+        switch (file.agent) {
+            .claude => {
+                var sink = claude.ListSink.init(model.allocator);
+                defer sink.deinit();
+                model.claude_tailer.scanFile(arena, io, file.path, sink.sink()) catch {};
+                for (sink.events.items) |ev| ingest(model, ev);
+            },
+            .codex => {
+                var events: std.ArrayList(types.UsageEvent) = .empty;
+                defer events.deinit(arena);
+                model.codex_tailer.poll(io, arena, file.path, &events) catch {};
+                for (events.items) |ev| ingest(model, ev);
+            },
+        }
+        model.catchup_next += 1;
+        if (file.size >= budget) break;
+        budget -= file.size;
+    }
+
+    if (model.catchup_next >= model.catchup_queue.len) {
+        model.catchup_active = false;
+        fx.cancelTimer(catchup_timer_key);
+        const took_ms = model.now_ms - model.catchup_started_ms;
+        std.log.info("history catch-up: {d} files in {d} ms", .{ model.catchup_queue.len, took_ms });
+        for (model.catchup_queue) |f| model.allocator.free(f.path);
+        model.allocator.free(model.catchup_queue);
+        model.catchup_queue = &.{};
+        model.catchup_next = 0;
+        // Limits + a full display pass now that the ledger is complete.
+        sweepOnce(model);
+    }
     refreshDisplay(model);
 }
 
@@ -225,10 +366,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .tick => {
             model.now_ms = fx.wallMs();
-            sweepOnce(model);
+            // While catch-up owns the tailers, the steady sweep stands
+            // down (offsets make overlap safe, but it's wasted work).
+            if (!model.catchup_active) sweepOnce(model);
             // First OAuth poll shouldn't wait for the 30 s gate.
             if (!model.first_sweep_done) maybeOauthPoll(model, fx);
             model.first_sweep_done = true;
+        },
+        .catchup_tick => {
+            model.now_ms = fx.wallMs();
+            if (model.catchup_active) processCatchupChunk(model, fx);
         },
         .oauth_tick => {
             model.now_ms = fx.wallMs();
@@ -348,7 +495,7 @@ fn handleCreds(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
     if (exit.code != 0) {
         model.oauth_inflight = false;
         model.oauth_next_ms = model.now_ms + oauth.poll_interval_ms;
-        setStatus(model, "keychain read failed (security exit {d})", .{exit.code});
+        setErrorStatus(model, "keychain read failed (security exit {d})", .{exit.code});
         return;
     }
 
@@ -357,7 +504,7 @@ fn handleCreds(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
     const creds = oauth.parseCredentials(arena_state.allocator(), std.mem.trim(u8, exit.output, " \t\r\n")) catch {
         model.oauth_inflight = false;
         model.oauth_next_ms = model.now_ms + oauth.poll_interval_ms;
-        setStatus(model, "unreadable Claude credentials payload", .{});
+        setErrorStatus(model, "unreadable Claude credentials payload", .{});
         return;
     };
 
@@ -395,18 +542,19 @@ fn handleOauthResponse(model: *Model, resp: native_sdk.EffectResponse) void {
         const snap = oauth.parseUsageResponse(arena_state.allocator(), resp.body, model.now_ms, plan) catch {
             model.oauth_backoff.onFailure();
             model.oauth_next_ms = model.now_ms + model.oauth_backoff.delayMs();
-            setStatus(model, "unparseable usage response", .{});
+            setErrorStatus(model, "unparseable usage response", .{});
             return;
         };
         model.walls.observe(snap);
         storeLimits(model, &model.claude_limits, snap);
         model.oauth_backoff.onSuccess();
+        model.status_error = false;
         model.oauth_last_success_ms = model.now_ms;
         model.oauth_next_ms = model.now_ms + oauth.poll_interval_ms;
     } else {
         model.oauth_backoff.onFailure();
         model.oauth_next_ms = model.now_ms + model.oauth_backoff.delayMs();
-        setStatus(model, "usage endpoint: status {d} ({t})", .{ resp.status, resp.outcome });
+        setErrorStatus(model, "usage endpoint: status {d} ({t})", .{ resp.status, resp.outcome });
     }
 }
 
@@ -414,6 +562,11 @@ fn handleOauthResponse(model: *Model, resp: native_sdk.EffectResponse) void {
 
 fn setStatus(model: *Model, comptime fmt: []const u8, args: anytype) void {
     model.status_text = std.fmt.bufPrint(&model.status_buf, fmt, args) catch model.status_text;
+}
+
+fn setErrorStatus(model: *Model, comptime fmt: []const u8, args: anytype) void {
+    setStatus(model, fmt, args);
+    model.status_error = true;
 }
 
 pub fn glanceState(model: *const Model) trayfmt.GlanceState {
@@ -469,8 +622,12 @@ fn refreshDisplay(model: *Model) void {
         w.writeAll(" tok") catch {};
         model.today_text = w.buffered();
     }
-    if (model.ready and model.status_text.ptr == &model.status_buf or model.status_text.len == 0 or std.mem.eql(u8, model.status_text, "starting…")) {
-        setStatus(model, "{d} events · {d} models priced", .{ model.ledger.all.events, model.ledger.per_model.count() });
+    if (model.catchup_active) {
+        setStatus(model, "scanning history… {d}/{d} files", .{ model.catchup_next, model.catchup_queue.len });
+    } else if (!model.status_error) {
+        if (model.ready) {
+            setStatus(model, "{d} events · {d} models priced", .{ model.ledger.all.events, model.ledger.per_model.count() });
+        }
     }
 }
 
