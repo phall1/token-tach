@@ -1,0 +1,10 @@
+this line is not json at all
+{"type":"event_msg","timestamp":"2025-10-09T13:58:00Z"
+{"type":"event_msg","timestamp":"2025-10-09T13:58:30Z"}
+[1,2,3]
+{"type":42,"timestamp":"2025-10-09T13:58:45Z","payload":{}}
+{"timestamp":"2025-10-09T13:59:00Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":50.0,"window_minutes":300,"resets_at":1760016000},"secondary":{"used_percent":9.0,"window_minutes":10080,"resets_at":1760400000},"plan_type":"plus"}}}
+{"timestamp":"not-a-timestamp","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2}}}}
+{"timestamp":"2025-10-09T13:59:30Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":"nope","cached_input_tokens":0,"output_tokens":5,"total_tokens":5}}}}
+{"timestamp":"2025-10-09T14:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":600,"output_tokens":250,"reasoning_output_tokens":50,"total_tokens":1150},"last_token_usage":{"input_tokens":900,"cached_input_tokens":600,"output_tokens":250,"reasoning_output_tokens":50,"total_tokens":1150},"model_context_window":258400},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":21.0,"window_minutes":300,"resets_at":1760016000},"secondary":{"used_percent":8.0,"window_minutes":10080,"resets_at":1760400000},"credits":null,"individual_limit":null,"plan_type":"plus","rate_limit_reached_type":null}}}
+{"timestamp":"2025-10-09T14:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":-5,"cached_input_tokens":0,"output_tokens":-1,"total_tokens":-6}}}}
