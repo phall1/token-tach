@@ -1,6 +1,8 @@
-//! A minimal native-rendered Native SDK app: the view lives in
-//! `app.native` (embedded into the binary, and watched for hot reload in
-//! dev); this file is the logic: `Model`, `Msg`, and `update`.
+//! token-tach: a menu-bar tachometer for AI coding-agent token usage.
+//! The engine (Model/Msg/boot/update) lives in `engine.zig`; the markup
+//! view in `app.native`; the UI-free core under `core/`. This file is
+//! shell wiring: window scene, permissions, the status-item glance, and
+//! the runtime entry point.
 
 const std = @import("std");
 const runner = @import("runner");
@@ -11,13 +13,25 @@ pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
-const canvas_label = "main-canvas";
-const window_width: f32 = 480;
-const window_height: f32 = 320;
+const engine = @import("engine.zig");
+const trayfmt = @import("core/trayfmt.zig");
 
-const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view };
+pub const Model = engine.Model;
+pub const Msg = engine.Msg;
+pub const update = engine.update;
+pub const boot = engine.boot;
+
+const canvas_label = "main-canvas";
+const window_width: f32 = 520;
+const window_height: f32 = 340;
+
+const app_permissions = [_][]const u8{
+    native_sdk.security.permission_command,
+    native_sdk.security.permission_view,
+    native_sdk.security.permission_network,
+};
 const shell_views = [_]native_sdk.ShellView{
-    .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Counter canvas", .accessibility_label = "Counter", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
+    .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Token usage dashboard", .accessibility_label = "Token Tach", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
 };
 const shell_windows = [_]native_sdk.ShellWindow{.{
     .label = "main",
@@ -29,53 +43,49 @@ const shell_windows = [_]native_sdk.ShellWindow{.{
 }};
 const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
-// ------------------------------------------------------------------ model
-
-pub const Msg = union(enum) {
-    increment,
-    decrement,
-    reset,
-};
-
-pub const Model = struct {
-    count: i64 = 0,
-};
-
-pub fn update(model: *Model, msg: Msg) void {
-    switch (msg) {
-        .increment => model.count += 1,
-        .decrement => model.count -= 1,
-        .reset => model.count = 0,
-    }
-}
-
 // ------------------------------------------------------------------- view
 
 pub const AppUi = canvas.Ui(Msg);
 pub const app_markup = @embedFile("app.native");
 
-// -------------------------------------------------------------------- app
+const TachApp = native_sdk.UiApp(Model, Msg);
 
-const CounterApp = native_sdk.UiApp(Model, Msg);
+/// The menu-bar glance: title is the trayfmt-rendered hero line, the
+/// dropdown mirrors the dashboard's per-agent and today lines. Rendered
+/// from the model after every dispatch; the runtime patches only what
+/// changed.
+fn statusItem(model: *const Model, scratch: *TachApp.StatusItemScratch) TachApp.StatusItemState {
+    const title = trayfmt.render(&scratch.title_buffer, model.cfg.tray_format, engine.glanceState(model));
+    scratch.items[0] = .{ .id = 1, .label = model.claude_text, .enabled = false };
+    scratch.items[1] = .{ .id = 2, .label = model.codex_text, .enabled = false };
+    scratch.items[2] = .{ .id = 3, .separator = true };
+    scratch.items[3] = .{ .id = 4, .label = model.today_text, .enabled = false };
+    return .{ .title = title, .items = scratch.items[0..4] };
+}
 
 pub fn initialModel() Model {
     return .{};
 }
 
 pub fn main(init: std.process.Init) !void {
-    // The app struct (and any real Model) is multi-MB: `create`
-    // heap-allocates and constructs everything in place, so neither
-    // ever rides the stack. Mutate `app_state.model` through the
-    // pointer before running if boot state is not the default.
-    const app_state = try CounterApp.create(std.heap.page_allocator, .{
+    const app_state = try TachApp.create(std.heap.page_allocator, .{
         .name = "token-tach",
         .scene = shell_scene,
         .canvas_label = canvas_label,
-        .update = update,
+        .update_fx = update,
+        .init_fx = boot,
+        .status_item_fn = statusItem,
         .markup = .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io },
     });
     defer app_state.destroy();
-    app_state.model = initialModel();
+
+    engine.setup(&app_state.model, std.heap.page_allocator, .{
+        .home = init.environ_map.get("HOME") orelse "",
+        .claude_config_dir = init.environ_map.get("CLAUDE_CONFIG_DIR"),
+        .codex_home = init.environ_map.get("CODEX_HOME"),
+    }) catch |err| {
+        std.log.err("engine setup failed: {s} — running with empty state", .{@errorName(err)});
+    };
 
     try runner.runWithOptions(app_state.app(), .{
         .app_name = "token-tach",
