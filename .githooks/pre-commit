@@ -37,8 +37,11 @@ if [ -n "$ZIG_FILES" ]; then
 fi
 
 # 2. native check — markup + manifest (validates app.zon), ~40ms
-if command -v native >/dev/null 2>&1; then
-  if OUT=$(native check 2>&1); then
+# Prefer the fork-built CLI: app.zon uses .macos, unparseable by stock 0.4.0.
+NATIVE="${NATIVE_BIN:-vendor/native/zig-out/bin/native}"
+[ -x "$NATIVE" ] || NATIVE=native
+if command -v "$NATIVE" >/dev/null 2>&1; then
+  if OUT=$("$NATIVE" check 2>&1); then
     echo "✓ native check (markup + app.zon)"
   else
     echo "✗ native check failed:"
@@ -56,6 +59,9 @@ IFS='
 '
 set -f
 for f in $STAGED; do
+  # Submodule pointers (gitlinks, mode 160000) have no blob content — skip.
+  mode=$(git ls-files --stage -- "$f" | awk '{print $1}' | head -n1)
+  [ "$mode" = "160000" ] && continue
   if git show ":$f" | grep -qIE '^(<{7}( |$)|>{7}( |$)|\|{7}( |$))'; then
     echo "✗ merge conflict markers in $f"
     content_ok=0

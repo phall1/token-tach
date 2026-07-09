@@ -41,6 +41,10 @@ const shell_windows = [_]native_sdk.ShellWindow{.{
     .title = "Token Tach",
     .width = window_width,
     .height = window_height,
+    // Popover-hosted instrument: fixed size, no chrome, no dead resize
+    // handles. Kept in lockstep with app.zon.
+    .titlebar = .chromeless,
+    .resizable = false,
     .restore_state = false,
     .views = &shell_views,
 }};
@@ -76,6 +80,9 @@ pub fn main(init: std.process.Init) !void {
         .canvas_label = canvas_label,
         .update_fx = update,
         .init_fx = boot,
+        // Static options carry the popover binding (tray click toggles an
+        // NSPopover hosting the "main" window); the fn derives title+menu.
+        .status_item = .{ .popover_window = "main" },
         .status_item_fn = statusItem,
         .view = view.rootView,
         .tokens = theme.tokens(),

@@ -8,6 +8,7 @@
     .platforms = .{"macos"},
     .permissions = .{ "view", "command", "network" },
     .capabilities = .{ "native_views", "gpu_surfaces", "tray" },
+    .macos = .{ .accessory = true },
     .shell = .{
         .windows = .{
             .{
@@ -15,6 +16,8 @@
                 .title = "Token Tach",
                 .width = 560,
                 .height = 420,
+                .titlebar = "chromeless",
+                .resizable = false,
                 .restore_state = false,
                 .restore_policy = "center_on_primary",
                 .views = .{

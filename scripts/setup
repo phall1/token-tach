@@ -41,11 +41,19 @@ else
   ok=0
 fi
 
-if command -v native >/dev/null 2>&1; then
-  echo "✓ $(native --version)"
+# The CLI must come from the vendored fork: app.zon uses `.macos`
+# (accessory mode), which the stock npm 0.4.0 CLI cannot parse.
+echo "==> fork CLI"
+if [ -x vendor/native/zig-out/bin/native ]; then
+  echo "✓ $(vendor/native/zig-out/bin/native --version) (fork)"
 else
-  echo "✗ native CLI not found — npm install -g @native-sdk/cli@0.4.0 (keep aligned with vendor/native, see docs/DEVELOPMENT.md)"
-  ok=0
+  echo "  building CLI from vendor/native (one-time, ~1 min)…"
+  if (cd vendor/native && zig build cli) >/dev/null 2>&1; then
+    echo "✓ $(vendor/native/zig-out/bin/native --version) (fork)"
+  else
+    echo "✗ fork CLI build failed — run: cd vendor/native && zig build cli"
+    ok=0
+  fi
 fi
 
 echo "✓ git $(git --version | sed 's/^git version //')"

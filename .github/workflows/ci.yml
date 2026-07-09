@@ -20,8 +20,8 @@ jobs:
       - name: Format check
         run: zig fmt --check src build.zig build.zig.zon
 
-      - name: Install Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.4.0
+      - name: Build Native SDK CLI from vendored fork
+        run: cd vendor/native && zig build cli
 
       - name: Verify
         run: scripts/verify

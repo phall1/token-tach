@@ -3,20 +3,27 @@
 #   1. native check   — markup/manifest/binding validation (ms)
 #   2. native test    — headless unit + model-contract tests
 #   3. native build   — automation-enabled ReleaseFast binary
-#   4. smoke drive    — launch app, snapshot a11y tree, click a widget,
-#                       assert state changed, screenshot, kill
+#   4. smoke drive    — launch app, snapshot a11y tree, toggle the tray
+#                       popover, assert state, screenshot, kill
 # Usage: scripts/verify [--no-smoke]
 set -e
 cd "$(dirname "$0")/.."
 
+# The app.zon uses `.macos` (accessory mode), which the stock npm CLI
+# cannot parse — prefer the CLI built from the vendored fork.
+# scripts/setup builds it; NATIVE_BIN overrides.
+NATIVE="${NATIVE_BIN:-vendor/native/zig-out/bin/native}"
+[[ -x "$NATIVE" ]] || NATIVE=native
+echo "==> using $($NATIVE --version)"
+
 echo "==> native check"
-native check
+$NATIVE check
 
 echo "==> native test"
-native test
+$NATIVE test
 
 echo "==> native build (-Dautomation=true)"
-native build -Dautomation=true
+$NATIVE build -Dautomation=true
 
 if [[ "$1" == "--no-smoke" ]]; then
   echo "==> smoke skipped"
@@ -24,6 +31,8 @@ if [[ "$1" == "--no-smoke" ]]; then
 fi
 
 echo "==> smoke drive"
+pkill -f zig-out/bin/token-tach 2>/dev/null || true
+sleep 0.5
 ./zig-out/bin/token-tach >/dev/null 2>&1 &
 APP_PID=$!
 cleanup() { kill $APP_PID 2>/dev/null || true }
@@ -31,23 +40,31 @@ trap cleanup EXIT
 
 # wait for automation socket
 for i in {1..20}; do
-  native automate list >/dev/null 2>&1 && break
+  $NATIVE automate list >/dev/null 2>&1 && break
   sleep 0.25
 done
 
-SNAP=$(native automate snapshot 2>/dev/null)
-echo "$SNAP" | grep -q 'window @w1' || { echo "FAIL: no window in snapshot"; exit 1 }
+SNAP=$($NATIVE automate snapshot 2>/dev/null)
+# Popover-hosted: the window exists but stays hidden until toggled.
+echo "$SNAP" | grep -q 'popover_window="main"' || { echo "FAIL: tray popover binding missing"; exit 1 }
 
-# Smoke assertions: the dashboard rendered its engine-bound strings.
-# "today $" comes from refreshDisplay at boot (works with an empty ledger),
-# and the status bar proves the full column laid out.
-SPEC_VIEW="main-canvas"
+# Toggle the popover open and assert the dashboard rendered.
+$NATIVE automate native-command native-sdk.tray.toggle-popover >/dev/null 2>&1 || true
+sleep 1
+SNAP=$($NATIVE automate snapshot 2>/dev/null)
+echo "$SNAP" | grep -q 'popover_visible=true' || { echo "FAIL: popover did not open"; exit 1 }
 echo "$SNAP" | grep -q 'today \$' || { echo "FAIL: today line missing from snapshot"; exit 1 }
-echo "$SNAP" | grep -q 'models priced\|starting' || { echo "FAIL: status line missing"; exit 1 }
+echo "$SNAP" | grep -q 'models priced\|starting\|scanning' || { echo "FAIL: status line missing"; exit 1 }
+
 # Give the first 2s sweep a chance to run, then confirm the app survived it.
 sleep 3
-native automate snapshot 2>/dev/null | grep -q 'today \$' || { echo "FAIL: app died or blanked after first sweep"; exit 1 }
-native automate screenshot "$SPEC_VIEW" >/dev/null 2>&1 || true
+$NATIVE automate snapshot 2>/dev/null | grep -q 'today \$' || { echo "FAIL: app died or blanked after first sweep"; exit 1 }
+$NATIVE automate screenshot main-canvas >/dev/null 2>&1 || true
+
+# Toggle closed again — the full round trip.
+$NATIVE automate native-command native-sdk.tray.toggle-popover >/dev/null 2>&1 || true
+sleep 1
+$NATIVE automate snapshot 2>/dev/null | grep -q 'popover_visible=false' || { echo "FAIL: popover did not close"; exit 1 }
 
 echo "==> smoke drive: PASS"
 echo "VERIFY: ALL GREEN"
