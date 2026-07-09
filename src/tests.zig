@@ -11,6 +11,8 @@ test {
     _ = @import("core/pricing.zig");
     _ = @import("core/oauth.zig");
     _ = @import("core/keychain.zig");
+    _ = @import("core/ledger.zig");
+    _ = @import("core/predict.zig");
 }
 
 const canvas = native_sdk.canvas;
