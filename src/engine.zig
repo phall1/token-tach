@@ -26,6 +26,7 @@ pub const sweep_timer_key: u64 = 1;
 pub const oauth_gate_timer_key: u64 = 2;
 pub const oauth_fetch_key: u64 = 3;
 pub const tz_spawn_key: u64 = 4;
+pub const creds_spawn_key: u64 = 5;
 
 pub const sweep_interval_ms: u32 = 2_000;
 pub const oauth_gate_interval_ms: u32 = 30_000;
@@ -33,6 +34,7 @@ pub const oauth_gate_interval_ms: u32 = 30_000;
 pub const Msg = union(enum) {
     tick: native_sdk.EffectTimer,
     oauth_tick: native_sdk.EffectTimer,
+    creds_done: native_sdk.EffectExit,
     oauth_response: native_sdk.EffectResponse,
     tz_done: native_sdk.EffectExit,
 };
@@ -70,6 +72,11 @@ pub const Model = struct {
     now_ms: i64 = 0,
     tz_offset_min: i32 = 0,
     first_sweep_done: bool = false,
+
+    /// Plan tier from the keychain credentials ("max"/"pro"), locally
+    /// known without any API call.
+    claude_plan: []const u8 = "",
+    claude_plan_buf: [32]u8 = undefined,
 
     // Display strings bound by app.native — regenerated each sweep, and
     // pointing into the fixed buffers below (never into stack copies).
@@ -180,6 +187,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.now_ms = fx.wallMs();
             maybeOauthPoll(model, fx);
         },
+        .creds_done => |exit| {
+            model.now_ms = fx.wallMs();
+            handleCreds(model, exit, fx);
+        },
         .oauth_response => |resp| {
             model.now_ms = fx.wallMs();
             handleOauthResponse(model, resp);
@@ -267,33 +278,53 @@ fn storeLimits(model: *Model, slot: *?types.LimitSnapshot, snap: types.LimitSnap
 
 // ------------------------------------------------------------------ oauth
 
+/// Kick a poll: acquire credentials ASYNCHRONOUSLY via Apple's
+/// security(1) through the effects channel. A synchronous SecItem read
+/// (keychain.zig) blocks the whole dispatch loop on macOS's keychain
+/// consent dialog for unsigned binaries — the frozen-tray bug. The
+/// spawn keeps any consent prompt in the child; keychain.zig remains
+/// the path for signed/bundled builds whose ACL entry sticks.
 fn maybeOauthPoll(model: *Model, fx: *Effects) void {
     if (!model.cfg.claude_oauth) return;
     if (model.oauth_inflight or model.now_ms < model.oauth_next_ms) return;
 
-    const raw = keychain.readGenericPassword(model.allocator, keychain.claude_service) catch |err| {
-        setStatus(model, "keychain unavailable: {s}", .{@errorName(err)});
+    model.oauth_inflight = true;
+    fx.spawn(.{
+        .key = creds_spawn_key,
+        .argv = &.{ "security", "find-generic-password", "-s", keychain.claude_service, "-w" },
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.creds_done),
+    });
+}
+
+fn handleCreds(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
+    if (exit.code != 0) {
+        model.oauth_inflight = false;
         model.oauth_next_ms = model.now_ms + oauth.poll_interval_ms;
+        setStatus(model, "keychain read failed (security exit {d})", .{exit.code});
         return;
-    } orelse {
-        setStatus(model, "no Claude Code credentials in keychain", .{});
-        model.oauth_next_ms = model.now_ms + oauth.poll_interval_ms;
-        return;
-    };
-    defer model.allocator.free(raw);
+    }
 
     var arena_state = std.heap.ArenaAllocator.init(model.allocator);
     defer arena_state.deinit();
-    const creds = oauth.parseCredentials(arena_state.allocator(), raw) catch {
-        setStatus(model, "unreadable Claude credentials payload", .{});
+    const creds = oauth.parseCredentials(arena_state.allocator(), std.mem.trim(u8, exit.output, " \t\r\n")) catch {
+        model.oauth_inflight = false;
         model.oauth_next_ms = model.now_ms + oauth.poll_interval_ms;
+        setStatus(model, "unreadable Claude credentials payload", .{});
         return;
     };
 
-    var auth_buf: [2048]u8 = undefined;
-    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{creds.access_token}) catch return;
+    if (creds.subscription_type.len > 0 and creds.subscription_type.len <= model.claude_plan_buf.len) {
+        @memcpy(model.claude_plan_buf[0..creds.subscription_type.len], creds.subscription_type);
+        model.claude_plan = model.claude_plan_buf[0..creds.subscription_type.len];
+    }
 
-    model.oauth_inflight = true;
+    var auth_buf: [2048]u8 = undefined;
+    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{creds.access_token}) catch {
+        model.oauth_inflight = false;
+        return;
+    };
+
     fx.fetch(.{
         .key = oauth_fetch_key,
         .url = oauth.endpoint_url,
@@ -311,7 +342,7 @@ fn maybeOauthPoll(model: *Model, fx: *Effects) void {
 fn handleOauthResponse(model: *Model, resp: native_sdk.EffectResponse) void {
     model.oauth_inflight = false;
     if (resp.outcome == .ok and resp.status == 200) {
-        const plan: []const u8 = if (model.claude_limits) |l| l.plan else "";
+        const plan = model.claude_plan;
         var arena_state = std.heap.ArenaAllocator.init(model.allocator);
         defer arena_state.deinit();
         const snap = oauth.parseUsageResponse(arena_state.allocator(), resp.body, model.now_ms, plan) catch {
