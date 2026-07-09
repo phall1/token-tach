@@ -56,7 +56,7 @@ for NSPopover-under-status-item, LSUIElement, and SMAppService — upstream
 PRs pending.
 
 The `native` CLI itself (check/test/build/automate verbs) still comes from
-npm `@native-sdk/cli`; keep its version aligned with the vendored commit.
+the vendored fork (`cd vendor/native && zig build cli` -> vendor/native/zig-out/bin/native); scripts/setup builds it. The stock npm CLI cannot parse app.zon's `.macos` key.
 
 ### Rebasing onto a new SDK release
 
@@ -65,7 +65,7 @@ cd vendor/native
 git fetch https://github.com/vercel-labs/native main
 git rebase FETCH_HEAD          # replay our patches
 cd ../.. && scripts/verify     # prove the world still stands
-npm i -g @native-sdk/cli@<matching version>
+(cd vendor/native && zig build cli)   # rebuild the fork CLI
 git add vendor/native && git commit
 ```
 
