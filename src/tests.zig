@@ -13,6 +13,7 @@ test {
     _ = @import("core/keychain.zig");
     _ = @import("core/ledger.zig");
     _ = @import("core/predict.zig");
+    _ = @import("core/trayfmt.zig");
 }
 
 const canvas = native_sdk.canvas;
