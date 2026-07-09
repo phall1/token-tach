@@ -1,35 +1,70 @@
 # token-tach
 
 A macOS menu-bar tachometer for AI coding-agent token usage and subscription
-limits. LiteLLM-dashboard truth without the proxy: everything is read from
-the session ledgers your agents already write, plus each vendor's own limit
-data.
+limits. It reads the session ledgers your agents already write — no proxy,
+no accounts, no telemetry — and turns them into an instrument.
 
 ```
-⚡ 214k/m → wall 3:40p          ← the menu bar, all day
+⚡ 50.7k/m → wall 3:40p          ← the menu bar, all day
 ```
 
-Click it:
-
-```
-claude  172M tok · $202.80 · 5h 34% · wk 12% · max
-codex   188M tok · $154.16 · 5h 3%  · wk 8%  · pro
-today   $114.85 · 116M tok
-```
+One click:
 
 ![the tach cluster](docs/assets/cluster.png)
 
+And yes — the needle does the full ignition sweep every time you open it:
+
+![ignition sweep](docs/assets/ignition.png)
+
 ## What it shows
 
-- **Burn rate** — limit-weighted tokens/minute (cache reads at 0.1×),
-  decayed over a 15-minute window. The needle.
+- **Burn rate** — limit-weighted tokens/minute (cache reads at 0.1×, because
+  that's roughly how they press on your quota), decayed over a 15-minute
+  window. The needle.
 - **Predicted wall** — "at this pace you hit a limit at 3:40 PM", projected
   from the *slope of the vendors' own utilization numbers*, not guessed
   token capacities.
 - **Window utilization** — Claude 5-hour / weekly (server truth) and Codex
-  5-hour / weekly (embedded in its logs), with reset countdowns.
-- **Today's spend** — API-equivalent dollars for what your subscription
-  absorbed, priced against LiteLLM's model-price database.
+  5-hour / weekly (embedded in its own logs), with reset countdowns and
+  threshold coloring.
+- **Today's spend** — API-equivalent dollars your subscription absorbed,
+  priced against LiteLLM's model database, on a mechanical odometer.
+
+## Why it's fast
+
+The binary is **~2.4 MB** — no Electron, no webview, no JS runtime. Native
+Zig on [Native SDK](https://github.com/vercel-labs/native), drawing every
+pixel through Metal.
+
+- **Cold launch**: window up instantly; months of JSONL history parse in
+  byte-budgeted 30 ms background chunks (~600 ms total) that never block a
+  frame.
+- **Warm launch**: tailer offsets and ledger rollups persist to an atomic
+  state file, so the next launch restores in **~2 ms** and re-reads only
+  what grew.
+- **Steady state**: the 2-second sweep costs **~0.1 ms** when nothing
+  changed (dir-mtime + hot-file detection; full re-walk only every 30 s).
+
+## How it's built (the fun parts)
+
+- **The popover is a patched framework.** Native SDK had a tray API but no
+  `NSPopover`, no dock-less mode, no launch-at-login — so this repo vendors
+  [a fork](https://github.com/phall1/native/tree/token-tach-patches) that
+  adds all three to its Objective-C AppKit host, with the popover reparenting
+  the app's Metal surface in and out of an `NSViewController`.
+- **The needle is real geometry.** The widget grammar rasterizes rects
+  axis-aligned, so the blade is a tapered vector path drawn through the
+  chrome display-list seam — the one primitive that stays true under the
+  render-animation rotation channel. Rest pose is always truth; animations
+  replay only deltas.
+- **Server-truth limits, no scraping.** Claude's 5h/weekly utilization comes
+  from the same OAuth endpoint Claude Code's `/usage` uses. Codex is even
+  better: it writes its `rate_limits` straight into its rollout files —
+  zero network for OpenAI numbers.
+- **Everything is fixture-tested.** ~100 tests over the UI-free core
+  (tailers, pricing, prediction, ledger, config, state), and `scripts/verify`
+  launches the real app headlessly, toggles the actual popover, walks the
+  accessibility tree, and screenshots it — locally and in CI.
 
 ## Where the data comes from (the trust story)
 
@@ -38,35 +73,38 @@ today   $114.85 · 116M tok
 | Source | What | How |
 |---|---|---|
 | Claude Code | tokens per message | tails `~/.claude/projects/**/*.jsonl` (and `$CLAUDE_CONFIG_DIR`), dedupes on `message.id:requestId` |
-| Codex CLI | tokens **and** 5h/weekly limit % | tails `~/.codex/sessions/**` — Codex embeds `rate_limits` in its own logs, so no network is involved |
+| Codex CLI | tokens **and** 5h/weekly limit % | tails `~/.codex/sessions/**` — limits are embedded in the logs |
 | Pricing | $/token rates | bundled snapshot of LiteLLM's `model_prices_and_context_window.json` |
 
-**Opt-in (`claude-oauth = true` in the config):** Claude's *server-truth*
-window utilization comes from the same endpoint Claude Code's `/usage` uses:
+**Opt-in (`claude-oauth = true`):** Claude's server-truth utilization via
 `GET https://api.anthropic.com/api/oauth/usage` with your existing Claude
-Code OAuth token (read from the macOS Keychain item
-`Claude Code-credentials` via Apple's `security` tool — macOS will ask for
-consent). Polled every 180 s, exponential backoff on 429, nothing else is
-sent — the request carries only your token and standard headers. Off by
-default; the app never writes to the Keychain and never talks to any other
-host.
+Code OAuth token (read from the Keychain item `Claude Code-credentials`
+via Apple's `security` tool — macOS asks for consent). Polled every 180 s,
+exponential backoff on 429. The request carries your token and standard
+headers, nothing else, to that host and no other. The app never writes to
+the Keychain. Off by default.
 
 ## Install
 
 ```sh
 git clone --recurse-submodules https://github.com/phall1/token-tach
 cd token-tach
-scripts/setup        # hooks, submodules, toolchain check (zig ≥ 0.16, native CLI)
-native build && ./zig-out/bin/token-tach
+scripts/setup                          # hooks, submodules, toolchain, fork CLI
+vendor/native/zig-out/bin/native build
+open zig-out/bin/token-tach            # or scripts/release for a .app/DMG
 ```
 
-Package a .app / DMG: `scripts/release` (adhoc) or
-`scripts/release --identity "Developer ID Application: …" --notarize`.
+Or grab the DMG from
+[releases](https://github.com/phall1/token-tach/releases) (adhoc-signed for
+now: right-click → Open the first time).
+
+It's an accessory app: no Dock icon — look for the glance in the menu bar.
+Left-click for the cluster, right-click for quick stats and Quit.
 
 ## Configure
 
-`~/.config/token-tach/config` — plain `key = value`, ghostty-style, every
-default overridable:
+`~/.config/token-tach/config` — plain `key = value`, ghostty-style,
+**live-reloaded** (edit it and watch the tray re-template within a tick):
 
 ```ini
 # the menu-bar template: {burn} {eta} {pct} {tok} {cost}
@@ -83,37 +121,25 @@ source = claude, codex     # enable/disable agents
 ## Development
 
 ```sh
-scripts/verify   # check + test + build + headless smoke drive
-native dev       # run with hot-reloading .native markup
+scripts/verify   # check + test + build + headless popover smoke drive
+native dev       # hot-reloading dev run
 ```
 
-See `docs/DEVELOPMENT.md` for the full loop, the SDK's built-in agent docs
-(`native skills get core`), and the vendored-fork rebase procedure.
-
-## Architecture
-
-Built on the [Native SDK](https://github.com/vercel-labs/native) (Zig,
-compiled declarative markup, own Metal renderer — no Electron, no webview;
-the binary is a few MB). The repo vendors a fork at `vendor/native` carrying
-small AppKit-host patches (tray popover, dock-less mode, launch-at-login)
-that are being upstreamed.
+See `docs/DEVELOPMENT.md` for the loop, the SDK's built-in agent docs, and
+the vendored-fork rebase procedure.
 
 ```
-src/core/       UI-free engine: tailers, pricing, ledger, prediction, oauth
+src/core/       UI-free engine: tailers, pricing, ledger, prediction, oauth, state
 src/engine.zig  the TEA loop: timers → sweep → ledger/burn/walls → display
-src/main.zig    shell: window scene, status item, runtime entry
+src/view.zig    the instrument cluster (canvas + vector chrome)
+src/main.zig    shell: scene, status item, popover, runtime entry
 ```
-
-Everything in `src/core` is fixture-tested and also powers the planned
-`token-tach --json` CLI.
 
 ## Status
 
-v1.0: tray glance, popover instrument cluster, both tailers, pricing,
-prediction, server-truth limits, live config reload — all shipped and
-verified. Next: notifications, history dashboard, `--json` CLI — see the
-issue tracker (this repo uses
-[beads](https://github.com/steveyegge/beads): `bd list`).
+v0.2: ignition sweep, machined dial, warm launches, live config reload.
+Next: notifications, history dashboard, `--json` CLI — tracked in
+[beads](https://github.com/steveyegge/beads) (`bd list`).
 
 ## License
 
