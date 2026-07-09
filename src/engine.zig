@@ -46,6 +46,8 @@ pub const Msg = union(enum) {
     creds_done: native_sdk.EffectExit,
     oauth_response: native_sdk.EffectResponse,
     tz_done: native_sdk.EffectExit,
+    /// Tray "Quit" — accessory apps have no Dock icon to quit from.
+    quit,
     /// Display-only: the tray popover just opened (SDK on_command
     /// `tray.popover_opened`) — replay the ignition sweep.
     popover_opened,
@@ -625,6 +627,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .popover_opened => {
             model.now_ms = fx.wallMs();
             startIgnition(model, fx);
+        },
+        .quit => {
+            // Accessory app: the tray Quit item is the only exit
+            // affordance. Flush state, then leave — the runtime has no
+            // graceful-shutdown API to hand back to.
+            saveStateNow(model);
+            std.process.exit(0);
         },
         .ignition_tick => {
             model.now_ms = fx.wallMs();

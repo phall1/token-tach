@@ -66,13 +66,16 @@ fn statusItem(model: *const Model, scratch: *TachApp.StatusItemScratch) TachApp.
     scratch.items[1] = .{ .id = 2, .label = model.codex_text, .enabled = false };
     scratch.items[2] = .{ .id = 3, .separator = true };
     scratch.items[3] = .{ .id = 4, .label = model.today_text, .enabled = false };
-    return .{ .title = title, .items = scratch.items[0..4] };
+    scratch.items[4] = .{ .id = 5, .separator = true };
+    scratch.items[5] = .{ .id = 6, .label = "Quit Token Tach", .command = "tach.quit" };
+    return .{ .title = title, .items = scratch.items[0..6] };
 }
 
 /// Shell commands → display Msgs: the popover-open notification keys
 /// the ignition sweep (the rest of the tray traffic stays unmapped).
 fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "tray.popover_opened")) return .popover_opened;
+    if (std.mem.eql(u8, name, "tach.quit")) return .quit;
     return null;
 }
 

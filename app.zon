@@ -9,6 +9,9 @@
     .permissions = .{ "view", "command", "network" },
     .capabilities = .{ "native_views", "gpu_surfaces", "tray" },
     .macos = .{ .accessory = true },
+    .commands = .{
+        .{ .id = "tach.quit", .title = "Quit Token Tach" },
+    },
     .shell = .{
         .windows = .{
             .{
