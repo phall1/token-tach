@@ -2,6 +2,15 @@ const std = @import("std");
 const native_sdk = @import("native_sdk");
 const main = @import("main.zig");
 
+// Pull in core-engine module tests (import-based discovery).
+test {
+    _ = @import("core/types.zig");
+    _ = @import("core/config.zig");
+    _ = @import("core/claude.zig");
+    _ = @import("core/codex.zig");
+    _ = @import("core/pricing.zig");
+}
+
 const canvas = native_sdk.canvas;
 const testing = std.testing;
 
