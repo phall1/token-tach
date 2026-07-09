@@ -109,10 +109,11 @@ Everything in `src/core` is fixture-tested and also powers the planned
 
 ## Status
 
-Early but real: the tray glance, both tailers, pricing, prediction, and
-server-truth limits are live. Popover instrument cluster, notifications,
-history dashboard, and the CLI are in flight — see the issue tracker
-(this repo uses [beads](https://github.com/steveyegge/beads): `bd list`).
+v1.0: tray glance, popover instrument cluster, both tailers, pricing,
+prediction, server-truth limits, live config reload — all shipped and
+verified. Next: notifications, history dashboard, `--json` CLI — see the
+issue tracker (this repo uses
+[beads](https://github.com/steveyegge/beads): `bd list`).
 
 ## License
 

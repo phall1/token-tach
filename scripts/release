@@ -10,6 +10,10 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# app.zon uses `.macos` — needs the fork-built CLI (see scripts/setup).
+NATIVE="${NATIVE_BIN:-vendor/native/zig-out/bin/native}"
+[[ -x "$NATIVE" ]] || NATIVE=native
+
 IDENTITY=""
 TEAM_ID=""
 NOTARIZE=0
@@ -34,7 +38,7 @@ else
   ARGS+=(--signing adhoc)
   echo "    (adhoc signing — pass --identity for a distributable build)"
 fi
-native package "${ARGS[@]}"
+$NATIVE package "${ARGS[@]}"
 
 APP=$(ls -d zig-out/package/*.app 2>/dev/null | head -1 || true)
 DMG=$(ls zig-out/package/*.dmg 2>/dev/null | head -1 || true)
