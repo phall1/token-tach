@@ -14,7 +14,7 @@ One click:
 
 And yes — the needle does the full ignition sweep every time you open it:
 
-![ignition sweep](docs/assets/ignition.png)
+![ignition sweep](docs/assets/ignition.gif)
 
 ## What it shows
 
