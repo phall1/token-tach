@@ -17,6 +17,7 @@ const pricing = @import("core/pricing.zig");
 const ledger_mod = @import("core/ledger.zig");
 const statefile = @import("core/statefile.zig");
 const predict = @import("core/predict.zig");
+const alerts = @import("core/alerts.zig");
 const oauth = @import("core/oauth.zig");
 const keychain = @import("core/keychain.zig");
 const trayfmt = @import("core/trayfmt.zig");
@@ -53,6 +54,14 @@ pub const Msg = union(enum) {
     popover_opened,
     /// Display-only: an ignition phase boundary (one-shot timer).
     ignition_tick: native_sdk.EffectTimer,
+    /// Open the history dashboard window (tray menu item or the
+    /// popover's DASH button). The flag IS the window: main.zig's
+    /// `windows_fn` declares the window while it is set and the runtime
+    /// reconciles after every dispatch.
+    open_dashboard,
+    /// The user closed the dashboard window — clear the flag so the
+    /// model agrees with the platform (see WindowDescriptor.on_close).
+    dashboard_closed,
 };
 
 /// One queued history file awaiting its catch-up parse.
@@ -86,6 +95,7 @@ pub const Model = struct {
     ledger: ledger_mod.Ledger = undefined,
     burn: predict.BurnRate = .{},
     walls: predict.WallTracker = .{},
+    alerts: alerts.AlertEngine = .{},
 
     /// Latest limit snapshots for display (windows slices owned by us).
     claude_limits: ?types.LimitSnapshot = null,
@@ -157,6 +167,11 @@ pub const Model = struct {
     // restarting the sweep.
     ignition_phase: IgnitionPhase = .off,
     ignition_t0_ms: i64 = 0,
+
+    /// The history dashboard window's open flag (pure display). The
+    /// runtime reconciles model-declared windows against this after
+    /// every dispatch — presence IS visibility.
+    dashboard_open: bool = false,
 };
 
 pub const IgnitionPhase = enum { off, up, settle };
@@ -593,6 +608,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 sweepOnce(model);
                 const sweep_us = (native_sdk.monotonicNanoseconds() - sweep_start_ns) / std.time.ns_per_us;
                 std.log.debug("sweep: {d} us", .{sweep_us});
+                dispatchAlerts(model, fx);
                 maybeSaveState(model);
             }
             // First OAuth poll shouldn't wait for the 30 s gate.
@@ -614,6 +630,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .oauth_response => |resp| {
             model.now_ms = fx.wallMs();
             handleOauthResponse(model, resp);
+            dispatchAlerts(model, fx);
             refreshDisplay(model);
         },
         .tz_done => |exit| {
@@ -634,6 +651,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // graceful-shutdown API to hand back to.
             saveStateNow(model);
             std.process.exit(0);
+        },
+        .open_dashboard => {
+            model.now_ms = fx.wallMs();
+            model.dashboard_open = true;
+        },
+        .dashboard_closed => {
+            model.dashboard_open = false;
         },
         .ignition_tick => {
             model.now_ms = fx.wallMs();
@@ -727,6 +751,34 @@ fn storeLimits(model: *Model, slot: *?types.LimitSnapshot, snap: types.LimitSnap
         model.allocator.free(old.plan);
     }
     slot.* = .{ .agent = snap.agent, .read_at_ms = snap.read_at_ms, .plan = plan, .windows = windows };
+}
+
+fn dispatchAlerts(model: *Model, fx: *Effects) void {
+    var snaps: [2]types.LimitSnapshot = undefined;
+    var count: usize = 0;
+    if (model.claude_limits) |snap| {
+        snaps[count] = snap;
+        count += 1;
+    }
+    if (model.codex_limits) |snap| {
+        snaps[count] = snap;
+        count += 1;
+    }
+    const fired = model.alerts.observe(
+        model.now_ms,
+        model.tz_offset_min,
+        snaps[0..count],
+        model.walls.nearestWall(model.now_ms),
+        model.cfg.alert_thresholds,
+    );
+    const services = fx.services orelse return;
+    for (fired) |*alert| {
+        services.showNotification(.{
+            .title = alert.title(),
+            .subtitle = "Token Tach",
+            .body = alert.body(),
+        }) catch {};
+    }
 }
 
 // ------------------------------------------------------------------ oauth
@@ -934,6 +986,154 @@ fn agentLine(buf: []u8, model: *const Model, agent: types.Agent, limits: ?types.
     return w.buffered();
 }
 
+// --------------------------------------------------- dashboard rollups
+// Pure display helpers for the history dashboard window: local calendar
+// math over the ledger's per-day buckets plus the subscription-value
+// framing. All read-only over Model/Ledger — unit-tested below.
+
+/// A local civil date derived from a ledger day key (days since epoch
+/// in the ledger's local time; see ledger.dayKey).
+pub const CivilDate = struct { year: u16, month: u8, day: u8 };
+
+pub fn civilFromDayKey(day_key: i64) CivilDate {
+    const epoch = std.time.epoch;
+    const clamped: u47 = @intCast(std.math.clamp(day_key, 0, std.math.maxInt(u47)));
+    const year_day = (epoch.EpochDay{ .day = clamped }).calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    return .{
+        .year = year_day.year,
+        .month = month_day.month.numeric(),
+        .day = @as(u8, month_day.day_index) + 1,
+    };
+}
+
+/// This local calendar month's rollup: the month the journaled clock
+/// says it is (in the ledger's tz), summed from per-day buckets.
+pub const MonthRollup = struct {
+    year: u16,
+    /// 1–12.
+    month: u8,
+    /// Day key of the 1st (inclusive lower bound of the bucket scan).
+    first_day_key: i64,
+    /// Calendar length of the month in days.
+    day_count: u8,
+    totals: ledger_mod.Totals,
+    /// Local days this month with at least one event.
+    active_days: u32,
+};
+
+pub fn monthRollup(ledger: *const ledger_mod.Ledger, now_ms: i64) MonthRollup {
+    const today_key = ledger_mod.dayKey(now_ms, ledger.tz_offset_min);
+    const date = civilFromDayKey(today_key);
+    const first = today_key - @as(i64, date.day) + 1;
+    const day_count: u8 = std.time.epoch.getDaysInMonth(date.year, @enumFromInt(date.month));
+    var out: MonthRollup = .{
+        .year = date.year,
+        .month = date.month,
+        .first_day_key = first,
+        .day_count = day_count,
+        .totals = .{},
+        .active_days = 0,
+    };
+    for (ledger.per_day.keys(), ledger.per_day.values()) |key, totals| {
+        if (key < first or key >= first + day_count) continue;
+        accumulateTotals(&out.totals, totals);
+        if (totals.events > 0) out.active_days += 1;
+    }
+    return out;
+}
+
+/// Fill `out` with cost per local day for the trailing `out.len` days,
+/// oldest first — `out[out.len - 1]` is today. Days with no bucket are 0.
+pub fn trailingDailyCost(ledger: *const ledger_mod.Ledger, now_ms: i64, out: []f64) void {
+    const today_key = ledger_mod.dayKey(now_ms, ledger.tz_offset_min);
+    for (out, 0..) |*slot, i| {
+        const key = today_key - @as(i64, @intCast(out.len - 1 - i));
+        slot.* = if (ledger.per_day.get(key)) |totals| totals.cost_usd else 0;
+    }
+}
+
+fn accumulateTotals(dst: *ledger_mod.Totals, src: ledger_mod.Totals) void {
+    dst.input_tokens += src.input_tokens;
+    dst.output_tokens += src.output_tokens;
+    dst.cache_creation_tokens += src.cache_creation_tokens;
+    dst.cache_read_tokens += src.cache_read_tokens;
+    dst.cost_usd += src.cost_usd;
+    dst.events += src.events;
+}
+
+/// A known plan's monthly price band. `lo == hi` when the plan string
+/// names one price; claude "max" is ambiguous between the 5x ($100) and
+/// 20x ($200) tiers — the credentials payload doesn't say which — so it
+/// carries the whole band and every derived figure says so.
+pub const PlanPrice = struct { lo: f64, hi: f64 };
+
+pub fn planPrice(agent: types.Agent, plan: []const u8) ?PlanPrice {
+    const eq = std.ascii.eqlIgnoreCase;
+    switch (agent) {
+        .claude => {
+            if (eq(plan, "pro")) return .{ .lo = 20, .hi = 20 };
+            if (eq(plan, "max")) return .{ .lo = 100, .hi = 200 };
+        },
+        .codex => {
+            if (eq(plan, "plus")) return .{ .lo = 20, .hi = 20 };
+            if (eq(plan, "pro")) return .{ .lo = 200, .hi = 200 };
+            if (eq(plan, "free")) return .{ .lo = 0, .hi = 0 };
+        },
+    }
+    return null;
+}
+
+/// The subscription-value framing: what the ledger's usage would have
+/// cost at API rates versus what the visible plans cost per month.
+/// Honesty rules: the multiple divides by the plan band's HIGH end (a
+/// lower bound, displayed "≥"), and an agent with usage but no
+/// recognizable plan marks the figure incomplete — an understated
+/// denominator would inflate the multiple, so none is claimed.
+pub const SubscriptionValue = struct {
+    plan_lo_usd: f64 = 0,
+    plan_hi_usd: f64 = 0,
+    claude_plan: []const u8 = "",
+    codex_plan: []const u8 = "",
+    /// Some agent contributed usage without a priceable plan string.
+    incomplete: bool = false,
+
+    /// The plan band spans two possible tiers (claude "max").
+    pub fn ambiguous(self: SubscriptionValue) bool {
+        return self.plan_lo_usd != self.plan_hi_usd;
+    }
+
+    /// Conservative "N× the plan" multiple: cost ÷ high end of the plan
+    /// band. Null when the denominator is unknown or zero.
+    pub fn multipleLowerBound(self: SubscriptionValue, api_cost_usd: f64) ?f64 {
+        if (self.incomplete or self.plan_hi_usd <= 0) return null;
+        return api_cost_usd / self.plan_hi_usd;
+    }
+};
+
+pub fn subscriptionValue(model: *const Model) SubscriptionValue {
+    var out: SubscriptionValue = .{};
+    out.claude_plan = if (model.claude_plan.len > 0)
+        model.claude_plan
+    else if (model.claude_limits) |snap| snap.plan else "";
+    out.codex_plan = if (model.codex_limits) |snap| snap.plan else "";
+
+    const plans = [_]struct { agent: types.Agent, plan: []const u8 }{
+        .{ .agent = .claude, .plan = out.claude_plan },
+        .{ .agent = .codex, .plan = out.codex_plan },
+    };
+    for (plans) |entry| {
+        const has_usage = model.ledger.forAgent(entry.agent).events > 0;
+        if (planPrice(entry.agent, entry.plan)) |price| {
+            out.plan_lo_usd += price.lo;
+            out.plan_hi_usd += price.hi;
+        } else if (has_usage) {
+            out.incomplete = true;
+        }
+    }
+    return out;
+}
+
 // ------------------------------------------------------------------ tests
 
 const testing = std.testing;
@@ -1050,6 +1250,123 @@ test "config live-reload: mtime change reapplies, unchanged mtime does not" {
     try tmp.dir.deleteFile(testing.io, "config");
     try testing.expectEqual(@as(?config.Sources, null), maybeReloadConfig(&model));
     try testing.expectEqualStrings("BBB", model.cfg.tray_format);
+}
+
+test "civil dates from day keys" {
+    // 1970-01-01 is day 0.
+    try testing.expectEqual(CivilDate{ .year = 1970, .month = 1, .day = 1 }, civilFromDayKey(0));
+    // 2026-07-09 is day 20643 (verified against `date -j -f %F 2026-07-09 +%s` / 86400).
+    try testing.expectEqual(CivilDate{ .year = 2026, .month = 7, .day = 9 }, civilFromDayKey(20_643));
+    // Leap-year boundary: 2024-02-29 is day 19782, 2024-03-01 is 19783.
+    try testing.expectEqual(CivilDate{ .year = 2024, .month = 2, .day = 29 }, civilFromDayKey(19_782));
+    try testing.expectEqual(CivilDate{ .year = 2024, .month = 3, .day = 1 }, civilFromDayKey(19_783));
+}
+
+test "month rollup sums exactly the local calendar month" {
+    var ledger = ledger_mod.Ledger.init(testing.allocator, 0);
+    defer ledger.deinit();
+
+    // 2026-07-09T12:00Z. July 2026 spans day keys 20635..20665.
+    const now_ms: i64 = (20_643 * 86_400_000) + 12 * 3_600_000;
+    const day_ms = 86_400_000;
+    const mk = struct {
+        fn ev(ts: i64, out: u64) types.UsageEvent {
+            return .{ .agent = .claude, .timestamp_ms = ts, .model = "m", .output_tokens = out };
+        }
+    };
+    // June 30 (out of month), July 1, July 9, July 31 (in month).
+    try ledger.add(mk.ev(20_634 * day_ms, 1), 10.0);
+    try ledger.add(mk.ev(20_635 * day_ms, 2), 1.0);
+    try ledger.add(mk.ev(20_643 * day_ms, 4), 2.0);
+    try ledger.add(mk.ev(20_665 * day_ms, 8), 4.0);
+    // Aug 1 (out of month).
+    try ledger.add(mk.ev(20_666 * day_ms, 16), 20.0);
+
+    const rollup = monthRollup(&ledger, now_ms);
+    try testing.expectEqual(@as(u16, 2026), rollup.year);
+    try testing.expectEqual(@as(u8, 7), rollup.month);
+    try testing.expectEqual(@as(i64, 20_635), rollup.first_day_key);
+    try testing.expectEqual(@as(u8, 31), rollup.day_count);
+    try testing.expectEqual(@as(u64, 14), rollup.totals.totalTokens());
+    try testing.expectApproxEqAbs(@as(f64, 7.0), rollup.totals.cost_usd, 1e-9);
+    try testing.expectEqual(@as(u32, 3), rollup.active_days);
+}
+
+test "month rollup respects the ledger tz offset at a month boundary" {
+    // 2026-08-01T02:00Z at UTC-5 is still locally July 31.
+    var ledger = ledger_mod.Ledger.init(testing.allocator, -300);
+    defer ledger.deinit();
+    const now_ms: i64 = 20_666 * 86_400_000 + 2 * 3_600_000;
+    try ledger.add(.{ .agent = .claude, .timestamp_ms = now_ms, .model = "m", .output_tokens = 5 }, 1.5);
+
+    const rollup = monthRollup(&ledger, now_ms);
+    try testing.expectEqual(@as(u8, 7), rollup.month);
+    try testing.expectApproxEqAbs(@as(f64, 1.5), rollup.totals.cost_usd, 1e-9);
+}
+
+test "trailing daily cost fills oldest-first with zeros for silent days" {
+    var ledger = ledger_mod.Ledger.init(testing.allocator, 0);
+    defer ledger.deinit();
+    const day_ms = 86_400_000;
+    const now_ms: i64 = 20_643 * day_ms + 1;
+    try ledger.add(.{ .agent = .claude, .timestamp_ms = now_ms, .model = "m", .output_tokens = 1 }, 3.0);
+    try ledger.add(.{ .agent = .codex, .timestamp_ms = now_ms - 2 * day_ms, .model = "m", .output_tokens = 1 }, 5.0);
+
+    var out: [4]f64 = undefined;
+    trailingDailyCost(&ledger, now_ms, &out);
+    try testing.expectEqual(@as(f64, 0), out[0]);
+    try testing.expectEqual(@as(f64, 5.0), out[1]);
+    try testing.expectEqual(@as(f64, 0), out[2]);
+    try testing.expectEqual(@as(f64, 3.0), out[3]);
+}
+
+test "plan price table" {
+    try testing.expectEqual(PlanPrice{ .lo = 20, .hi = 20 }, planPrice(.claude, "pro").?);
+    try testing.expectEqual(PlanPrice{ .lo = 100, .hi = 200 }, planPrice(.claude, "Max").?);
+    try testing.expectEqual(PlanPrice{ .lo = 20, .hi = 20 }, planPrice(.codex, "plus").?);
+    try testing.expectEqual(PlanPrice{ .lo = 200, .hi = 200 }, planPrice(.codex, "pro").?);
+    try testing.expectEqual(PlanPrice{ .lo = 0, .hi = 0 }, planPrice(.codex, "free").?);
+    try testing.expectEqual(@as(?PlanPrice, null), planPrice(.claude, "enterprise"));
+    try testing.expectEqual(@as(?PlanPrice, null), planPrice(.codex, ""));
+}
+
+test "subscription value: bands, ambiguity, and the incomplete guard" {
+    var model = Model{ .allocator = testing.allocator };
+    model.ledger = ledger_mod.Ledger.init(testing.allocator, 0);
+    defer model.ledger.deinit();
+
+    // claude max + codex plus with usage on both.
+    @memcpy(model.claude_plan_buf[0..3], "max");
+    model.claude_plan = model.claude_plan_buf[0..3];
+    const codex_windows = [_]types.LimitWindow{.{ .kind = .five_hour, .used_percent = 1 }};
+    model.codex_limits = .{ .agent = .codex, .read_at_ms = 0, .plan = "plus", .windows = &codex_windows };
+    try model.ledger.add(.{ .agent = .claude, .timestamp_ms = 0, .model = "m", .output_tokens = 1 }, 100.0);
+    try model.ledger.add(.{ .agent = .codex, .timestamp_ms = 0, .model = "m", .output_tokens = 1 }, 10.0);
+
+    var value = subscriptionValue(&model);
+    try testing.expectEqual(@as(f64, 120), value.plan_lo_usd);
+    try testing.expectEqual(@as(f64, 220), value.plan_hi_usd);
+    try testing.expect(value.ambiguous());
+    try testing.expect(!value.incomplete);
+    // ≥ 4180 / 220 = 19×.
+    try testing.expectApproxEqAbs(@as(f64, 19.0), value.multipleLowerBound(4_180).?, 1e-9);
+
+    // An agent with usage but no recognizable plan withdraws the claim.
+    model.claude_plan = "";
+    value = subscriptionValue(&model);
+    try testing.expect(value.incomplete);
+    try testing.expectEqual(@as(?f64, null), value.multipleLowerBound(4_180));
+
+    // No usage from the unpriced agent: the claim stands on codex alone.
+    var fresh = Model{ .allocator = testing.allocator };
+    fresh.ledger = ledger_mod.Ledger.init(testing.allocator, 0);
+    defer fresh.ledger.deinit();
+    fresh.codex_limits = .{ .agent = .codex, .read_at_ms = 0, .plan = "plus", .windows = &codex_windows };
+    try fresh.ledger.add(.{ .agent = .codex, .timestamp_ms = 0, .model = "m", .output_tokens = 1 }, 10.0);
+    const solo = subscriptionValue(&fresh);
+    try testing.expect(!solo.incomplete);
+    try testing.expectEqual(@as(f64, 20), solo.plan_hi_usd);
+    try testing.expect(!solo.ambiguous());
 }
 
 test "glance state reflects ledger and burn" {

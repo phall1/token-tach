@@ -29,6 +29,13 @@ And yes — the needle does the full ignition sweep every time you open it:
   threshold coloring.
 - **Today's spend** — API-equivalent dollars your subscription absorbed,
   priced against LiteLLM's model database, on a mechanical odometer.
+- **History dashboard** — a second native window with this month's spend,
+  subscription-value multiple, 30-day cost bars, and top model/project
+  attribution:
+
+![the dashboard](docs/assets/dashboard.png)
+- **Alerts and CLI** — hysteresis notifications at configured thresholds,
+  plus `--json` / `--statusline` for scripting and Claude Code statuslines.
 
 ## Why it's fast
 
@@ -100,6 +107,7 @@ now: right-click → Open the first time).
 
 It's an accessory app: no Dock icon — look for the glance in the menu bar.
 Left-click for the cluster, right-click for quick stats and Quit.
+Use the Dashboard menu item or the popover's `DASH` button for history.
 
 ## Configure
 
@@ -132,14 +140,16 @@ the vendored-fork rebase procedure.
 src/core/       UI-free engine: tailers, pricing, ledger, prediction, oauth, state
 src/engine.zig  the TEA loop: timers → sweep → ledger/burn/walls → display
 src/view.zig    the instrument cluster (canvas + vector chrome)
+src/dashboard.zig history dashboard window
+src/cli.zig     --json / --statusline local snapshot mode
 src/main.zig    shell: scene, status item, popover, runtime entry
 ```
 
 ## Status
 
-v0.2: ignition sweep, machined dial, warm launches, live config reload.
-Next: notifications, history dashboard, `--json` CLI — tracked in
-[beads](https://github.com/steveyegge/beads) (`bd list`).
+v0.3: history dashboard, notifications, and local-only CLI/statusline mode.
+Follow-up work is tracked in [beads](https://github.com/steveyegge/beads)
+(`bd list`).
 
 ## License
 

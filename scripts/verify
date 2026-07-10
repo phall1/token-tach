@@ -7,6 +7,7 @@
 #                       popover, assert state, screenshot, kill
 # Usage: scripts/verify [--no-smoke]
 set -e
+unsetopt bg_nice 2>/dev/null || true
 cd "$(dirname "$0")/.."
 
 # The app.zon uses `.macos` (accessory mode), which the stock npm CLI
@@ -60,6 +61,14 @@ echo "$SNAP" | grep -q 'models priced\|starting\|scanning' || { echo "FAIL: stat
 sleep 3
 $NATIVE automate snapshot 2>/dev/null | grep -q 'today \$' || { echo "FAIL: app died or blanked after first sweep"; exit 1 }
 $NATIVE automate screenshot main-canvas >/dev/null 2>&1 || true
+
+# Open the model-declared dashboard window and assert its canvas tree exists.
+$NATIVE automate native-command tach.dashboard >/dev/null 2>&1 || true
+sleep 1
+SNAP=$($NATIVE automate snapshot 2>/dev/null)
+echo "$SNAP" | grep -q 'dashboard-canvas' || { echo "FAIL: dashboard window missing"; exit 1 }
+echo "$SNAP" | grep -q 'Token Tach dashboard' || { echo "FAIL: dashboard semantics missing"; exit 1 }
+$NATIVE automate screenshot dashboard-canvas >/dev/null 2>&1 || true
 
 # Toggle closed again — the full round trip.
 $NATIVE automate native-command native-sdk.tray.toggle-popover >/dev/null 2>&1 || true

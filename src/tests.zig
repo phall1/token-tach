@@ -3,6 +3,7 @@ const native_sdk = @import("native_sdk");
 const main = @import("main.zig");
 const engine = @import("engine.zig");
 const view = @import("view.zig");
+const dashboard = @import("dashboard.zig");
 const theme = @import("theme.zig");
 const types = @import("core/types.zig");
 const ledger_mod = @import("core/ledger.zig");
@@ -22,7 +23,10 @@ test {
     _ = @import("core/ledger.zig");
     _ = @import("core/statefile.zig");
     _ = @import("core/predict.zig");
+    _ = @import("core/alerts.zig");
     _ = @import("core/trayfmt.zig");
+    _ = @import("cli.zig");
+    _ = @import("dashboard.zig");
     _ = @import("engine.zig");
 }
 
@@ -33,6 +37,13 @@ const Msg = main.Msg;
 fn buildTree(arena: std.mem.Allocator, model: *const Model) !AppUi.Tree {
     var ui = AppUi.init(arena);
     const node = view.rootView(&ui, model);
+    try testing.expect(!ui.failed);
+    return ui.finalizeWithTokens(node, theme.tokens());
+}
+
+fn buildDashboardTree(arena: std.mem.Allocator, model: *const Model) !AppUi.Tree {
+    var ui = AppUi.init(arena);
+    const node = dashboard.rootView(&ui, model);
     try testing.expect(!ui.failed);
     return ui.finalizeWithTokens(node, theme.tokens());
 }
@@ -121,6 +132,35 @@ test "the instrument cluster binds the engine's structured state" {
     // Dial furniture: unit caption and the sparkline caption.
     try testing.expect(containsText(tree.root, "tok/min ×1000"));
     try testing.expect(containsText(tree.root, "burn · last 15 min"));
+}
+
+test "dashboard view exposes hero stats and attribution sections" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = instrumentedModel();
+    defer model.ledger.deinit();
+    model.now_ms = 20_643 * 86_400_000 + 12 * 3_600_000;
+    try model.ledger.add(.{
+        .agent = .claude,
+        .timestamp_ms = model.now_ms,
+        .model = "claude-fable-5",
+        .output_tokens = 1_000,
+        .cwd = "/tmp/token-tach",
+    }, 42.0);
+    @memcpy(model.claude_plan_buf[0..3], "max");
+    model.claude_plan = model.claude_plan_buf[0..3];
+
+    const tree = try buildDashboardTree(arena, &model);
+    try testing.expect(containsText(tree.root, "TOKEN TACH DASH"));
+    try testing.expect(containsText(tree.root, "MONTH API EQUIV"));
+    try testing.expect(containsText(tree.root, "SUBSCRIPTION VALUE"));
+    try testing.expect(containsText(tree.root, "30-DAY API-EQUIVALENT COST"));
+    try testing.expect(containsText(tree.root, "MODELS"));
+    try testing.expect(containsText(tree.root, "PROJECTS"));
+    try testing.expect(containsText(tree.root, "claude-fable-5"));
+    try testing.expect(containsText(tree.root, "token-tach"));
 }
 
 test "a disabled source says so instead of showing dead bars" {

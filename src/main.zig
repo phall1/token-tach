@@ -16,6 +16,8 @@ const geometry = native_sdk.geometry;
 
 const engine = @import("engine.zig");
 const view = @import("view.zig");
+const dashboard = @import("dashboard.zig");
+const cli = @import("cli.zig");
 const theme = @import("theme.zig");
 const trayfmt = @import("core/trayfmt.zig");
 
@@ -67,16 +69,45 @@ fn statusItem(model: *const Model, scratch: *TachApp.StatusItemScratch) TachApp.
     scratch.items[2] = .{ .id = 3, .separator = true };
     scratch.items[3] = .{ .id = 4, .label = model.today_text, .enabled = false };
     scratch.items[4] = .{ .id = 5, .separator = true };
-    scratch.items[5] = .{ .id = 6, .label = "Quit Token Tach", .command = "tach.quit" };
-    return .{ .title = title, .items = scratch.items[0..6] };
+    scratch.items[5] = .{ .id = 6, .label = "Dashboard", .command = "tach.dashboard" };
+    scratch.items[6] = .{ .id = 7, .separator = true };
+    scratch.items[7] = .{ .id = 8, .label = "Quit Token Tach", .command = "tach.quit" };
+    return .{ .title = title, .items = scratch.items[0..8] };
 }
 
 /// Shell commands → display Msgs: the popover-open notification keys
 /// the ignition sweep (the rest of the tray traffic stays unmapped).
 fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "tray.popover_opened")) return .popover_opened;
+    if (std.mem.eql(u8, name, "tach.dashboard")) return .open_dashboard;
     if (std.mem.eql(u8, name, "tach.quit")) return .quit;
     return null;
+}
+
+fn tachWindows(model: *const Model, scratch: *TachApp.WindowsScratch) []const TachApp.WindowDescriptor {
+    var count: usize = 0;
+    if (model.dashboard_open) {
+        scratch.windows[count] = .{
+            .label = dashboard.window_label,
+            .canvas_label = dashboard.canvas_label,
+            .title = "Token Tach Dashboard",
+            .width = dashboard.window_width,
+            .height = dashboard.window_height,
+            .min_width = 820,
+            .min_height = 560,
+            .resizable = true,
+            .on_close = .dashboard_closed,
+        };
+        count += 1;
+    }
+    return scratch.windows[0..count];
+}
+
+fn tachWindowView(ui: *AppUi, model: *const Model, window_label: []const u8) AppUi.Node {
+    if (std.mem.eql(u8, window_label, dashboard.window_label)) {
+        return dashboard.rootView(ui, model);
+    }
+    return ui.panel(.{}, .{});
 }
 
 pub fn initialModel() Model {
@@ -84,6 +115,8 @@ pub fn initialModel() Model {
 }
 
 pub fn main(init: std.process.Init) !void {
+    if (try cli.maybeRunCli(init)) return;
+
     const app_state = try TachApp.create(std.heap.page_allocator, .{
         .name = "token-tach",
         .scene = shell_scene,
@@ -95,6 +128,8 @@ pub fn main(init: std.process.Init) !void {
         .status_item = .{ .popover_window = "main" },
         .status_item_fn = statusItem,
         .view = view.rootView,
+        .windows_fn = tachWindows,
+        .window_view = tachWindowView,
         .tokens = theme.tokens(),
         .animations = view.animations,
         // Raw display-list chrome around the widget span: gradient

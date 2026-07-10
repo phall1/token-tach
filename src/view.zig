@@ -285,6 +285,13 @@ fn header(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
         .{ .text = " TACH", .weight = .bold, .monospace = true, .scale = 1.2, .color = .accent },
     }));
 
+    push(ui, nodes, ui.button(.{
+        .frame = rect(356, header_y + 1, 62, 22),
+        .size = .sm,
+        .on_press = .open_dashboard,
+        .semantics = .{ .label = "Open dashboard" },
+    }, "DASH"));
+
     // Live LED: green while burning, red in danger, unlit when idle.
     const led: Color = if (danger) theme.red else if (glance.idle) theme.track else theme.green;
     const led_word: []const u8 = if (danger) "REDLINE" else if (glance.idle) "IDLE" else "LIVE";
