@@ -566,6 +566,12 @@ fn processCatchupChunk(model: *Model, fx: *Effects) void {
     refreshDisplay(model);
 }
 
+/// The OAuth cadence: `poll-interval` from config (seconds), floored at
+/// 60s so a typo can never hammer the endpoint.
+fn configuredPollMs(model: *const Model) i64 {
+    return @as(i64, @max(model.cfg.poll_interval_s, 60)) * 1000;
+}
+
 /// Save every `state_save_ticks` sweeps, only if the ledger moved.
 fn maybeSaveState(model: *Model) void {
     if (model.state_save_countdown > 1) {
@@ -805,7 +811,7 @@ fn maybeOauthPoll(model: *Model, fx: *Effects) void {
 fn handleCreds(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
     if (exit.code != 0) {
         model.oauth_inflight = false;
-        model.oauth_next_ms = model.now_ms + oauth.poll_interval_ms;
+        model.oauth_next_ms = model.now_ms + configuredPollMs(model);
         setErrorStatus(model, "keychain read failed (security exit {d})", .{exit.code});
         return;
     }
@@ -814,7 +820,7 @@ fn handleCreds(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
     defer arena_state.deinit();
     const creds = oauth.parseCredentials(arena_state.allocator(), std.mem.trim(u8, exit.output, " \t\r\n")) catch {
         model.oauth_inflight = false;
-        model.oauth_next_ms = model.now_ms + oauth.poll_interval_ms;
+        model.oauth_next_ms = model.now_ms + configuredPollMs(model);
         setErrorStatus(model, "unreadable Claude credentials payload", .{});
         return;
     };
@@ -861,7 +867,7 @@ fn handleOauthResponse(model: *Model, resp: native_sdk.EffectResponse) void {
         model.oauth_backoff.onSuccess();
         model.status_error = false;
         model.oauth_last_success_ms = model.now_ms;
-        model.oauth_next_ms = model.now_ms + oauth.poll_interval_ms;
+        model.oauth_next_ms = model.now_ms + configuredPollMs(model);
     } else {
         model.oauth_backoff.onFailure();
         model.oauth_next_ms = model.now_ms + model.oauth_backoff.delayMs();
