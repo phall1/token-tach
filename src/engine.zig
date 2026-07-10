@@ -62,6 +62,9 @@ pub const Msg = union(enum) {
     /// The user closed the dashboard window — clear the flag so the
     /// model agrees with the platform (see WindowDescriptor.on_close).
     dashboard_closed,
+    /// Tray "Settings": open ~/.config/token-tach/config in the default
+    /// editor (creating a commented template first if absent).
+    open_config,
 };
 
 /// One queued history file awaiting its catch-up parse.
@@ -572,6 +575,48 @@ fn configuredPollMs(model: *const Model) i64 {
     return @as(i64, @max(model.cfg.poll_interval_s, 60)) * 1000;
 }
 
+pub const config_spawn_key: u64 = 8;
+
+const config_template =
+    \\# token-tach configuration — live-reloaded while the app runs.
+    \\# Tray template tokens: {burn} {eta} {pct} {tok} {cost}
+    \\#tray-format = {burn} → {eta}
+    \\
+    \\# Server-truth Claude limits via your Claude Code OAuth token (Keychain).
+    \\#claude-oauth = true
+    \\#poll-interval = 180s
+    \\
+    \\#alert-threshold = 70, 90
+    \\#source = claude, codex
+    \\#claude-config-dir = ~/some/other/claude-root
+    \\#codex-home = ~/.codex
+    \\
+;
+
+/// Tray "Settings": ensure the config file exists (write a fully
+/// commented template on first use) and hand it to the default editor.
+fn openConfig(model: *Model, fx: *Effects) void {
+    if (model.config_path.len == 0) return;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    var cwd = std.Io.Dir.cwd();
+    _ = cwd.statFile(io, model.config_path, .{}) catch {
+        if (std.fs.path.dirname(model.config_path)) |dir| {
+            cwd.createDirPath(io, dir) catch {};
+        }
+        cwd.writeFile(io, .{ .sub_path = model.config_path, .data = config_template }) catch |err| {
+            setErrorStatus(model, "could not create config: {s}", .{@errorName(err)});
+            return;
+        };
+    };
+    fx.spawn(.{
+        .key = config_spawn_key,
+        .argv = &.{ "open", "-t", model.config_path },
+        .output = .collect,
+        .on_exit = Effects.exitMsg(.tz_done), // exit is uninteresting; reuse a no-op-safe arm
+    });
+}
+
 /// Save every `state_save_ticks` sweeps, only if the ledger moved.
 fn maybeSaveState(model: *Model) void {
     if (model.state_save_countdown > 1) {
@@ -651,6 +696,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.now_ms = fx.wallMs();
             startIgnition(model, fx);
         },
+        .open_config => openConfig(model, fx),
         .quit => {
             // Accessory app: the tray Quit item is the only exit
             // affordance. Flush state, then leave — the runtime has no

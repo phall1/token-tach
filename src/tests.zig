@@ -332,3 +332,14 @@ test "the chrome display list emits exactly its declared command counts" {
     }
     try testing.expect(found_blade);
 }
+
+test "menu version string matches the manifest" {
+    // Runs from the repo root under `zig build test`; skip if the layout
+    // ever moves rather than failing a legitimate build.
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    const zon = std.Io.Dir.cwd().readFileAlloc(io, "app.zon", testing.allocator, .limited(16 * 1024)) catch return error.SkipZigTest;
+    defer testing.allocator.free(zon);
+    const needle = "\"" ++ main.app_version ++ "\"";
+    try testing.expect(std.mem.indexOf(u8, zon, needle) != null);
+}

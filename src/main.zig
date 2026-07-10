@@ -66,20 +66,28 @@ fn statusItem(model: *const Model, scratch: *TachApp.StatusItemScratch) TachApp.
     const title = trayfmt.render(&scratch.title_buffer, model.cfg.tray_format, engine.glanceState(model));
     scratch.items[0] = .{ .id = 1, .label = model.claude_text, .enabled = false };
     scratch.items[1] = .{ .id = 2, .label = model.codex_text, .enabled = false };
-    scratch.items[2] = .{ .id = 3, .separator = true };
-    scratch.items[3] = .{ .id = 4, .label = model.today_text, .enabled = false };
-    scratch.items[4] = .{ .id = 5, .separator = true };
+    scratch.items[2] = .{ .id = 3, .label = model.today_text, .enabled = false };
+    scratch.items[3] = .{ .id = 4, .separator = true };
+    // The reserved toggle command is intercepted by the runtime, so this
+    // menu item opens the popover cluster without any app wiring.
+    scratch.items[4] = .{ .id = 5, .label = "Open Tach", .command = "native-sdk.tray.toggle-popover" };
     scratch.items[5] = .{ .id = 6, .label = "Dashboard", .command = "tach.dashboard" };
-    scratch.items[6] = .{ .id = 7, .separator = true };
-    scratch.items[7] = .{ .id = 8, .label = "Quit Token Tach", .command = "tach.quit" };
-    return .{ .title = title, .items = scratch.items[0..8] };
+    scratch.items[6] = .{ .id = 7, .label = "Settings (config file)", .command = "tach.config" };
+    scratch.items[7] = .{ .id = 8, .separator = true };
+    scratch.items[8] = .{ .id = 9, .label = "Token Tach v" ++ app_version, .enabled = false };
+    scratch.items[9] = .{ .id = 10, .label = "Quit", .command = "tach.quit" };
+    return .{ .title = title, .items = scratch.items[0..10] };
 }
+
+/// Kept in lockstep with app.zon .version (checked by a test).
+pub const app_version = "0.3.2";
 
 /// Shell commands → display Msgs: the popover-open notification keys
 /// the ignition sweep (the rest of the tray traffic stays unmapped).
 fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "tray.popover_opened")) return .popover_opened;
     if (std.mem.eql(u8, name, "tach.dashboard")) return .open_dashboard;
+    if (std.mem.eql(u8, name, "tach.config")) return .open_config;
     if (std.mem.eql(u8, name, "tach.quit")) return .quit;
     return null;
 }
