@@ -70,9 +70,13 @@ echo "$SNAP" | grep -q 'dashboard-canvas' || { echo "FAIL: dashboard window miss
 echo "$SNAP" | grep -q 'Token Tach dashboard' || { echo "FAIL: dashboard semantics missing"; exit 1 }
 $NATIVE automate screenshot dashboard-canvas >/dev/null 2>&1 || true
 
-# Toggle closed again — the full round trip.
-$NATIVE automate native-command native-sdk.tray.toggle-popover >/dev/null 2>&1 || true
-sleep 1
+# Close the round trip. The dashboard window may have stolen focus and
+# auto-closed the transient popover already — check state before toggling
+# so we assert "ends closed", not a blind toggle count.
+if $NATIVE automate snapshot 2>/dev/null | grep -q 'popover_visible=true'; then
+  $NATIVE automate native-command native-sdk.tray.toggle-popover >/dev/null 2>&1 || true
+  sleep 1
+fi
 $NATIVE automate snapshot 2>/dev/null | grep -q 'popover_visible=false' || { echo "FAIL: popover did not close"; exit 1 }
 
 echo "==> smoke drive: PASS"
