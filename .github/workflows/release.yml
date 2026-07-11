@@ -129,11 +129,11 @@ jobs:
       - name: Prepare notarization key
         shell: bash
         env:
-          API_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          API_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_API_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          [[ -n "$API_KEY_BASE64" ]]
-          printf '%s' "$API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/notary-api-key.p8"
+          [[ -n "$API_PRIVATE_KEY" ]]
+          printf '%s' "$API_PRIVATE_KEY" > "$RUNNER_TEMP/notary-api-key.p8"
           chmod 600 "$RUNNER_TEMP/notary-api-key.p8"
 
       - name: Prepare Sparkle signing key
@@ -152,8 +152,8 @@ jobs:
           DEVELOPER_ID_APPLICATION: ${{ vars.DEVELOPER_ID_APPLICATION }}
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
           NOTARY_KEY_PATH: ${{ runner.temp }}/notary-api-key.p8
-          NOTARY_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          NOTARY_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          NOTARY_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
           SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
           SPARKLE_FEED_URL: https://github.com/${{ github.repository }}/releases/latest/download/appcast.xml
           SPARKLE_ED_KEY_FILE: ${{ runner.temp }}/sparkle-ed25519-key

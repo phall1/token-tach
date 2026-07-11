@@ -14,10 +14,10 @@ the signing secrets on that environment so they are unavailable until approval:
 - `MACOS_CERTIFICATE_P12`: base64 of the Developer ID Application `.p12`.
 - `MACOS_CERTIFICATE_PASSWORD`: password used when exporting the `.p12`.
 - `MACOS_KEYCHAIN_PASSWORD`: a strong, release-only temporary keychain password.
-- `APPLE_API_PRIVATE_KEY`: base64 of an App Store Connect API `.p8` key permitted
-  to submit notarizations.
-- `APPLE_API_KEY_ID`: App Store Connect API key ID.
-- `APPLE_API_ISSUER_ID`: App Store Connect API issuer UUID.
+- `APP_STORE_CONNECT_API_PRIVATE_KEY`: raw contents of an App Store Connect API
+  `.p8` key permitted to submit notarizations.
+- `APP_STORE_CONNECT_API_KEY_ID`: App Store Connect API key ID.
+- `APP_STORE_CONNECT_API_ISSUER_ID`: App Store Connect API issuer UUID.
 - `SPARKLE_PRIVATE_KEY`: the production Sparkle Ed25519 private key used only
   to sign update archives and appcasts.
 - `HOMEBREW_TAP_TOKEN` (optional): a fine-grained token with Actions dispatch
