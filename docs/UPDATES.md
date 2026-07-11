@@ -1,6 +1,10 @@
-# Direct-download updates
+# Deferred Direct-Download Updates
 
-Direct-download releases use Sparkle 2.9.4. The framework archive is fetched
+The active ad-hoc release does not embed Sparkle; Homebrew is the supported
+update path. Bead `tt-ejr` tracks enabling this code after Developer ID signing
+and notarization are available and a real update path can be validated.
+
+The parked implementation uses Sparkle 2.9.4. The framework archive is fetched
 from Sparkle's GitHub release and checked against its published SHA-256 before
 it is linked or packaged. Normal development builds contain no updater code or
 framework; updater support is enabled only for signed release builds.

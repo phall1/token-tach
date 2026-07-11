@@ -2,34 +2,15 @@
 
 The `Release` workflow publishes an existing `vMAJOR.MINOR.PATCH` tag. It builds
 the tag's exact commit for arm64 and x86_64, creates and verifies a Universal 2
-binary with Sparkle, signs it with Developer ID, notarizes and staples the app
-and DMG, verifies the signature and Gatekeeper result, and publishes the DMG,
-signed update ZIP/appcast, `SHA256SUMS`, and GitHub artifact provenance.
+binary, applies an ad-hoc signature, and publishes the DMG, `SHA256SUMS`, and
+GitHub artifact provenance. Homebrew is the canonical install/update path.
 
 ## Repository configuration
 
-Create a GitHub environment named `release` and require trusted reviewers. Put
-the signing secrets on that environment so they are unavailable until approval:
-
-- `MACOS_CERTIFICATE_P12`: base64 of the Developer ID Application `.p12`.
-- `MACOS_CERTIFICATE_PASSWORD`: password used when exporting the `.p12`.
-- `MACOS_KEYCHAIN_PASSWORD`: a strong, release-only temporary keychain password.
-- `APP_STORE_CONNECT_API_PRIVATE_KEY`: raw contents of an App Store Connect API
-  `.p8` key permitted to submit notarizations.
-- `APP_STORE_CONNECT_API_KEY_ID`: App Store Connect API key ID.
-- `APP_STORE_CONNECT_API_ISSUER_ID`: App Store Connect API issuer UUID.
-- `SPARKLE_PRIVATE_KEY`: the production Sparkle Ed25519 private key used only
-  to sign update archives and appcasts.
+No signing or Apple credentials are required for the active ad-hoc release
+workflow.
 - `HOMEBREW_TAP_TOKEN` (optional): a fine-grained token with Actions dispatch
   access to `phall1/homebrew-tap`; it triggers an immediate cask update.
-
-Add these environment variables (not secrets):
-
-- `DEVELOPER_ID_APPLICATION`: full certificate name, beginning with
-  `Developer ID Application: `.
-- `APPLE_TEAM_ID`: the 10-character Apple Developer team ID.
-- `SPARKLE_PUBLIC_KEY`: base64-encoded 32-byte public key matching the private
-  key. It is embedded in direct-download builds.
 
 Enable GitHub artifact attestations for the repository. Provenance is generated
 for public repositories, where GitHub's Sigstore-backed attestation service is
@@ -49,31 +30,20 @@ an existing GitHub Release.
    normal CI.
 2. Create and push the matching tag, for example `v0.3.2`, after required checks
    pass on that commit. A tag push starts the workflow automatically.
-3. Approve the `release` environment deployment after checking the tag and
-   commit shown by the verify job.
-
 The workflow can also be run manually with an existing tag. It never builds an
 arbitrary branch or untagged SHA.
 
 After publication, the workflow dispatches `phall1/homebrew-tap` with the
 released version and verified DMG checksum when the optional token is present.
 The tap also polls the latest release hourly, so updates remain automatic
-without a cross-repository credential. It rewrites and commits the notarized
-cask automatically; no quarantine bypass is used for new releases.
+without a cross-repository credential. It rewrites and commits the cask,
+including the quarantine compatibility required by ad-hoc builds.
 
-For a local updater-enabled equivalent, import the Developer ID identity, keep
-the Sparkle private key outside the repository, and store notarytool credentials
-in a keychain profile, then run:
+For a local equivalent, run:
 
 ```sh
-scripts/release-updater \
-  --identity "Developer ID Application: Example (TEAMID)" \
-  --feed-url "https://github.com/phall1/token-tach/releases/latest/download/appcast.xml" \
-  --public-key "$SPARKLE_PUBLIC_KEY" --notarize
-SPARKLE_ED_KEY_FILE=/secure/path/to/sparkle-private-key \
-  scripts/updater-generate-appcast zig-out/updater/releases \
-  "https://github.com/phall1/token-tach/releases/download/vX.Y.Z/"
+scripts/release --universal
 ```
 
-App Store Connect API credentials can be used instead by setting
-`NOTARY_KEY_PATH`, `NOTARY_KEY_ID`, and `NOTARY_ISSUER_ID`.
+Developer ID signing, notarization, and signed Sparkle updates are deferred in
+Bead `tt-ejr`.
