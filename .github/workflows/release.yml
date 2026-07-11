@@ -232,6 +232,20 @@ jobs:
           gh release create "$RELEASE_TAG" dist/* \
             --verify-tag --title "Token Tach $VERSION" --generate-notes
 
+      - name: Update Homebrew tap
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ -n "$GH_TOKEN" ]]
+          sha256="$(shasum -a 256 "dist/token-tach-$VERSION-universal2.dmg" | cut -d ' ' -f 1)"
+          gh api --method POST repos/phall1/homebrew-tap/dispatches \
+            -f event_type=token-tach-release \
+            -F "client_payload[version]=$VERSION" \
+            -F "client_payload[sha256]=$sha256"
+
       - name: Remove signing material
         if: always()
         shell: bash

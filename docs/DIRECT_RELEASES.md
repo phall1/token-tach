@@ -20,6 +20,8 @@ the signing secrets on that environment so they are unavailable until approval:
 - `APPLE_API_ISSUER_ID`: App Store Connect API issuer UUID.
 - `SPARKLE_PRIVATE_KEY`: the production Sparkle Ed25519 private key used only
   to sign update archives and appcasts.
+- `HOMEBREW_TAP_TOKEN`: a fine-grained token with Actions dispatch access to
+  `phall1/homebrew-tap`; it triggers the cask checksum/version update.
 
 Add these environment variables (not secrets):
 
@@ -52,6 +54,10 @@ an existing GitHub Release.
 
 The workflow can also be run manually with an existing tag. It never builds an
 arbitrary branch or untagged SHA.
+
+After publication, the workflow dispatches `phall1/homebrew-tap` with the
+released version and verified DMG checksum. The tap rewrites and commits the
+notarized cask automatically; no quarantine bypass is used for new releases.
 
 For a local updater-enabled equivalent, import the Developer ID identity, keep
 the Sparkle private key outside the repository, and store notarytool credentials
