@@ -122,7 +122,7 @@ jobs:
           [[ ${#dmgs[@]} == 1 && -f "${dmgs[0]}" ]]
           cp "${dmgs[0]}" "dist/token-tach-$VERSION-universal2.dmg"
           (cd dist && shasum -a 256 "token-tach-$VERSION-universal2.dmg" > SHA256SUMS)
-          shasum -a 256 -c dist/SHA256SUMS
+          (cd dist && shasum -a 256 -c SHA256SUMS)
 
       - name: Attest release artifacts
         if: github.event.repository.visibility == 'public'
