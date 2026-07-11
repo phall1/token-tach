@@ -6,7 +6,6 @@
 //! point.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const updater_options = @import("updater_options");
@@ -32,75 +31,6 @@ const canvas_label = "main-canvas";
 const window_width: f32 = view.window_width;
 const window_height: f32 = view.window_height;
 
-const store_path_capacity = 4096;
-
-/// App Store builds are sandboxed and cannot discover ~/.claude or ~/.codex
-/// directly. The small AppKit shim restores (or creates) security-scoped
-/// bookmarks and returns paths while retaining access for the process life.
-const StoreAccess = struct {
-    sandboxed: bool = false,
-    claude_buf: [store_path_capacity]u8 = undefined,
-    claude_len: usize = 0,
-    codex_buf: [store_path_capacity]u8 = undefined,
-    codex_len: usize = 0,
-    opencode_buf: [store_path_capacity]u8 = undefined,
-    opencode_len: usize = 0,
-    home_buf: [store_path_capacity]u8 = undefined,
-    home_len: usize = 0,
-
-    fn prepare() StoreAccess {
-        var result: StoreAccess = .{};
-        if (builtin.os.tag != .macos or token_tach_macos_is_sandboxed() == 0) return result;
-        result.sandboxed = true;
-        _ = token_tach_macos_prepare_store_access(
-            &result.claude_buf,
-            result.claude_buf.len,
-            &result.claude_len,
-            &result.codex_buf,
-            result.codex_buf.len,
-            &result.codex_len,
-            &result.opencode_buf,
-            result.opencode_buf.len,
-            &result.opencode_len,
-            &result.home_buf,
-            result.home_buf.len,
-            &result.home_len,
-        );
-        return result;
-    }
-
-    fn claudePath(self: *const StoreAccess) ?[]const u8 {
-        return if (self.claude_len > 0) self.claude_buf[0..self.claude_len] else null;
-    }
-
-    fn codexPath(self: *const StoreAccess) ?[]const u8 {
-        return if (self.codex_len > 0) self.codex_buf[0..self.codex_len] else null;
-    }
-
-    fn opencodePath(self: *const StoreAccess) ?[]const u8 {
-        return if (self.opencode_len > 0) self.opencode_buf[0..self.opencode_len] else null;
-    }
-
-    fn home(self: *const StoreAccess, fallback: []const u8) []const u8 {
-        return if (self.home_len > 0) self.home_buf[0..self.home_len] else fallback;
-    }
-};
-
-extern fn token_tach_macos_is_sandboxed() u8;
-extern fn token_tach_macos_prepare_store_access(
-    claude_out: [*]u8,
-    claude_capacity: usize,
-    claude_len: *usize,
-    codex_out: [*]u8,
-    codex_capacity: usize,
-    codex_len: *usize,
-    opencode_out: [*]u8,
-    opencode_capacity: usize,
-    opencode_len: *usize,
-    home_out: [*]u8,
-    home_capacity: usize,
-    home_len: *usize,
-) c_int;
 extern fn token_tach_updater_start() void;
 extern fn token_tach_updater_check() void;
 
@@ -147,10 +77,7 @@ fn statusItem(model: *const Model, scratch: *TachApp.StatusItemScratch) TachApp.
     // menu item opens the popover cluster without any app wiring.
     scratch.items[5] = .{ .id = 6, .label = "Open Tach", .command = "native-sdk.tray.toggle-popover" };
     scratch.items[6] = .{ .id = 7, .label = "Dashboard", .command = "tach.dashboard" };
-    scratch.items[7] = if (model.store_sandbox)
-        .{ .id = 8, .label = "Folders managed by macOS", .enabled = false }
-    else
-        .{ .id = 8, .label = "Settings (config file)", .command = "tach.config" };
+    scratch.items[7] = .{ .id = 8, .label = "Settings (config file)", .command = "tach.config" };
     scratch.items[8] = .{ .id = 9, .separator = true };
     var count: usize = 9;
     if (updater_options.enabled) {
@@ -213,8 +140,6 @@ pub fn initialModel() Model {
 pub fn main(init: std.process.Init) !void {
     if (try cli.maybeRunCli(init)) return;
 
-    var store_access = StoreAccess.prepare();
-
     const app_state = try TachApp.create(std.heap.page_allocator, .{
         .name = "token-tach",
         .scene = shell_scene,
@@ -244,13 +169,12 @@ pub fn main(init: std.process.Init) !void {
     defer app_state.destroy();
 
     engine.setup(&app_state.model, std.heap.page_allocator, .{
-        .home = store_access.home(init.environ_map.get("HOME") orelse ""),
-        .claude_config_dir = if (store_access.sandboxed) store_access.claudePath() else init.environ_map.get("CLAUDE_CONFIG_DIR"),
-        .codex_home = if (store_access.sandboxed) store_access.codexPath() else init.environ_map.get("CODEX_HOME"),
-        .opencode_db = if (store_access.sandboxed) store_access.opencodePath() else init.environ_map.get("OPENCODE_DB"),
+        .home = init.environ_map.get("HOME") orelse "",
+        .claude_config_dir = init.environ_map.get("CLAUDE_CONFIG_DIR"),
+        .codex_home = init.environ_map.get("CODEX_HOME"),
+        .opencode_db = init.environ_map.get("OPENCODE_DB"),
         .xdg_data_home = init.environ_map.get("XDG_DATA_HOME"),
         .xdg_state_home = init.environ_map.get("XDG_STATE_HOME"),
-        .store_sandbox = store_access.sandboxed,
     }) catch |err| {
         std.log.err("engine setup failed: {s} — running with empty state", .{@errorName(err)});
     };

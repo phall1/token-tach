@@ -95,6 +95,17 @@ the Keychain. Off by default.
 
 ## Install
 
+Homebrew is the canonical distribution channel:
+
+```sh
+brew install --cask phall1/tap/token-tach
+```
+
+Releases are Universal 2, Developer ID signed, notarized, and updated through
+both Homebrew and the app's signed Sparkle feed.
+
+To build from source instead:
+
 ```sh
 git clone --recurse-submodules https://github.com/phall1/token-tach
 cd token-tach
@@ -103,9 +114,8 @@ vendor/native/zig-out/bin/native build
 open zig-out/bin/token-tach            # or scripts/release for a .app/DMG
 ```
 
-Or grab the DMG from
-[releases](https://github.com/phall1/token-tach/releases) (adhoc-signed for
-now: right-click → Open the first time).
+The same notarized DMG is also available from
+[GitHub Releases](https://github.com/phall1/token-tach/releases).
 
 It's an accessory app: no Dock icon — look for the glance in the menu bar.
 Left-click for the cluster, right-click for quick stats and Quit.

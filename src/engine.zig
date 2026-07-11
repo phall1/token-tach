@@ -80,11 +80,6 @@ const text_buf_len = 192;
 pub const Model = struct {
     allocator: std.mem.Allocator = undefined,
     ready: bool = false,
-    /// True for the Mac App Store build. Sandboxing forbids launching the
-    /// `security` helper and the store edition never borrows another app's
-    /// OAuth credential.
-    store_sandbox: bool = false,
-
     cfg: config.Config = .{},
     /// Config live-reload state: the resolved config path (owned), the
     /// mtime of the last text we parsed, and the arena that owns every
@@ -278,7 +273,6 @@ pub const Env = struct {
     opencode_db: ?[]const u8 = null,
     xdg_data_home: ?[]const u8 = null,
     xdg_state_home: ?[]const u8 = null,
-    store_sandbox: bool = false,
 };
 
 /// Persist tailer+ledger state every N sweep ticks (N × 2 s ≈ 60 s).
@@ -288,8 +282,6 @@ pub const state_save_ticks: u32 = 30;
 /// on the heap-allocated model before the runtime starts.
 pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
     model.allocator = allocator;
-    model.store_sandbox = env.store_sandbox;
-
     const home = env.home;
 
     // Config: absent file or bad lines never block startup. The path and
@@ -901,7 +893,6 @@ fn dispatchAlerts(model: *Model, fx: *Effects) void {
 /// spawn keeps any consent prompt in the child; keychain.zig remains
 /// the path for signed/bundled builds whose ACL entry sticks.
 fn maybeOauthPoll(model: *Model, fx: *Effects) void {
-    if (model.store_sandbox) return;
     if (!model.cfg.claude_oauth) return;
     if (model.oauth_inflight or model.now_ms < model.oauth_next_ms) return;
 

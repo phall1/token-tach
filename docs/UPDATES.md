@@ -2,9 +2,8 @@
 
 Direct-download releases use Sparkle 2.9.4. The framework archive is fetched
 from Sparkle's GitHub release and checked against its published SHA-256 before
-it is linked or packaged. Normal development builds and `-Dapp-store=true`
-builds contain no updater code or framework; `-Dapp-store` and `-Dupdater`
-are rejected when combined.
+it is linked or packaged. Normal development builds contain no updater code or
+framework; updater support is enabled only for signed release builds.
 
 The updater release path fails closed unless it receives a Developer ID
 Application identity, an HTTPS appcast URL, and a 32-byte Ed25519 public key:
