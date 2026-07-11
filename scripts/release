@@ -1,13 +1,14 @@
 #!/bin/zsh
-# token-tach release build: verify -> package -> sign -> (optionally) notarize.
+# token-tach release build: verify -> build -> package -> sign -> notarize.
 #
 # Usage:
-#   scripts/release                     # adhoc-signed .app + dmg (local use)
-#   scripts/release --identity "Developer ID Application: ..." [--team-id XXX] [--notarize]
+#   scripts/release                     # adhoc-signed arm64 .app + DMG (local use)
+#   scripts/release --universal --identity "Developer ID Application: ..." \
+#     --team-id XXX --notarize
 #
-# Notarization needs a notarytool keychain profile named "token-tach"
-# (xcrun notarytool store-credentials token-tach --apple-id ... --team-id ...).
-set -e
+# Notarization uses a notarytool keychain profile (default: token-tach), or
+# NOTARY_KEY_PATH, NOTARY_KEY_ID, and NOTARY_ISSUER_ID for App Store Connect API auth.
+set -euo pipefail
 unsetopt bg_nice 2>/dev/null || true
 cd "$(dirname "$0")/.."
 
@@ -18,28 +19,59 @@ NATIVE="${NATIVE_BIN:-vendor/native/zig-out/bin/native}"
 IDENTITY=""
 TEAM_ID=""
 NOTARIZE=0
+UNIVERSAL=0
+SKIP_VERIFY=0
+NOTARY_PROFILE="${NOTARY_PROFILE:-token-tach}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --identity) IDENTITY="$2"; shift 2 ;;
-    --team-id)  TEAM_ID="$2"; shift 2 ;;
+    --identity) [[ $# -ge 2 ]] || { echo "FAIL: --identity needs a value"; exit 2; }; IDENTITY="$2"; shift 2 ;;
+    --team-id)  [[ $# -ge 2 ]] || { echo "FAIL: --team-id needs a value"; exit 2; }; TEAM_ID="$2"; shift 2 ;;
     --notarize) NOTARIZE=1; shift ;;
+    --notary-profile) [[ $# -ge 2 ]] || { echo "FAIL: --notary-profile needs a value"; exit 2; }; NOTARY_PROFILE="$2"; shift 2 ;;
+    --universal) UNIVERSAL=1; shift ;;
+    --skip-verify) SKIP_VERIFY=1; shift ;;
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
 
-echo "==> verify (no smoke)"
-scripts/verify --no-smoke
+if [[ "$NOTARIZE" == 1 && -z "$IDENTITY" ]]; then
+  echo "FAIL: --notarize requires --identity"
+  exit 2
+fi
+
+if [[ "$SKIP_VERIFY" == 0 ]]; then
+  echo "==> verify (no smoke)"
+  scripts/verify --no-smoke
+fi
 
 # verify leaves an automation-enabled binary in zig-out/bin — that build
 # writes its automation socket to a RELATIVE path and dies with
 # ReadOnlyFileSystem when launched from Finder (cwd=/). Package a clean
 # production build instead.
 echo "==> production build (no automation)"
-$NATIVE build
+BINARY="zig-out/bin/token-tach"
+if [[ "$UNIVERSAL" == 1 ]]; then
+  rm -rf zig-out/release
+  mkdir -p zig-out/release/universal/bin
+  "$NATIVE" build -Dtarget=aarch64-macos
+  cp zig-out/bin/token-tach zig-out/release/universal/bin/token-tach-arm64
+  "$NATIVE" build -Dtarget=x86_64-macos
+  cp zig-out/bin/token-tach zig-out/release/universal/bin/token-tach-x86_64
+  lipo -create \
+    zig-out/release/universal/bin/token-tach-arm64 \
+    zig-out/release/universal/bin/token-tach-x86_64 \
+    -output zig-out/release/universal/bin/token-tach
+  lipo zig-out/release/universal/bin/token-tach -verify_arch arm64 x86_64
+  BINARY="zig-out/release/universal/bin/token-tach"
+else
+  "$NATIVE" build
+fi
+[[ -f "$BINARY" ]] || { echo "FAIL: production binary missing: $BINARY"; exit 1; }
 
 echo "==> package"
 rm -rf zig-out/package
-ARGS=(--target macos --archive)
+mkdir -p zig-out/package
+ARGS=(--target macos --output zig-out/package/token-tach.app --binary "$BINARY" --optimize ReleaseFast --archive)
 if [[ -n "$IDENTITY" ]]; then
   ARGS+=(--signing identity --identity "$IDENTITY")
   [[ -n "$TEAM_ID" ]] && ARGS+=(--team-id "$TEAM_ID")
@@ -47,24 +79,51 @@ else
   ARGS+=(--signing adhoc)
   echo "    (adhoc signing — pass --identity for a distributable build)"
 fi
-$NATIVE package "${ARGS[@]}"
+"$NATIVE" package "${ARGS[@]}"
 
-APP=$(find zig-out/package -maxdepth 1 -type d -name '*.app' -print 2>/dev/null | head -1 || true)
-DMG=$(find zig-out/package -maxdepth 1 -type f -name '*.dmg' -print 2>/dev/null | head -1 || true)
-[[ -n "$APP" ]] || { echo "FAIL: no .app produced"; exit 1 }
-[[ -n "$DMG" ]] || { echo "FAIL: no dmg produced"; exit 1 }
+APPS=(zig-out/package/*.app(N))
+DMGS=(zig-out/package/*.dmg(N))
+[[ ${#APPS[@]} == 1 ]] || { echo "FAIL: expected exactly one .app, found ${#APPS[@]}"; exit 1; }
+[[ ${#DMGS[@]} == 1 ]] || { echo "FAIL: expected exactly one DMG, found ${#DMGS[@]}"; exit 1; }
+APP="$APPS[1]"
+DMG="$DMGS[1]"
 echo "==> app: $APP"
 echo "==> dmg: $DMG"
+
+APP_BIN="$APP/Contents/MacOS/token-tach"
+[[ -x "$APP_BIN" ]] || { echo "FAIL: packaged executable missing"; exit 1; }
+if [[ "$UNIVERSAL" == 1 ]]; then
+  lipo "$APP_BIN" -verify_arch arm64 x86_64
+fi
+
+echo "==> signature verification"
+codesign --verify --deep --strict --verbose=2 "$APP"
+if [[ -n "$IDENTITY" ]]; then
+  SIGNATURE_INFO="$(mktemp)"
+  trap 'rm -f "$SIGNATURE_INFO"' EXIT
+  codesign -d --verbose=4 "$APP" 2>"$SIGNATURE_INFO"
+  grep -Fqx "Authority=$IDENTITY" "$SIGNATURE_INFO" || {
+    echo "FAIL: bundle is not signed by the requested Developer ID identity"
+    exit 1
+  }
+  if [[ -n "$TEAM_ID" ]]; then
+    grep -Fqx "TeamIdentifier=$TEAM_ID" "$SIGNATURE_INFO" || {
+      echo "FAIL: signature TeamIdentifier does not match --team-id"
+      exit 1
+    }
+  fi
+fi
 
 # Launch sanity: Finder launches with cwd=/ — the packaged app must
 # survive that (an automation build dies on its relative socket path).
 echo "==> launch check (cwd=/)"
-BIN="$(pwd)/$(ls "$APP"/Contents/MacOS/* | head -1)"
+BIN="$(pwd)/$APP_BIN"
 ( cd / && "$BIN" >/dev/null 2>&1 ) &
 CHECK_PID=$!
 sleep 3
-if kill -0 $CHECK_PID 2>/dev/null; then
-  kill $CHECK_PID 2>/dev/null || true
+if kill -0 "$CHECK_PID" 2>/dev/null; then
+  kill "$CHECK_PID" 2>/dev/null || true
+  wait "$CHECK_PID" 2>/dev/null || true
   echo "==> launch check: PASS"
 else
   echo "FAIL: packaged app exited within 3s when launched from cwd=/"
@@ -72,12 +131,26 @@ else
 fi
 
 if [[ "$NOTARIZE" == 1 ]]; then
-  [[ -n "$IDENTITY" ]] || { echo "FAIL: --notarize requires --identity"; exit 1 }
-  [[ -n "$DMG" ]] || { echo "FAIL: no dmg produced to notarize"; exit 1 }
   echo "==> notarize"
-  xcrun notarytool submit "$DMG" --keychain-profile token-tach --wait
+  if [[ -n "${NOTARY_KEY_PATH:-}" || -n "${NOTARY_KEY_ID:-}" || -n "${NOTARY_ISSUER_ID:-}" ]]; then
+    [[ -n "${NOTARY_KEY_PATH:-}" && -n "${NOTARY_KEY_ID:-}" && -n "${NOTARY_ISSUER_ID:-}" ]] || {
+      echo "FAIL: API notarization requires NOTARY_KEY_PATH, NOTARY_KEY_ID, and NOTARY_ISSUER_ID"
+      exit 2
+    }
+    xcrun notarytool submit "$DMG" \
+      --key "$NOTARY_KEY_PATH" --key-id "$NOTARY_KEY_ID" \
+      --issuer "$NOTARY_ISSUER_ID" --wait
+  else
+    xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+  fi
   xcrun stapler staple "$DMG"
-  echo "==> notarized + stapled"
+  xcrun stapler validate "$DMG"
+  codesign --verify --deep --strict --verbose=2 "$APP"
+  spctl --assess --type execute --verbose=4 "$APP"
+  echo "==> notarized, stapled, and Gatekeeper accepted"
+elif [[ -n "$IDENTITY" ]]; then
+  echo "FAIL: Developer ID release was not notarized; pass --notarize"
+  exit 1
 fi
 
 echo "RELEASE: done"

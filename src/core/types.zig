@@ -7,11 +7,13 @@ const std = @import("std");
 pub const Agent = enum {
     claude,
     codex,
+    opencode,
 
     pub fn label(self: Agent) []const u8 {
         return switch (self) {
             .claude => "claude",
             .codex => "codex",
+            .opencode => "opencode",
         };
     }
 };

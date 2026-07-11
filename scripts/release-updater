@@ -1,0 +1,120 @@
+#!/bin/zsh
+# Universal 2 Developer ID release with a pinned Sparkle 2 updater.
+set -euo pipefail
+unsetopt bg_nice 2>/dev/null || true
+cd "$(dirname "$0")/.."
+
+IDENTITY=""
+FEED_URL=""
+PUBLIC_KEY=""
+NOTARIZE=0
+
+usage() {
+  print -u2 "usage: scripts/release-updater --identity 'Developer ID Application: ...' --feed-url https://.../appcast.xml --public-key <base64> [--notarize]"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --identity) IDENTITY="$2"; shift 2 ;;
+    --feed-url) FEED_URL="$2"; shift 2 ;;
+    --public-key) PUBLIC_KEY="$2"; shift 2 ;;
+    --notarize) NOTARIZE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 2 ;;
+  esac
+done
+
+[[ "$IDENTITY" == "Developer ID Application:"* ]] || { print -u2 "FAIL: a Developer ID Application identity is required"; exit 1; }
+[[ "$FEED_URL" == https://* ]] || { print -u2 "FAIL: feed URL must use HTTPS"; exit 1; }
+KEY_BYTES=$(print -rn -- "$PUBLIC_KEY" | base64 -D 2>/dev/null | wc -c | tr -d ' ')
+[[ "$KEY_BYTES" == 32 ]] || { print -u2 "FAIL: Sparkle public key must be a base64-encoded 32-byte Ed25519 key"; exit 1; }
+security find-identity -v -p codesigning | grep -Fq "\"$IDENTITY\"" || { print -u2 "FAIL: signing identity is unavailable"; exit 1; }
+
+NATIVE="${NATIVE_BIN:-vendor/native/zig-out/bin/native}"
+[[ -x "$NATIVE" ]] || NATIVE=native
+SPARKLE_ROOT=$(scripts/updater-fetch-sparkle)
+APP="zig-out/package/Token Tach.app"
+VERSION=$(scripts/version current)
+ARCHIVES="zig-out/updater/releases"
+ZIP="$ARCHIVES/token-tach-${VERSION}-macos.zip"
+DMG="$ARCHIVES/token-tach-${VERSION}-universal2.dmg"
+ARM_PREFIX="zig-out/updater-arm64"
+INTEL_PREFIX="zig-out/updater-x86_64"
+UNIVERSAL_DIR="zig-out/updater-universal"
+UNIVERSAL_BINARY="$UNIVERSAL_DIR/token-tach"
+
+print "==> verify"
+scripts/verify --no-smoke
+print "==> updater-enabled Universal 2 production build"
+rm -rf "$ARM_PREFIX" "$INTEL_PREFIX" "$UNIVERSAL_DIR"
+zig build --prefix "$ARM_PREFIX" -Dtarget=aarch64-macos -Doptimize=ReleaseFast -Dupdater=true -Dsparkle-dir="$SPARKLE_ROOT"
+zig build --prefix "$INTEL_PREFIX" -Dtarget=x86_64-macos -Doptimize=ReleaseFast -Dupdater=true -Dsparkle-dir="$SPARKLE_ROOT"
+mkdir -p "$UNIVERSAL_DIR"
+lipo -create "$ARM_PREFIX/bin/token-tach" "$INTEL_PREFIX/bin/token-tach" -output "$UNIVERSAL_BINARY"
+lipo "$UNIVERSAL_BINARY" -verify_arch arm64 x86_64
+print "==> unsigned package"
+rm -rf "$APP"
+"$NATIVE" package --target macos --output "$APP" --binary "$UNIVERSAL_BINARY" --signing none
+rm -f "$APP/Contents/Resources/signing-plan.txt"
+
+print "==> embed updater and signed-feed policy"
+mkdir -p "$APP/Contents/Frameworks"
+ditto "$SPARKLE_ROOT/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
+PLIST="$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :SUFeedURL string $FEED_URL" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $PUBLIC_KEY" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :SUEnableAutomaticChecks bool false" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :SUVerifyUpdateBeforeExtraction bool true" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :SURequireSignedFeed bool true" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :SUSignedFeedFailureExpirationInterval integer 0" "$PLIST"
+
+print "==> sign completed bundle"
+xattr -cr "$APP"
+SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
+codesign --force --timestamp --options runtime --sign "$IDENTITY" "$SPARKLE/Versions/B/XPCServices/Installer.xpc"
+codesign --force --timestamp --options runtime --preserve-metadata=entitlements --sign "$IDENTITY" "$SPARKLE/Versions/B/XPCServices/Downloader.xpc"
+codesign --force --timestamp --options runtime --sign "$IDENTITY" "$SPARKLE/Versions/B/Autoupdate"
+codesign --force --timestamp --options runtime --sign "$IDENTITY" "$SPARKLE/Versions/B/Updater.app"
+codesign --force --timestamp --options runtime --sign "$IDENTITY" "$SPARKLE"
+codesign --force --timestamp --options runtime --sign "$IDENTITY" "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
+lipo "$APP/Contents/MacOS/token-tach" -verify_arch arm64 x86_64
+otool -L "$APP/Contents/MacOS/token-tach" | grep -q '@rpath/Sparkle.framework/' || { print -u2 "FAIL: binary is not linked to embedded Sparkle"; exit 1; }
+otool -l "$APP/Contents/MacOS/token-tach" | grep -q '@executable_path/../Frameworks' || { print -u2 "FAIL: Sparkle runtime search path is missing"; exit 1; }
+
+mkdir -p "$ARCHIVES"
+rm -f "$ZIP" "$DMG"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+
+if [[ "$NOTARIZE" == 1 ]]; then
+  print "==> notarize application archive"
+  if [[ -n "${NOTARY_KEY_PATH:-}" || -n "${NOTARY_KEY_ID:-}" || -n "${NOTARY_ISSUER_ID:-}" ]]; then
+    [[ -n "${NOTARY_KEY_PATH:-}" && -n "${NOTARY_KEY_ID:-}" && -n "${NOTARY_ISSUER_ID:-}" ]] || {
+      print -u2 "FAIL: API notarization requires NOTARY_KEY_PATH, NOTARY_KEY_ID, and NOTARY_ISSUER_ID"
+      exit 2
+    }
+    NOTARY_ARGS=(--key "$NOTARY_KEY_PATH" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID")
+  else
+    NOTARY_ARGS=(--keychain-profile "${NOTARY_PROFILE:-token-tach}")
+  fi
+  xcrun notarytool submit "$ZIP" "${NOTARY_ARGS[@]}" --wait
+  xcrun stapler staple "$APP"
+  rm -f "$ZIP"
+  ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+  xcrun stapler validate "$APP"
+fi
+
+print "==> create direct-install DMG"
+hdiutil create -volname "Token Tach" -srcfolder "$APP" -ov -format UDZO "$DMG"
+if [[ "$NOTARIZE" == 1 ]]; then
+  xcrun notarytool submit "$DMG" "${NOTARY_ARGS[@]}" --wait
+  xcrun stapler staple "$DMG"
+  xcrun stapler validate "$DMG"
+  spctl --assess --type execute --verbose=4 "$APP"
+else
+  print -u2 "WARNING: updater release is signed but not notarized"
+fi
+
+print -r -- "UPDATER ARCHIVE: $ZIP"
+print -r -- "DIRECT INSTALL DMG: $DMG"
+print -r -- "Next: scripts/updater-generate-appcast '$ARCHIVES' '<https-download-directory>'"

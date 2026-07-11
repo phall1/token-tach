@@ -1,6 +1,6 @@
-//! History dashboard window: month rollups, 30-day bars, and top
-//! model/project attribution. The main popover stays an instrument;
-//! this is the ledger workbench.
+//! History dashboard window: the instrument's disciplined ledger view.
+//! Dense month rollups and attribution share the popover's materials,
+//! telemetry inks, and compact labeling without imitating the dial.
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
@@ -35,8 +35,8 @@ pub fn rootView(ui: *Ui, model: *const Model) Ui.Node {
     hero(ui, &nodes, model);
     dailyBars(ui, &nodes, model);
     agentSplit(ui, &nodes, model);
-    topTable(ui, &nodes, "MODELS", model.ledger.per_model.keys(), model.ledger.per_model.values(), rect(pad, 388, 424, 216));
-    topTable(ui, &nodes, "PROJECTS", model.ledger.per_project.keys(), model.ledger.per_project.values(), rect(472, 388, 424, 216));
+    topTable(ui, &nodes, "03 / MODELS", model.ledger.per_model.keys(), model.ledger.per_model.values(), rect(pad, 404, 424, 212));
+    topTable(ui, &nodes, "04 / PROJECTS", model.ledger.per_project.keys(), model.ledger.per_project.values(), rect(472, 404, 424, 212));
 
     return ui.panel(.{
         .grow = 1,
@@ -48,15 +48,15 @@ pub fn rootView(ui: *Ui, model: *const Model) Ui.Node {
 fn header(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
     const rollup = engine.monthRollup(&model.ledger, model.now_ms);
     push(ui, nodes, ui.paragraph(.{
-        .frame = rect(pad, 18, 360, 30),
+        .frame = rect(pad, 19, 420, 30),
         .semantics = .{ .label = "Token Tach history dashboard" },
     }, &.{
         .{ .text = "TOKEN", .weight = .bold, .monospace = true, .scale = 1.35, .color = .text },
         .{ .text = " TACH", .weight = .bold, .monospace = true, .scale = 1.35, .color = .accent },
-        .{ .text = " DASH", .weight = .bold, .monospace = true, .scale = 1.35, .color = .text_muted },
+        .{ .text = " / LEDGER", .weight = .medium, .monospace = true, .scale = 1.0, .color = .text_muted },
     }));
     push(ui, nodes, ui.text(.{
-        .frame = rect(window_width - 260, 24, 236, 18),
+        .frame = rect(window_width - 300, 24, 276, 18),
         .size = .sm,
         .text_alignment = .end,
         .style_tokens = .{ .foreground = .text_muted },
@@ -64,12 +64,18 @@ fn header(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
 }
 
 fn hero(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
-    const frame = rect(pad, 60, window_width - 2 * pad, 122);
-    panel(ui, nodes, frame, Color.rgb8(10, 15, 18), 10);
+    const frame = rect(pad, 62, window_width - 2 * pad, 126);
+    card(ui, nodes, frame);
+
+    push(ui, nodes, ui.text(.{
+        .frame = rect(42, 76, 180, 14),
+        .size = .sm,
+        .style = .{ .foreground = theme.text_faint },
+    }, "01 / MONTH TO DATE"));
 
     const rollup = engine.monthRollup(&model.ledger, model.now_ms);
-    stat(ui, nodes, "MONTH API EQUIV", fmtCost(ui, rollup.totals.cost_usd), rect(48, 88, 210, 68), theme.green);
-    stat(ui, nodes, "MONTH TOKENS", fmtTokens(ui, rollup.totals.totalTokens()), rect(276, 88, 190, 68), theme.cluster_colors.text);
+    stat(ui, nodes, "API EQUIVALENT", fmtCost(ui, rollup.totals.cost_usd), rect(48, 104, 200, 58), theme.green);
+    stat(ui, nodes, "TOKENS PROCESSED", fmtTokens(ui, rollup.totals.totalTokens()), rect(276, 104, 180, 58), theme.cluster_colors.text);
 
     const value = engine.subscriptionValue(model);
     const multiple_text = if (value.multipleLowerBound(rollup.totals.cost_usd)) |m|
@@ -78,18 +84,20 @@ fn hero(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
         "plan unknown"
     else
         "no paid plan";
-    stat(ui, nodes, "SUBSCRIPTION VALUE", multiple_text, rect(488, 88, 180, 68), if (value.incomplete) theme.amber else theme.needle);
+    stat(ui, nodes, "SUBSCRIPTION VALUE", multiple_text, rect(488, 104, 170, 58), if (value.incomplete) theme.amber else theme.needle);
+
+    panel(ui, nodes, rect(258, 102, 1, 58), theme.hairline, 0);
+    panel(ui, nodes, rect(470, 102, 1, 58), theme.hairline, 0);
+    panel(ui, nodes, rect(674, 78, 1, 92), theme.hairline, 0);
 
     const plan_text = if (value.plan_hi_usd > 0)
-        ui.fmt("{s} API-equivalent on {s}/mo plans{s}", .{
-            fmtCost(ui, rollup.totals.cost_usd),
+        ui.fmt("C/C plan denominator: {s}/mo. OpenCode: API-equivalent only.", .{
             planBand(ui, value),
-            if (value.ambiguous()) " (Claude Max tier ambiguous)" else "",
         })
     else
         "No recognizable paid plan string yet";
     push(ui, nodes, ui.text(.{
-        .frame = rect(684, 112, 188, 32),
+        .frame = rect(698, 112, 174, 42),
         .wrap = true,
         .size = .sm,
         .style_tokens = .{ .foreground = .text_muted },
@@ -109,12 +117,12 @@ fn stat(ui: *Ui, nodes: *std.ArrayList(Ui.Node), label: []const u8, value: []con
 }
 
 fn dailyBars(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
-    const frame = rect(pad, 196, 642, 170);
-    panel(ui, nodes, frame, Color.rgb8(10, 15, 18), 10);
+    const frame = rect(pad, 204, 642, 184);
+    card(ui, nodes, frame);
     push(ui, nodes, ui.text(.{
-        .frame = rect(frame.x + 18, frame.y + 14, 180, 16),
+        .frame = rect(frame.x + 18, frame.y + 15, 260, 16),
         .style_tokens = .{ .foreground = .text_muted },
-    }, "30-DAY API-EQUIVALENT COST"));
+    }, "02 / 30-DAY API-EQUIVALENT COST"));
 
     var raw: [30]f64 = undefined;
     engine.trailingDailyCost(&model.ledger, model.now_ms, &raw);
@@ -128,11 +136,11 @@ fn dailyBars(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void 
         slot.* = @floatCast(v);
     }
     push(ui, nodes, ui.stack(.{
-        .frame = rect(frame.x + 18, frame.y + 44, frame.width - 36, 96),
+        .frame = rect(frame.x + 18, frame.y + 48, frame.width - 36, 102),
     }, .{
         ui.chart(.{
             .width = frame.width - 36,
-            .height = 96,
+            .height = 102,
             .y_min = 0,
             .y_max = @floatCast(@max(max_cost, 1)),
             .grid_lines = 3,
@@ -140,12 +148,12 @@ fn dailyBars(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void 
         }, &.{.{ .kind = .bar, .values = values, .color = .accent, .label = "daily cost" }}),
     }));
     push(ui, nodes, ui.text(.{
-        .frame = rect(frame.x + 18, frame.y + 146, 180, 14),
+        .frame = rect(frame.x + 18, frame.y + 162, 180, 14),
         .size = .sm,
         .style_tokens = .{ .foreground = .text_muted },
     }, "oldest → today"));
     push(ui, nodes, ui.text(.{
-        .frame = rect(frame.x + frame.width - 180, frame.y + 146, 160, 14),
+        .frame = rect(frame.x + frame.width - 180, frame.y + 162, 160, 14),
         .size = .sm,
         .text_alignment = .end,
         .style_tokens = .{ .foreground = .text_muted },
@@ -153,17 +161,19 @@ fn dailyBars(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void 
 }
 
 fn agentSplit(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
-    const frame = rect(690, 196, 206, 170);
-    panel(ui, nodes, frame, Color.rgb8(10, 15, 18), 10);
+    const frame = rect(690, 204, 206, 184);
+    card(ui, nodes, frame);
     push(ui, nodes, ui.text(.{
         .frame = rect(frame.x + 16, frame.y + 14, 160, 16),
         .style_tokens = .{ .foreground = .text_muted },
-    }, "AGENT SPLIT"));
+    }, "AGENT / SHARE"));
 
     const claude_total = model.ledger.forAgent(.claude);
     const codex_total = model.ledger.forAgent(.codex);
-    agentRow(ui, nodes, "Claude", claude_total, model.ledger.all.cost_usd, frame.y + 48);
-    agentRow(ui, nodes, "Codex", codex_total, model.ledger.all.cost_usd, frame.y + 96);
+    const opencode_total = model.ledger.forAgent(.opencode);
+    agentRow(ui, nodes, "CLAUDE", claude_total, model.ledger.all.cost_usd, frame.y + 42);
+    agentRow(ui, nodes, "CODEX", codex_total, model.ledger.all.cost_usd, frame.y + 88);
+    agentRow(ui, nodes, "OPENCODE", opencode_total, model.ledger.all.cost_usd, frame.y + 134);
 }
 
 fn agentRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), name: []const u8, totals: ledger_mod.Totals, all_cost: f64, y: f32) void {
@@ -191,7 +201,7 @@ fn topTable(
     values: []const ledger_mod.Totals,
     frame: geometry.RectF,
 ) void {
-    panel(ui, nodes, frame, Color.rgb8(10, 15, 18), 10);
+    card(ui, nodes, frame);
     push(ui, nodes, ui.text(.{
         .frame = rect(frame.x + 16, frame.y + 14, 180, 16),
         .style_tokens = .{ .foreground = .text_muted },
@@ -199,7 +209,7 @@ fn topTable(
 
     const rows = sortedRows(ui, keys, values);
     const shown = @min(rows.len, 7);
-    var y = frame.y + 44;
+    var y = frame.y + 42;
     for (rows[0..shown]) |row| {
         tableRow(ui, nodes, row.name, row.totals, rowsTotalCost(rows), frame.x + 16, y, frame.width - 32);
         y += 22;
@@ -271,6 +281,11 @@ fn panel(ui: *Ui, nodes: *std.ArrayList(Ui.Node), frame: geometry.RectF, color: 
         .frame = frame,
         .style = .{ .background = color, .border = theme.bezel_edge, .stroke_width = if (radius > 0) 1 else 0, .radius = radius },
     }, .{}));
+}
+
+fn card(ui: *Ui, nodes: *std.ArrayList(Ui.Node), frame: geometry.RectF) void {
+    panel(ui, nodes, frame, theme.panel, 8);
+    panel(ui, nodes, rect(frame.x + 1, frame.y + 1, frame.width - 2, 1), theme.panel_topline, 0);
 }
 
 fn push(ui: *Ui, nodes: *std.ArrayList(Ui.Node), node: Ui.Node) void {

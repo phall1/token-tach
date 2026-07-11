@@ -1,7 +1,7 @@
 .{
     .name = .token_tach,
     .fingerprint = 0xe3b1adac5a707070,
-    .version = "0.1.0",
+    .version = "0.4.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{ .native_sdk = .{ .path = "vendor/native" } },
     .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "app.zon" },

@@ -154,9 +154,9 @@ pub fn buildChrome(
         .rect = geometry.RectF.init(0, 0, size.width, size.height),
         .fill = .{ .color = theme.bg },
     });
-    try bezelWash(builder, chrome_id_base + 2, gauge_panel, 14);
-    try bezelWash(builder, chrome_id_base + 3, limits_panel_rect, 14);
-    try bezelWash(builder, chrome_id_base + 4, strip_rect, 10);
+    try bezelWash(builder, chrome_id_base + 2, gauge_panel, 10);
+    try bezelWash(builder, chrome_id_base + 3, limits_panel_rect, 10);
+    try bezelWash(builder, chrome_id_base + 4, strip_rect, 7);
     try builder.fillPath(.{
         .id = chrome_id_base + 5,
         .elements = circlePath(&dial_face_elems, center, dial_r),
@@ -286,7 +286,7 @@ fn header(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
     }));
 
     push(ui, nodes, ui.button(.{
-        .frame = rect(356, header_y + 1, 62, 22),
+        .frame = rect(354, header_y + 1, 66, 22),
         .size = .sm,
         .on_press = .open_dashboard,
         .semantics = .{ .label = "Open dashboard" },
@@ -326,7 +326,7 @@ fn gaugeCluster(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) vo
     // Gauge bezel border (fill is chrome; the widget carries the edge).
     push(ui, nodes, ui.panel(.{
         .frame = gauge_panel,
-        .style = .{ .background = theme.transparent, .border = theme.bezel_edge, .stroke_width = 1, .radius = 14 },
+        .style = .{ .background = theme.transparent, .border = theme.bezel_edge, .stroke_width = 1, .radius = 10 },
     }, .{}));
 
     // Redline halo: a pulsing glow behind the red zone while danger holds.
@@ -365,7 +365,7 @@ fn gaugeCluster(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) vo
             push(ui, nodes, ui.panel(.{
                 .global_key = canvas.uiKey(led_glow_key_base + @as(u64, @intCast(i))),
                 .frame = rect(p.x - 5.5, p.y - 5.5, 11, 11),
-                .style = .{ .background = withAlpha(ink, 0.22), .radius = 5.5, .stroke_width = 0 },
+                .style = .{ .background = withAlpha(ink, 0.17), .radius = 5.5, .stroke_width = 0 },
             }, .{}));
             push(ui, nodes, ui.panel(.{
                 .global_key = canvas.uiKey(led_key_base + @as(u64, @intCast(i))),
@@ -473,7 +473,7 @@ const row_h: f32 = 24;
 fn limitsPanel(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
     push(ui, nodes, ui.panel(.{
         .frame = limits_panel_rect,
-        .style = .{ .background = theme.transparent, .border = theme.bezel_edge, .stroke_width = 1, .radius = 14 },
+        .style = .{ .background = theme.transparent, .border = theme.bezel_edge, .stroke_width = 1, .radius = 10 },
     }, .{}));
 
     var y: f32 = panel_y + 16;
@@ -483,6 +483,7 @@ fn limitsPanel(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
         .style = .{ .background = theme.hairline, .radius = 0, .stroke_width = 0 },
     }, .{}));
     _ = agentGroup(ui, nodes, model, .codex, model.codex_limits, y + 10);
+    compactOpenCodeRow(ui, nodes, model);
 
     // Burn history trace pinned to the panel foot: an area-filled scope
     // line on a square-root scale, so one spike no longer flattens the
@@ -527,6 +528,7 @@ fn agentGroup(
     const name: []const u8 = switch (agent) {
         .claude => "CLAUDE",
         .codex => "CODEX",
+        .opencode => "OPENCODE",
     };
 
     var name_spans: [3]canvas.TextSpan = .{
@@ -589,14 +591,38 @@ fn agentGroup(
         push(ui, nodes, ui.text(.{
             .frame = rect(bars_x, y + 15, bars_right - bars_x, 14),
             .size = .sm,
-            .style = .{ .foreground = Color.rgb8(84, 100, 95) },
+            .style = .{ .foreground = theme.text_faint },
         }, switch (agent) {
             .claude => "set claude-oauth = true in config",
             .codex => "none embedded in recent rollouts",
+            .opencode => "API-equivalent usage only",
         }));
         y += row_h + 14;
     }
     return y + 4;
+}
+
+fn compactOpenCodeRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
+    const y = panel_y + 194;
+    const enabled = model.cfg.sources.opencode;
+    const totals = model.ledger.forAgent(.opencode);
+    const empty = enabled and engine.agentIsEmpty(model, .opencode);
+    push(ui, nodes, ui.paragraph(.{
+        .frame = rect(bars_x, y, 100, 16),
+        .semantics = .{ .label = "OpenCode API-equivalent usage" },
+    }, &.{.{ .text = "OPENCODE", .weight = .bold, .monospace = true }}));
+    const value: []const u8 = if (!enabled)
+        "disabled"
+    else if (empty)
+        "no messages found"
+    else
+        ui.fmt("{s} · {s}", .{ fmtTokens(ui, totals.totalTokens()), fmtCost(ui, totals.cost_usd) });
+    push(ui, nodes, ui.text(.{
+        .frame = rect(bars_right - 140, y + 1, 140, 14),
+        .size = .sm,
+        .text_alignment = .end,
+        .style_tokens = .{ .foreground = .text_muted },
+    }, value));
 }
 
 fn windowRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), window: types.LimitWindow, now_ms: i64, y: f32, stale: bool) void {
@@ -667,7 +693,7 @@ fn odometerStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) v
 
     push(ui, nodes, ui.panel(.{
         .frame = strip_rect,
-        .style = .{ .background = theme.transparent, .border = theme.bezel_edge, .stroke_width = 1, .radius = 10 },
+        .style = .{ .background = theme.transparent, .border = theme.bezel_edge, .stroke_width = 1, .radius = 7 },
         .semantics = .{ .label = model.today_text },
     }, .{}));
 
@@ -713,7 +739,7 @@ fn odometerStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) v
             ui.paragraph(.{
                 .frame = rect(0, 5, cell_w, 16),
                 .text_alignment = .center,
-                .style = .{ .foreground = if (significant) theme.cluster_colors.text else Color.rgb8(52, 64, 60) },
+                .style = .{ .foreground = if (significant) theme.cluster_colors.text else theme.text_faint },
             }, &.{.{ .text = digits[i .. i + 1], .monospace = true, .weight = .medium }}),
         }));
         x += cell_w + cell_gap;

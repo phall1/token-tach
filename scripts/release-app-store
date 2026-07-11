@@ -1,0 +1,255 @@
+#!/bin/zsh
+# Build a sandboxed Mac App Store installer package.
+#
+# Signing assets stay in the login keychain / Xcode profile directory. This
+# script never copies credentials into the repository and never accepts a
+# password or private key on the command line.
+set -euo pipefail
+unsetopt bg_nice 2>/dev/null || true
+cd "$(dirname "$0")/.."
+
+BUNDLE_ID="com.phall.token-tach"
+PROFILE=""
+APP_IDENTITY=""
+INSTALLER_IDENTITY=""
+CI_MODE=0
+UPLOAD=0
+TESTFLIGHT_GROUP=""
+
+usage() {
+  echo "usage: scripts/release-app-store [--ci] [--profile file] [--app-identity name] [--installer-identity name] [--upload] [--testflight-group name]"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile) PROFILE="$2"; shift 2 ;;
+    --app-identity) APP_IDENTITY="$2"; shift 2 ;;
+    --installer-identity) INSTALLER_IDENTITY="$2"; shift 2 ;;
+    --ci) CI_MODE=1; shift ;;
+    --upload) UPLOAD=1; shift ;;
+    --testflight-group) TESTFLIGHT_GROUP="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown argument: $1"; usage; exit 2 ;;
+  esac
+done
+
+if [[ -z "${GITHUB_RUN_ID:-}" && -z "${STORE_BUILD_NUMBER:-}" ]]; then
+  if [[ -n "${APP_STORE_CONNECT_API_KEY_ID:-}" && -n "${APP_STORE_CONNECT_API_ISSUER_ID:-}" && -n "${APP_STORE_CONNECT_APP_ID:-}" && -n "${APP_STORE_CONNECT_API_KEY_PATH:-}" ]]; then
+    STORE_BUILD_NUMBER=$(scripts/app-store-connect next-build-number)
+  else
+    STORE_BUILD_NUMBER=$(date -u +%Y%m%d%H%M%S)
+  fi
+  export STORE_BUILD_NUMBER
+fi
+STORE_BUILD_FLOOR="${STORE_BUILD_FLOOR:-0}"
+export STORE_BUILD_FLOOR
+VERSION=$(scripts/version current)
+STORE_BUILD_NUMBER=$(scripts/version store-build-number)
+echo "==> App Store build number: $STORE_BUILD_NUMBER"
+
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/token-tach-store.XXXXXX")
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+profile_bundle_id() {
+  local profile="$1"
+  local plist="$TMP_DIR/profile-check.plist"
+  security cms -D -i "$profile" > "$plist" 2>/dev/null || return 1
+  local application_id
+  application_id=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$plist" 2>/dev/null) || return 1
+  print -r -- "${application_id#*.}"
+}
+
+if [[ "$CI_MODE" == 0 && -z "$PROFILE" ]]; then
+  while IFS= read -r candidate; do
+    if [[ "$(profile_bundle_id "$candidate" 2>/dev/null || true)" == "$BUNDLE_ID" ]]; then
+      PROFILE="$candidate"
+      break
+    fi
+  done < <(find \
+    "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
+    "$HOME/Library/MobileDevice/Provisioning Profiles" \
+    -maxdepth 1 -type f \( -name '*.provisionprofile' -o -name '*.mobileprovision' \) \
+    -print 2>/dev/null || true)
+fi
+
+if [[ "$CI_MODE" == 0 && ( -z "$PROFILE" || ! -f "$PROFILE" ) ]]; then
+  echo "FAIL: no Mac App Store provisioning profile for $BUNDLE_ID was found"
+  echo "Create and download a Mac App Store distribution profile in the Apple Developer portal,"
+  echo "then rerun with: scripts/release-app-store --profile /path/to/profile.provisionprofile"
+  exit 1
+fi
+
+TEAM_ID=""
+if [[ "$CI_MODE" == 0 ]]; then
+  PROFILE_PLIST="$TMP_DIR/profile.plist"
+  security cms -D -i "$PROFILE" > "$PROFILE_PLIST"
+  PROFILE_APP_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$PROFILE_PLIST")
+  PROFILE_BUNDLE_ID="${PROFILE_APP_ID#*.}"
+  TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.team-identifier' "$PROFILE_PLIST" 2>/dev/null || true)
+  [[ -n "$TEAM_ID" ]] || TEAM_ID="${PROFILE_APP_ID%%.*}"
+
+  if [[ "$PROFILE_BUNDLE_ID" != "$BUNDLE_ID" ]]; then
+    echo "FAIL: profile is for $PROFILE_BUNDLE_ID, expected $BUNDLE_ID"
+    exit 1
+  fi
+fi
+
+find_identity() {
+  local pattern="$1"
+  local policy="${2:-}"
+  local args=(-v)
+  [[ -n "$policy" ]] && args+=(-p "$policy")
+  security find-identity "${args[@]}" \
+    | sed -nE 's/.*"([^"]+)".*/\1/p' \
+    | grep -E "$pattern" \
+    | head -1 || true
+}
+
+if [[ "$CI_MODE" == 0 && -z "$APP_IDENTITY" ]]; then
+  APP_IDENTITY=$(find_identity '^(Apple Distribution:|3rd Party Mac Developer Application:)' codesigning)
+fi
+if [[ "$CI_MODE" == 0 && -z "$INSTALLER_IDENTITY" ]]; then
+  INSTALLER_IDENTITY=$(find_identity '^(Mac Installer Distribution:|3rd Party Mac Developer Installer:)')
+fi
+
+if [[ "$CI_MODE" == 0 && -z "$APP_IDENTITY" ]]; then
+  echo "FAIL: no usable Apple Distribution/Mac App Distribution signing identity"
+  echo "Create it on this Mac so its private key appears in Keychain Access."
+  exit 1
+fi
+if [[ "$CI_MODE" == 0 && -z "$INSTALLER_IDENTITY" ]]; then
+  echo "FAIL: no usable Mac Installer Distribution signing identity"
+  echo "Create it on this Mac so its private key appears in Keychain Access."
+  exit 1
+fi
+
+NATIVE="${NATIVE_BIN:-vendor/native/zig-out/bin/native}"
+[[ -x "$NATIVE" ]] || NATIVE=native
+
+echo "==> verify"
+scripts/verify --no-smoke
+
+echo "==> production builds (arm64 + x86_64)"
+ARM_PREFIX="zig-out/store-arm64"
+INTEL_PREFIX="zig-out/store-x86_64"
+UNIVERSAL_DIR="zig-out/store-universal"
+UNIVERSAL_BINARY="$UNIVERSAL_DIR/token-tach"
+zig build --prefix "$ARM_PREFIX" -Dtarget=aarch64-macos -Doptimize=ReleaseFast -Dapp-store=true
+zig build --prefix "$INTEL_PREFIX" -Dtarget=x86_64-macos -Doptimize=ReleaseFast -Dapp-store=true
+mkdir -p "$UNIVERSAL_DIR"
+lipo -create \
+  "$ARM_PREFIX/bin/token-tach" \
+  "$INTEL_PREFIX/bin/token-tach" \
+  -output "$UNIVERSAL_BINARY"
+lipo "$UNIVERSAL_BINARY" -verify_arch arm64 x86_64
+
+# Zig's self-hosted Mach-O linker identifies itself with a private build-tool
+# value that current App Store processing does not recognize as a valid app
+# binary. Header padding is reserved by -Dapp-store; replace that load command
+# with Apple's defined LD record using the installed Xcode toolchain.
+SDK_VERSION=$(xcrun --sdk macosx --show-sdk-version)
+LD_VERSION=$(xcrun ld -version_details | plutil -extract version raw -)
+NORMALIZED_BINARY="$UNIVERSAL_DIR/token-tach-normalized"
+vtool -set-build-version macos 11.0 "$SDK_VERSION" \
+  -tool ld "$LD_VERSION" -replace \
+  -output "$NORMALIZED_BINARY" "$UNIVERSAL_BINARY"
+mv "$NORMALIZED_BINARY" "$UNIVERSAL_BINARY"
+chmod +x "$UNIVERSAL_BINARY"
+lipo "$UNIVERSAL_BINARY" -verify_arch arm64 x86_64
+echo "    architectures: $(lipo -archs "$UNIVERSAL_BINARY")"
+BUILD_INFO=$(vtool -show-build "$UNIVERSAL_BINARY")
+[[ $(print -r -- "$BUILD_INFO" | grep -c 'tool LD') == 2 ]] || {
+  echo "FAIL: both Mach-O slices must identify Apple's LD build tool"
+  print -r -- "$BUILD_INFO"
+  exit 1
+}
+
+APP="zig-out/package/Token Tach.app"
+if [[ "$CI_MODE" == 1 ]]; then
+  PKG="zig-out/package/token-tach-${VERSION}-build-${STORE_BUILD_NUMBER}-mac-app-store-ci.pkg"
+else
+  PKG="zig-out/package/token-tach-${VERSION}-build-${STORE_BUILD_NUMBER}-mac-app-store.pkg"
+fi
+ENTITLEMENTS="zig-out/package/mac-app-store-expanded.entitlements"
+
+echo "==> package unsigned app"
+rm -rf "$APP" "$PKG"
+"$NATIVE" package --target macos --output "$APP" --binary "$UNIVERSAL_BINARY" --signing none
+# The SDK's local diagnostic says "unsigned" by design; it is not part of
+# the product and would be misleading after the store signature is applied.
+rm -f "$APP/Contents/Resources/signing-plan.txt"
+
+echo "==> add Mac App Store category"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $STORE_BUILD_NUMBER" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy \
+  -c 'Add :LSApplicationCategoryType string public.app-category.developer-tools' \
+  "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleSupportedPlatforms array' "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleSupportedPlatforms:0 string MacOSX' "$APP/Contents/Info.plist"
+scripts/version check-bundle "$APP" "$STORE_BUILD_NUMBER"
+
+if [[ "$CI_MODE" == 0 ]]; then
+  echo "==> embed provisioning profile"
+  # Downloads are quarantined by macOS. Never preserve those extended
+  # attributes in an App Store payload, and scrub the complete bundle in case
+  # another packaged input arrived with metadata of its own.
+  /bin/cp -X "$PROFILE" "$APP/Contents/embedded.provisionprofile"
+fi
+xattr -cr "$APP"
+
+echo "==> expand public signing entitlements"
+cp assets/mac-app-store.entitlements "$ENTITLEMENTS"
+if [[ "$CI_MODE" == 0 ]]; then
+  /usr/libexec/PlistBuddy -c "Add :com.apple.application-identifier string $TEAM_ID.$BUNDLE_ID" "$ENTITLEMENTS"
+  /usr/libexec/PlistBuddy -c "Add :com.apple.developer.team-identifier string $TEAM_ID" "$ENTITLEMENTS"
+fi
+
+echo "==> sign app"
+if [[ "$CI_MODE" == 1 ]]; then
+  codesign --force --deep --sign - --entitlements "$ENTITLEMENTS" "$APP"
+else
+  codesign --force --deep --timestamp --options runtime --sign "$APP_IDENTITY" --entitlements "$ENTITLEMENTS" "$APP"
+fi
+codesign --verify --deep --strict --verbose=2 "$APP"
+
+if [[ "$CI_MODE" == 1 ]]; then
+  echo "==> sandbox launch survival check"
+  APP_BINARY="${APP:A}/Contents/MacOS/token-tach"
+  (cd / && "$APP_BINARY" > "$TMP_DIR/launch.log" 2>&1) &
+  APP_PID=$!
+  sleep 4
+  if kill -0 "$APP_PID" 2>/dev/null; then
+    kill "$APP_PID" 2>/dev/null || true
+    wait "$APP_PID" 2>/dev/null || true
+  else
+    wait "$APP_PID" || true
+    echo "FAIL: sandboxed Store-shaped app exited during launch"
+    sed -n '1,120p' "$TMP_DIR/launch.log"
+    exit 1
+  fi
+  echo "==> build unsigned CI installer"
+  productbuild --component "$APP" /Applications "$PKG"
+  AUDIT_MODE=ci
+else
+  echo "==> build signed installer"
+  productbuild --component "$APP" /Applications --sign "$INSTALLER_IDENTITY" "$PKG"
+  pkgutil --check-signature "$PKG"
+  AUDIT_MODE=distribution
+fi
+
+scripts/audit-app-store --mode "$AUDIT_MODE" --build-number "$STORE_BUILD_NUMBER" "$PKG"
+
+echo "APP STORE PACKAGE: $PKG"
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  echo "package=$PKG" >> "$GITHUB_OUTPUT"
+  echo "build_number=$STORE_BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+fi
+
+if [[ "$UPLOAD" == 1 ]]; then
+  [[ "$CI_MODE" == 0 ]] || { echo "FAIL: credential-free CI packages cannot be uploaded"; exit 1; }
+  DELIVERY_ARGS=(deliver "$PKG" --build-number "$STORE_BUILD_NUMBER")
+  [[ -n "$TESTFLIGHT_GROUP" ]] && DELIVERY_ARGS+=(--testflight-group "$TESTFLIGHT_GROUP")
+  scripts/app-store-connect "${DELIVERY_ARGS[@]}"
+else
+  echo "Upload skipped. Pass --upload with App Store Connect API credentials to deliver this package."
+fi

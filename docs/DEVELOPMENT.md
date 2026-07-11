@@ -49,7 +49,12 @@ native skills get automation       # driving a running app
 The app builds against a **vendored fork** of the Native SDK
 (`vendor/native`, submodule → github.com/phall1/native), not the npm CLI's
 copy. `build.zig`/`build.zig.zon` are ejected (`native eject`) and owned by
-this repo; `build.zig.zon` points `.native_sdk` at `vendor/native`.
+this repo; `build.zig.zon` points `.native_sdk` at `vendor/native`. App release
+versions belong in `app.zon`. Zig 0.16 requires `build.zig.zon` to repeat its
+package version, so `scripts/version check` fails unless that compatibility
+field mirrors the manifest. The build imports the manifest version directly
+for CLI, JSON, and menu consumers, while Native SDK packaging uses it for
+bundle metadata and artifact names.
 
 Why: we carry patches to the macOS host (`src/platform/macos/appkit_host.m`)
 for NSPopover-under-status-item, LSUIElement, and SMAppService — upstream

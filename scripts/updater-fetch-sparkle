@@ -1,0 +1,36 @@
+#!/bin/zsh
+# Fetch the pinned, prebuilt Sparkle distribution and verify it before use.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+VERSION="2.9.4"
+SHA256="ce89daf967db1e1893ed3ebd67575ed82d3902563e3191ca92aaec9164fbdef9"
+URL="https://github.com/sparkle-project/Sparkle/releases/download/${VERSION}/Sparkle-${VERSION}.tar.xz"
+DEST="${SPARKLE_DIR:-zig-out/updater/sparkle-${VERSION}}"
+
+if [[ -d "$DEST/Sparkle.framework" && -x "$DEST/bin/generate_appcast" ]]; then
+  print -r -- "$DEST"
+  exit 0
+fi
+
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/token-tach-sparkle.XXXXXX")
+trap 'rm -rf "$TMP_DIR"' EXIT
+ARCHIVE="$TMP_DIR/Sparkle.tar.xz"
+
+curl --fail --location --proto '=https' --tlsv1.2 "$URL" --output "$ARCHIVE"
+ACTUAL=$(shasum -a 256 "$ARCHIVE" | cut -d ' ' -f 1)
+[[ "$ACTUAL" == "$SHA256" ]] || {
+  print -u2 "FAIL: Sparkle archive SHA-256 mismatch"
+  exit 1
+}
+
+mkdir -p "${DEST:h}"
+rm -rf "$DEST"
+mkdir "$DEST"
+tar -xJf "$ARCHIVE" -C "$DEST"
+[[ -d "$DEST/Sparkle.framework" && -x "$DEST/bin/generate_appcast" ]] || {
+  print -u2 "FAIL: Sparkle distribution is incomplete"
+  exit 1
+}
+print -r -- "$DEST"

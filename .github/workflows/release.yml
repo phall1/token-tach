@@ -1,0 +1,243 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (for example, v0.3.2)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  verify:
+    name: Verify tagged commit
+    runs-on: macos-15
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - name: Build Native SDK CLI from vendored fork
+        run: cd vendor/native && zig build cli
+
+      - name: Validate exact tag and version
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "Release tag must be canonical vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          }
+          version="$(perl -ne 'print "$1\n" if /^\s*\.version\s*=\s*"([^"]+)"\s*,\s*$/' app.zon)"
+          [[ -n "$version" && "$(printf '%s\n' "$version" | wc -l | tr -d ' ')" == 1 ]] || {
+            echo "Could not read exactly one canonical version from app.zon" >&2
+            exit 1
+          }
+          [[ "$RELEASE_TAG" == "v$version" ]] || {
+            echo "Tag $RELEASE_TAG does not match app.zon version $version" >&2
+            exit 1
+          }
+          tag_commit="$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"
+          head_commit="$(git rev-parse HEAD)"
+          [[ "$head_commit" == "$tag_commit" ]] || {
+            echo "Checkout $head_commit is not tagged commit $tag_commit" >&2
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$head_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Verify source
+        run: scripts/verify
+
+  release:
+    name: Sign and publish
+    needs: verify
+    runs-on: macos-15
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - name: Build Native SDK CLI from vendored fork
+        run: cd vendor/native && zig build cli
+
+      - name: Revalidate immutable source
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.verify.outputs.commit }}
+          EXPECTED_VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_COMMIT" ]]
+          [[ "$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")" == "$EXPECTED_COMMIT" ]]
+          [[ "$RELEASE_TAG" == "v$EXPECTED_VERSION" ]]
+
+      - name: Import Developer ID certificate
+        shell: bash
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [[ -n "$CERTIFICATE_P12_BASE64" && -n "$CERTIFICATE_PASSWORD" && -n "$KEYCHAIN_PASSWORD" ]]
+          cert="$RUNNER_TEMP/developer-id.p12"
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$cert"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$cert" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          rm -f "$cert"
+
+      - name: Prepare notarization key
+        shell: bash
+        env:
+          API_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n "$API_KEY_BASE64" ]]
+          printf '%s' "$API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/notary-api-key.p8"
+          chmod 600 "$RUNNER_TEMP/notary-api-key.p8"
+
+      - name: Prepare Sparkle signing key
+        shell: bash
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n "$SPARKLE_PRIVATE_KEY" ]]
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle-ed25519-key"
+          chmod 600 "$RUNNER_TEMP/sparkle-ed25519-key"
+
+      - name: Build, sign, notarize, and validate updater release
+        shell: bash
+        env:
+          DEVELOPER_ID_APPLICATION: ${{ vars.DEVELOPER_ID_APPLICATION }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          NOTARY_KEY_PATH: ${{ runner.temp }}/notary-api-key.p8
+          NOTARY_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
+          SPARKLE_FEED_URL: https://github.com/${{ github.repository }}/releases/latest/download/appcast.xml
+          SPARKLE_ED_KEY_FILE: ${{ runner.temp }}/sparkle-ed25519-key
+        run: |
+          set -euo pipefail
+          [[ "$DEVELOPER_ID_APPLICATION" == "Developer ID Application: "* ]]
+          [[ "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]
+          scripts/release-updater --identity "$DEVELOPER_ID_APPLICATION" \
+            --feed-url "$SPARKLE_FEED_URL" --public-key "$SPARKLE_PUBLIC_KEY" --notarize
+          mkdir -p zig-out/updater/appcast-input
+          cp zig-out/updater/releases/*.zip zig-out/updater/appcast-input/
+          scripts/updater-generate-appcast zig-out/updater/appcast-input \
+            "https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG/"
+          cp zig-out/updater/appcast-input/appcast.xml zig-out/updater/releases/appcast.xml
+
+      - name: Stage release artifacts and checksums
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          dmgs=(zig-out/updater/releases/*.dmg)
+          zips=(zig-out/updater/releases/*.zip)
+          [[ ${#dmgs[@]} == 1 && -f "${dmgs[0]}" ]]
+          [[ ${#zips[@]} == 1 && -f "${zips[0]}" ]]
+          [[ -s zig-out/updater/releases/appcast.xml ]]
+          cp "${dmgs[0]}" "dist/token-tach-$VERSION-universal2.dmg"
+          cp "${zips[0]}" "dist/token-tach-$VERSION-macos.zip"
+          cp zig-out/updater/releases/appcast.xml dist/appcast.xml
+          (cd dist && shasum -a 256 "token-tach-$VERSION-universal2.dmg" \
+            "token-tach-$VERSION-macos.zip" appcast.xml > SHA256SUMS)
+          shasum -a 256 -c dist/SHA256SUMS
+
+      - name: Attest release artifacts
+        if: github.event.repository.visibility == 'public'
+        id: attest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/appcast.xml
+            dist/SHA256SUMS
+
+      - name: Include provenance bundle
+        if: github.event.repository.visibility == 'public'
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ -s "$BUNDLE_PATH" ]]
+          cp "$BUNDLE_PATH" "dist/token-tach-$VERSION.intoto.jsonl"
+
+      - name: Upload immutable workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: token-tach-${{ needs.verify.outputs.version }}-${{ needs.verify.outputs.commit }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to mutate it" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" dist/* \
+            --verify-tag --title "Token Tach $VERSION" --generate-notes
+
+      - name: Remove signing material
+        if: always()
+        shell: bash
+        env:
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary-api-key.p8" "$RUNNER_TEMP/sparkle-ed25519-key"
+          security delete-keychain "$keychain" 2>/dev/null || true

@@ -1,0 +1,137 @@
+#!/bin/zsh
+# Fail-closed inspection of the app inside a Store-shaped installer package.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+MODE="distribution"
+EXPECTED_BUILD=""
+
+usage() {
+  print -u2 "usage: scripts/audit-app-store [--mode ci|distribution] --build-number N package.pkg"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode) MODE="$2"; shift 2 ;;
+    --build-number) EXPECTED_BUILD="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --*) print -u2 "unknown argument: $1"; usage; exit 2 ;;
+    *)
+      [[ -z "${PKG:-}" ]] || { print -u2 "only one package may be audited"; exit 2; }
+      PKG="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ "$MODE" == "ci" || "$MODE" == "distribution" ]] || { print -u2 "invalid audit mode: $MODE"; exit 2; }
+[[ -n "$EXPECTED_BUILD" && -n "${PKG:-}" ]] || { usage; exit 2; }
+[[ -f "$PKG" ]] || { print -u2 "FAIL: package not found: $PKG"; exit 1; }
+
+BUNDLE_ID="com.phall.token-tach"
+CATEGORY="public.app-category.developer-tools"
+MINIMUM_OS="11.0"
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/token-tach-store-audit.XXXXXX")
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+fail() {
+  print -u2 "FAIL: $*"
+  exit 1
+}
+
+plist_value() {
+  /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null || fail "missing plist key $2"
+}
+
+print "==> expand and inventory installer"
+pkgutil --expand-full "$PKG" "$TMP_DIR/expanded"
+[[ -z "$(find "$TMP_DIR/expanded" -type d -name Scripts -print -quit)" ]] || fail "installer contains package scripts"
+APPS=("${(@f)$(find "$TMP_DIR/expanded" -type d -name '*.app' -prune -print)}")
+(( ${#APPS[@]} == 1 )) || fail "installer must contain exactly one app (found ${#APPS[@]})"
+APP="$APPS[1]"
+PLIST="$APP/Contents/Info.plist"
+BINARY="$APP/Contents/MacOS/token-tach"
+[[ -f "$PLIST" ]] || fail "Info.plist is missing"
+[[ -x "$BINARY" ]] || fail "token-tach executable is missing or not executable"
+
+EXECUTABLES=("${(@f)$(find "$APP/Contents/MacOS" -type f -perm +111 -print)}")
+(( ${#EXECUTABLES[@]} == 1 )) || fail "Contents/MacOS must contain exactly one executable"
+[[ "$EXECUTABLES[1]" == "$BINARY" ]] || fail "unexpected main executable: $EXECUTABLES[1]"
+
+while IFS= read -r link; do
+  target=$(realpath "$link") || fail "broken symlink in payload: $link"
+  [[ "$target" == "$APP"/* ]] || fail "symlink escapes app bundle: $link -> $target"
+done < <(find "$APP" -type l -print)
+
+print "==> verify bundle metadata"
+[[ "$(plist_value "$PLIST" CFBundleIdentifier)" == "$BUNDLE_ID" ]] || fail "wrong bundle identifier"
+[[ "$(plist_value "$PLIST" CFBundleExecutable)" == "token-tach" ]] || fail "wrong bundle executable"
+[[ "$(plist_value "$PLIST" CFBundleVersion)" == "$EXPECTED_BUILD" ]] || fail "wrong build number"
+[[ "$(plist_value "$PLIST" LSApplicationCategoryType)" == "$CATEGORY" ]] || fail "wrong App Store category"
+[[ "$(plist_value "$PLIST" CFBundleSupportedPlatforms:0)" == "MacOSX" ]] || fail "MacOSX platform declaration is missing"
+[[ "$(plist_value "$PLIST" LSMinimumSystemVersion)" == "$MINIMUM_OS" ]] || fail "minimum macOS must be $MINIMUM_OS"
+
+VERSION=$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)".*/\1/p' app.zon)
+[[ -n "$VERSION" ]] || fail "could not read app version"
+[[ "$(plist_value "$PLIST" CFBundleShortVersionString)" == "$VERSION" ]] || fail "bundle version does not match app.zon"
+
+print "==> verify Universal 2 Mach-O metadata"
+lipo "$BINARY" -verify_arch arm64 x86_64
+ARCHS=("${(@s: :)$(lipo -archs "$BINARY")}")
+(( ${#ARCHS[@]} == 2 )) || fail "binary contains unexpected architecture slices: ${ARCHS[*]}"
+[[ " ${ARCHS[*]} " == *" arm64 "* && " ${ARCHS[*]} " == *" x86_64 "* ]] || fail "binary is not Universal 2"
+BUILD_INFO=$(vtool -show-build "$BINARY")
+[[ $(print -r -- "$BUILD_INFO" | grep -c 'platform MACOS') == 2 ]] || fail "both slices must target macOS"
+[[ $(print -r -- "$BUILD_INFO" | grep -c "minos $MINIMUM_OS") == 2 ]] || fail "both slices must target macOS $MINIMUM_OS"
+[[ $(print -r -- "$BUILD_INFO" | grep -c 'tool LD') == 2 ]] || fail "both slices must identify Apple's LD build tool"
+
+print "==> verify signature and least-privilege entitlements"
+codesign --verify --deep --strict --verbose=2 "$APP"
+codesign -d --entitlements :- "$APP" > "$TMP_DIR/entitlements.plist" 2>/dev/null
+ENTITLEMENTS="$TMP_DIR/entitlements.plist"
+[[ "$(plist_value "$ENTITLEMENTS" com.apple.security.app-sandbox)" == "true" ]] || fail "App Sandbox entitlement is missing"
+[[ "$(plist_value "$ENTITLEMENTS" com.apple.security.files.bookmarks.app-scope)" == "true" ]] || fail "app-scoped bookmarks entitlement is missing"
+[[ "$(plist_value "$ENTITLEMENTS" com.apple.security.files.user-selected.read-only)" == "true" ]] || fail "read-only user-selected files entitlement is missing"
+
+ALLOWED_ENTITLEMENTS=(
+  com.apple.application-identifier
+  com.apple.developer.team-identifier
+  com.apple.security.app-sandbox
+  com.apple.security.files.bookmarks.app-scope
+  com.apple.security.files.user-selected.read-only
+)
+while IFS= read -r key; do
+  [[ -z "$key" ]] && continue
+  (( ${ALLOWED_ENTITLEMENTS[(Ie)$key]} )) || fail "unexpected entitlement: $key"
+done < <(/usr/libexec/PlistBuddy -c Print "$ENTITLEMENTS" | sed -nE 's/^[[:space:]]*([^ =]+) =.*/\1/p')
+
+if [[ "$MODE" == "distribution" ]]; then
+  PROFILE="$APP/Contents/embedded.provisionprofile"
+  [[ -f "$PROFILE" ]] || fail "embedded provisioning profile is missing"
+  security cms -D -i "$PROFILE" > "$TMP_DIR/profile.plist" 2>/dev/null || fail "embedded provisioning profile is invalid"
+  PROFILE_APP_ID=$(plist_value "$TMP_DIR/profile.plist" Entitlements:com.apple.application-identifier)
+  SIGNED_APP_ID=$(plist_value "$ENTITLEMENTS" com.apple.application-identifier)
+  [[ "$PROFILE_APP_ID" == "$SIGNED_APP_ID" && "${PROFILE_APP_ID#*.}" == "$BUNDLE_ID" ]] || fail "profile, signature, and bundle identifiers disagree"
+  PROFILE_TEAM_ID=$(plist_value "$TMP_DIR/profile.plist" Entitlements:com.apple.developer.team-identifier)
+  SIGNED_TEAM_ID=$(plist_value "$ENTITLEMENTS" com.apple.developer.team-identifier)
+  [[ "$PROFILE_TEAM_ID" == "$SIGNED_TEAM_ID" ]] || fail "profile and signature team identifiers disagree"
+  /usr/libexec/PlistBuddy -c 'Print :ExpirationDate' "$TMP_DIR/profile.plist" >/dev/null 2>&1 || fail "profile expiration is missing"
+  /usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices' "$TMP_DIR/profile.plist" >/dev/null 2>&1 && fail "development/ad hoc provisioning profile is not allowed"
+  APP_SIGNATURE=$(codesign -dvv "$APP" 2>&1)
+  print -r -- "$APP_SIGNATURE" | grep -Eq '^Authority=(Apple Distribution:|3rd Party Mac Developer Application:)' || fail "app lacks a Store distribution authority"
+  PACKAGE_SIGNATURE=$(pkgutil --check-signature "$PKG" 2>&1) || { print -u2 -r -- "$PACKAGE_SIGNATURE"; fail "installer signature is invalid"; }
+  print -r -- "$PACKAGE_SIGNATURE" | grep -Eq 'Mac Installer Distribution:|3rd Party Mac Developer Installer:' || fail "installer lacks a Store distribution authority"
+else
+  [[ ! -e "$APP/Contents/embedded.provisionprofile" ]] || fail "credential-free artifact unexpectedly contains a provisioning profile"
+  [[ $(codesign -dvv "$APP" 2>&1 | grep -c '^Signature=adhoc$') == 1 ]] || fail "CI artifact must be ad hoc signed"
+fi
+
+if xattr -lr "$APP" 2>/dev/null | grep -q 'com.apple.quarantine'; then
+  fail "quarantine metadata exists in installer payload"
+fi
+
+print "    bundle: $BUNDLE_ID ($VERSION build $EXPECTED_BUILD)"
+print "    architectures: ${ARCHS[*]}"
+print "    sandbox: enabled; user-selected access: read-only"
+print "APP STORE AUDIT: PASS ($MODE)"

@@ -32,17 +32,19 @@
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
+const app_version = @import("app_version");
 
 const types = @import("core/types.zig");
 const config = @import("core/config.zig");
 const claude = @import("core/claude.zig");
 const codex = @import("core/codex.zig");
+const opencode = @import("core/opencode.zig");
 const pricing = @import("core/pricing.zig");
 const ledger_mod = @import("core/ledger.zig");
 const statefile = @import("core/statefile.zig");
 const trayfmt = @import("core/trayfmt.zig");
 
-pub const version = "0.3.0";
+pub const version: []const u8 = app_version.version;
 
 /// Keep the statusline under ~60 visible chars (Claude Code renders it
 /// in a single status row; long lines get cropped by narrow terminals).
@@ -76,6 +78,8 @@ pub fn maybeRunCli(init: std.process.Init) !bool {
                 .home = init.environ_map.get("HOME") orelse "",
                 .claude_config_dir = init.environ_map.get("CLAUDE_CONFIG_DIR"),
                 .codex_home = init.environ_map.get("CODEX_HOME"),
+                .opencode_db = init.environ_map.get("OPENCODE_DB"),
+                .xdg_data_home = init.environ_map.get("XDG_DATA_HOME"),
                 .xdg_state_home = init.environ_map.get("XDG_STATE_HOME"),
             };
             // Never crash: any collection failure (OOM, pathological fs)
@@ -127,8 +131,8 @@ const help_text =
     \\  token-tach --version      print the version, exit
     \\  token-tach --help         show this help
     \\
-    \\The CLI reads the same local data as the app (Claude Code + Codex
-    \\JSONL ledgers plus the app's saved state) and never writes, polls,
+    \\The CLI reads the same local data as the app (Claude Code/Codex
+    \\JSONL and OpenCode SQLite plus saved state) and never writes, polls,
     \\or touches the keychain. See docs/CLI.md for the JSON schema and a
     \\Claude Code statusline recipe.
     \\
@@ -144,6 +148,8 @@ pub const Env = struct {
     home: []const u8 = "",
     claude_config_dir: ?[]const u8 = null,
     codex_home: ?[]const u8 = null,
+    opencode_db: ?[]const u8 = null,
+    xdg_data_home: ?[]const u8 = null,
     xdg_state_home: ?[]const u8 = null,
 };
 
@@ -166,6 +172,7 @@ pub const Snapshot = struct {
     all: ledger_mod.Totals = .{},
     claude_total: ledger_mod.Totals = .{},
     codex_total: ledger_mod.Totals = .{},
+    opencode_total: ledger_mod.Totals = .{},
     codex_limits: ?types.LimitSnapshot = null,
     models: []const Entry = &.{},
     projects: []const Entry = &.{},
@@ -195,21 +202,24 @@ pub fn collect(arena: std.mem.Allocator, io: std.Io, env: Env, now_ms: i64) !Sna
         try claude.discoverRoots(arena, io, env.claude_config_dir, env.home);
     const codex_env: ?[]const u8 = if (cfg.codex_home.len > 0) cfg.codex_home else env.codex_home;
     const codex_roots = try codex.sessionsDirs(arena, codex_env, env.home);
+    const opencode_path = try opencode.resolvePath(arena, cfg.opencode_db, env.opencode_db, env.xdg_data_home, env.home);
 
     var claude_tailer = claude.Tailer.init(arena);
     var codex_tailer = codex.Tailer.init(arena);
+    var opencode_poller = opencode.Poller.init(arena);
     var ledger = ledger_mod.Ledger.init(arena, 0);
 
     // Warm path: restore offsets + rollups so the sweep below only reads
     // appended bytes. READ-ONLY — this module never calls statefile.save,
     // so it cannot corrupt the app's state or race a running instance.
     if (statefile.defaultPath(arena, env.xdg_state_home, env.home) catch null) |state_path| {
-        snap.state = try statefile.restore(arena, io, state_path, &claude_tailer, &codex_tailer, &ledger);
+        snap.state = try statefile.restore(arena, io, state_path, &claude_tailer, &codex_tailer, &opencode_poller, &ledger);
         if (snap.state == .invalid) {
             // Restore guarantees pristine args on .invalid, but stay in
             // lockstep with engine.setup's belt-and-suspenders reinit.
             claude_tailer = claude.Tailer.init(arena);
             codex_tailer = codex.Tailer.init(arena);
+            opencode_poller = opencode.Poller.init(arena);
             ledger = ledger_mod.Ledger.init(arena, 0);
         }
     }
@@ -237,6 +247,16 @@ pub fn collect(arena: std.mem.Allocator, io: std.Io, env: Env, now_ms: i64) !Sna
         // borrowed slices are arena-owned, so they outlive the tailer var.
         snap.codex_limits = codex_tailer.lastLimits();
     }
+    if (cfg.sources.opencode) {
+        var changes: std.ArrayList(opencode.Change) = .empty;
+        opencode_poller.poll(arena, opencode_path, &changes) catch {};
+        for (changes.items) |change| {
+            const new_cost = if (prices) |*db| db.costOf(change.current) else null;
+            if (change.previous) |old| {
+                ledger.replace(old, if (prices) |*db| db.costOf(old) else null, change.current, new_cost) catch {};
+            } else ledger.add(change.current, new_cost) catch {};
+        }
+    }
 
     snap.tz_offset_min = ledger.tz_offset_min;
     snap.today = ledger.today(now_ms);
@@ -244,6 +264,7 @@ pub fn collect(arena: std.mem.Allocator, io: std.Io, env: Env, now_ms: i64) !Sna
     snap.all = ledger.all;
     snap.claude_total = ledger.forAgent(.claude);
     snap.codex_total = ledger.forAgent(.codex);
+    snap.opencode_total = ledger.forAgent(.opencode);
     snap.models = try topEntries(arena, ledger.per_model.keys(), ledger.per_model.values());
     snap.projects = try topEntries(arena, ledger.per_project.keys(), ledger.per_project.values());
     return snap;
@@ -359,7 +380,7 @@ const JsonOut = struct {
         cost_usd: f64,
         tokens: u64,
         events: u64,
-        by_agent: struct { claude: JsonTotals, codex: JsonTotals },
+        by_agent: struct { claude: JsonTotals, codex: JsonTotals, opencode: JsonTotals },
     },
     /// Always null in v1 — see the module doc for why.
     burn_tokens_per_min: ?f64,
@@ -449,6 +470,7 @@ pub fn writeJson(w: *std.Io.Writer, snap: Snapshot) !void {
             .by_agent = .{
                 .claude = jsonTotals(snap.claude_total),
                 .codex = jsonTotals(snap.codex_total),
+                .opencode = jsonTotals(snap.opencode_total),
             },
         },
         .burn_tokens_per_min = null,
@@ -666,6 +688,7 @@ test "collect: warm restore does not double-count and keeps the saved tz" {
     {
         var claude_tailer = claude.Tailer.init(arena);
         var codex_tailer = codex.Tailer.init(arena);
+        var opencode_poller = opencode.Poller.init(arena);
         var ledger = ledger_mod.Ledger.init(arena, -300);
 
         var sink = claude.ListSink.init(arena);
@@ -679,7 +702,7 @@ test "collect: warm restore does not double-count and keeps the saved tz" {
         for (events.items) |ev| try ledger.add(ev, 0.25);
 
         const state_path = try statefile.defaultPath(arena, env.xdg_state_home, env.home);
-        try statefile.save(arena, io, state_path, &claude_tailer, &codex_tailer, &ledger);
+        try statefile.save(arena, io, state_path, &claude_tailer, &codex_tailer, &opencode_poller, &ledger);
     }
 
     const snap = try collect(arena, io, env, fixture_now_ms);

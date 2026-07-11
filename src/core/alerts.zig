@@ -321,6 +321,7 @@ pub fn agentName(agent: types.Agent) []const u8 {
     return switch (agent) {
         .claude => "Claude",
         .codex => "Codex",
+        .opencode => "OpenCode",
     };
 }
 

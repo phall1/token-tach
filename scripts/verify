@@ -17,6 +17,9 @@ NATIVE="${NATIVE_BIN:-vendor/native/zig-out/bin/native}"
 [[ -x "$NATIVE" ]] || NATIVE=native
 echo "==> using $($NATIVE --version)"
 
+echo "==> version policy"
+scripts/version check
+
 echo "==> native check"
 $NATIVE check
 
@@ -25,6 +28,7 @@ $NATIVE test
 
 echo "==> native build (-Dautomation=true)"
 $NATIVE build -Dautomation=true
+scripts/version check-runtime zig-out/bin/token-tach
 
 if [[ "$1" == "--no-smoke" ]]; then
   echo "==> smoke skipped"

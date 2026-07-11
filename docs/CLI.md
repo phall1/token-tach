@@ -4,8 +4,9 @@
 as the menu-bar app, print once, and exit without launching the GUI.
 
 The CLI is local-only: it reads config, the persisted state file, and any
-newly appended Claude/Codex JSONL bytes. It does not poll the network, write
-state, or touch the Keychain.
+newly appended Claude/Codex JSONL bytes, and one OpenCode SQLite database via
+a read-only connection. It does not poll the network, write state, or touch
+the Keychain. OpenCode prompt/content/tool/auth fields are never queried.
 
 ```sh
 token-tach --json
@@ -39,7 +40,7 @@ The top-level schema is stable for v0.3.x. New fields may be added.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "0.3.2",
   "generated_at_ms": 1783483200000,
   "tz_offset_min": -300,
   "note": null,
@@ -59,7 +60,8 @@ The top-level schema is stable for v0.3.x. New fields may be added.
     "events": 1234,
     "by_agent": {
       "claude": {},
-      "codex": {}
+      "codex": {},
+      "opencode": {}
     }
   },
   "burn_tokens_per_min": null,
@@ -82,3 +84,10 @@ The top-level schema is stable for v0.3.x. New fields may be added.
 `burn_tokens_per_min` is always `null` in v0.3 CLI mode. The persisted
 ledger stores rollups, not enough recent per-event history for an honest
 one-shot burn rate.
+
+OpenCode database resolution uses the first non-empty value only:
+`opencode-db` in config, `OPENCODE_DB`,
+`$XDG_DATA_HOME/opencode/opencode.db`, then
+`~/.local/share/opencode/opencode.db`. This intentionally supports one
+database, preventing the same local usage from being counted through multiple
+discovery channels.

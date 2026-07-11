@@ -8,13 +8,13 @@
 //! file, and re-hydrates freshly-initialized tailers/ledger from it so
 //! catch-up only touches bytes appended since the last save.
 //!
-//! Format: a single JSON object, `{"version": 1, ...}`, written atomically
+//! Format: a single JSON object, `{"version": 2, ...}`, written atomically
 //! (tmp file + rename) at a caller-provided path (`defaultPath` yields
 //! `$XDG_STATE_HOME/token-tach/tailers.json`, falling back to
-//! `~/.local/state/...`). Unknown fields are ignored on read; any version
-//! mismatch, parse failure, or read failure degrades to `.invalid`/`.absent`
-//! and the caller falls back to a full catch-up — the state file is a pure
-//! cache, never truth.
+//! `~/.local/state/...`) with mode 0600 inside a mode-0700 app state directory.
+//! Unknown fields are ignored on read; any version mismatch, parse failure,
+//! or read failure degrades to `.invalid`/`.absent`, and the caller falls back
+//! to a full catch-up. The state file is a pure cache, never truth.
 //!
 //! Design notes:
 //!
@@ -41,9 +41,10 @@ const std = @import("std");
 const types = @import("types.zig");
 const claude = @import("claude.zig");
 const codex = @import("codex.zig");
+const opencode = @import("opencode.zig");
 const ledger_mod = @import("ledger.zig");
 
-pub const format_version: u32 = 1;
+pub const format_version: u32 = 2;
 
 /// Hard ceiling on a plausible state file; anything bigger is corrupt.
 const max_state_bytes = 64 * 1024 * 1024;
@@ -105,6 +106,19 @@ const WireCodexFile = struct {
     model: []const u8 = "",
 };
 
+const WireOpenCodeRow = struct {
+    id: []const u8,
+    updated_ms: i64,
+    timestamp_ms: i64,
+    model: []const u8,
+    input: u64 = 0,
+    output: u64 = 0,
+    cache_creation: u64 = 0,
+    cache_read: u64 = 0,
+    session_id: []const u8 = "",
+    cwd: []const u8 = "",
+};
+
 const WireLimits = struct {
     read_at_ms: i64 = 0,
     plan: []const u8 = "",
@@ -119,6 +133,7 @@ const WireLedger = struct {
     all: WireTotals = .{},
     claude: WireTotals = .{},
     codex: WireTotals = .{},
+    opencode: WireTotals = .{},
     per_day: []const WireDay = &.{},
     per_model: []const WireKeyed = &.{},
     per_project: []const WireKeyed = &.{},
@@ -130,6 +145,7 @@ const WireState = struct {
     claude_seen: []const []const u8 = &.{},
     codex_files: []const WireCodexFile = &.{},
     codex_limits: ?WireLimits = null,
+    opencode_rows: []const WireOpenCodeRow = &.{},
     ledger: WireLedger = .{},
 };
 
@@ -168,28 +184,40 @@ pub fn save(
     path: []const u8,
     claude_tailer: *const claude.Tailer,
     codex_tailer: *const codex.Tailer,
+    opencode_poller: *const opencode.Poller,
     ledger: *const ledger_mod.Ledger,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const state = try toWire(arena, claude_tailer, codex_tailer, ledger);
+    const state = try toWire(arena, claude_tailer, codex_tailer, opencode_poller, ledger);
     const json = try std.json.Stringify.valueAlloc(arena, state, .{});
 
     var cwd = std.Io.Dir.cwd();
     if (std.fs.path.dirname(path)) |dir_path| {
         cwd.createDirPath(io, dir_path) catch {};
+        setMode(arena, dir_path, 0o700);
     }
     const tmp_path = try std.fmt.allocPrint(arena, "{s}.tmp", .{path});
     try cwd.writeFile(io, .{ .sub_path = tmp_path, .data = json });
+    setMode(arena, tmp_path, 0o600);
     try cwd.rename(tmp_path, cwd, path, io);
+    setMode(arena, path, 0o600);
+}
+
+extern fn chmod(path: [*:0]const u8, mode: c_uint) c_int;
+
+fn setMode(allocator: std.mem.Allocator, path: []const u8, mode: c_uint) void {
+    const zpath = allocator.dupeZ(u8, path) catch return;
+    _ = chmod(zpath.ptr, mode);
 }
 
 fn toWire(
     arena: std.mem.Allocator,
     claude_tailer: *const claude.Tailer,
     codex_tailer: *const codex.Tailer,
+    opencode_poller: *const opencode.Poller,
     ledger: *const ledger_mod.Ledger,
 ) !WireState {
     var state = WireState{ .version = format_version };
@@ -211,6 +239,31 @@ fn toWire(
         var kit = claude_tailer.seen.keyIterator();
         while (kit.next()) |key| try seen.append(arena, key.*);
         state.claude_seen = try seen.toOwnedSlice(arena);
+    }
+
+    // OpenCode: stable row identities plus their latest safe usage snapshot.
+    // This is sufficient to suppress duplicates and replace rows updated in
+    // place after restart; no source payload text is persisted.
+    {
+        var rows: std.ArrayList(WireOpenCodeRow) = .empty;
+        var it = opencode_poller.seen.iterator();
+        while (it.next()) |entry| {
+            const stored = entry.value_ptr.*;
+            const ev = stored.event;
+            try rows.append(arena, .{
+                .id = entry.key_ptr.*,
+                .updated_ms = stored.updated_ms,
+                .timestamp_ms = ev.timestamp_ms,
+                .model = ev.model,
+                .input = ev.input_tokens,
+                .output = ev.output_tokens,
+                .cache_creation = ev.cache_creation_tokens,
+                .cache_read = ev.cache_read_tokens,
+                .session_id = ev.session_id,
+                .cwd = ev.cwd,
+            });
+        }
+        state.opencode_rows = try rows.toOwnedSlice(arena);
     }
 
     // Codex: offsets, baselines, session attribution, freshest limits.
@@ -264,6 +317,7 @@ fn toWire(
             .all = wireTotals(ledger.all),
             .claude = wireTotals(ledger.per_agent.get(.claude)),
             .codex = wireTotals(ledger.per_agent.get(.codex)),
+            .opencode = wireTotals(ledger.per_agent.get(.opencode)),
             .per_day = try days.toOwnedSlice(arena),
             .per_model = try models.toOwnedSlice(arena),
             .per_project = try projects.toOwnedSlice(arena),
@@ -288,6 +342,7 @@ pub fn restore(
     path: []const u8,
     claude_tailer: *claude.Tailer,
     codex_tailer: *codex.Tailer,
+    opencode_poller: *opencode.Poller,
     ledger: *ledger_mod.Ledger,
 ) error{OutOfMemory}!RestoreOutcome {
     var cwd = std.Io.Dir.cwd();
@@ -326,11 +381,25 @@ pub fn restore(
     if (state.codex_limits) |l| {
         try codex_tailer.restoreLimits(l.read_at_ms, l.plan, l.windows);
     }
+    for (state.opencode_rows) |row| {
+        try opencode_poller.restore(row.id, row.updated_ms, .{
+            .agent = .opencode,
+            .timestamp_ms = row.timestamp_ms,
+            .model = row.model,
+            .input_tokens = row.input,
+            .output_tokens = row.output,
+            .cache_creation_tokens = row.cache_creation,
+            .cache_read_tokens = row.cache_read,
+            .session_id = row.session_id,
+            .cwd = row.cwd,
+        });
+    }
 
     ledger.tz_offset_min = state.ledger.tz_offset_min;
     ledger.all = unwireTotals(state.ledger.all);
     ledger.per_agent.set(.claude, unwireTotals(state.ledger.claude));
     ledger.per_agent.set(.codex, unwireTotals(state.ledger.codex));
+    ledger.per_agent.set(.opencode, unwireTotals(state.ledger.opencode));
     for (state.ledger.per_day) |d| try ledger.putDay(d.day, unwireTotals(d.totals));
     for (state.ledger.per_model) |m| try ledger.putModel(m.key, unwireTotals(m.totals));
     for (state.ledger.per_project) |p| try ledger.putProject(p.key, unwireTotals(p.totals));
@@ -356,12 +425,14 @@ const codex_rollout_rel =
 const Harness = struct {
     claude_tailer: claude.Tailer,
     codex_tailer: codex.Tailer,
+    opencode_poller: opencode.Poller,
     ledger: ledger_mod.Ledger,
 
     fn init(tz_offset_min: i32) Harness {
         return .{
             .claude_tailer = claude.Tailer.init(testing.allocator),
             .codex_tailer = codex.Tailer.init(testing.allocator),
+            .opencode_poller = opencode.Poller.init(testing.allocator),
             .ledger = ledger_mod.Ledger.init(testing.allocator, tz_offset_min),
         };
     }
@@ -369,6 +440,7 @@ const Harness = struct {
     fn deinit(self: *Harness) void {
         self.claude_tailer.deinit();
         self.codex_tailer.deinit();
+        self.opencode_poller.deinit();
         self.ledger.deinit();
     }
 
@@ -440,14 +512,26 @@ test "statefile round-trip: identical totals, no re-reads, dedup survives restar
     defer h1.deinit();
     // 8 claude events + 3 codex events.
     try testing.expectEqual(@as(usize, 11), try h1.sweepAndIngest(io, claude_root, codex_root));
-    try save(testing.allocator, io, state_path, &h1.claude_tailer, &h1.codex_tailer, &h1.ledger);
+    const opencode_event = types.UsageEvent{
+        .agent = .opencode,
+        .timestamp_ms = 1_783_483_000_000,
+        .model = "gpt-5.4",
+        .input_tokens = 10,
+        .output_tokens = 20,
+        .cache_read_tokens = 30,
+        .session_id = "ses_state",
+        .cwd = "/work/private-project",
+    };
+    try h1.opencode_poller.restore("msg_state", 1_783_483_000_100, opencode_event);
+    try h1.ledger.add(opencode_event, 0.0042);
+    try save(testing.allocator, io, state_path, &h1.claude_tailer, &h1.codex_tailer, &h1.opencode_poller, &h1.ledger);
 
     // Fresh everything; restore.
     var h2 = Harness.init(0);
     defer h2.deinit();
     try testing.expectEqual(
         RestoreOutcome.restored,
-        try restore(testing.allocator, io, state_path, &h2.claude_tailer, &h2.codex_tailer, &h2.ledger),
+        try restore(testing.allocator, io, state_path, &h2.claude_tailer, &h2.codex_tailer, &h2.opencode_poller, &h2.ledger),
     );
 
     // Ledger rollups come back bit-identical (including the tz offset the
@@ -456,6 +540,8 @@ test "statefile round-trip: identical totals, no re-reads, dedup survives restar
     try expectTotalsEqual(h1.ledger.all, h2.ledger.all);
     try expectTotalsEqual(h1.ledger.forAgent(.claude), h2.ledger.forAgent(.claude));
     try expectTotalsEqual(h1.ledger.forAgent(.codex), h2.ledger.forAgent(.codex));
+    try expectTotalsEqual(h1.ledger.forAgent(.opencode), h2.ledger.forAgent(.opencode));
+    try testing.expectEqual(@as(u32, 1), h2.opencode_poller.seen.count());
     try testing.expectEqual(h1.ledger.per_day.count(), h2.ledger.per_day.count());
     for (h1.ledger.per_day.keys(), h1.ledger.per_day.values()) |day, totals| {
         try expectTotalsEqual(totals, h2.ledger.per_day.get(day).?);
@@ -557,7 +643,7 @@ test "restore outcomes: absent, corrupted, and version mismatch leave state pris
     const missing = try std.fmt.allocPrint(arena, "{s}/nope.json", .{base});
     try testing.expectEqual(
         RestoreOutcome.absent,
-        try restore(testing.allocator, io, missing, &h.claude_tailer, &h.codex_tailer, &h.ledger),
+        try restore(testing.allocator, io, missing, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.ledger),
     );
 
     // Corrupted JSON.
@@ -565,7 +651,7 @@ test "restore outcomes: absent, corrupted, and version mismatch leave state pris
     const corrupt = try std.fmt.allocPrint(arena, "{s}/corrupt.json", .{base});
     try testing.expectEqual(
         RestoreOutcome.invalid,
-        try restore(testing.allocator, io, corrupt, &h.claude_tailer, &h.codex_tailer, &h.ledger),
+        try restore(testing.allocator, io, corrupt, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.ledger),
     );
 
     // Valid JSON, wrong version (with fields v1 has never heard of).
@@ -576,7 +662,7 @@ test "restore outcomes: absent, corrupted, and version mismatch leave state pris
     const future = try std.fmt.allocPrint(arena, "{s}/future.json", .{base});
     try testing.expectEqual(
         RestoreOutcome.invalid,
-        try restore(testing.allocator, io, future, &h.claude_tailer, &h.codex_tailer, &h.ledger),
+        try restore(testing.allocator, io, future, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.ledger),
     );
 
     // Nothing leaked into the state on any failed path.
@@ -601,12 +687,17 @@ test "save writes atomically and creates parent directories" {
 
     var h = Harness.init(0);
     defer h.deinit();
-    try save(testing.allocator, io, state_path, &h.claude_tailer, &h.codex_tailer, &h.ledger);
+    try save(testing.allocator, io, state_path, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.ledger);
 
     // The final file exists; the tmp staging file does not.
     const data = try std.Io.Dir.cwd().readFileAlloc(io, state_path, testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(data);
-    try testing.expect(std.mem.indexOf(u8, data, "\"version\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "\"version\":2") != null);
+    const state_stat = try std.Io.Dir.cwd().statFile(io, state_path, .{});
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), state_stat.permissions.toMode() & 0o777);
+    const state_dir = std.fs.path.dirname(state_path).?;
+    const dir_stat = try std.Io.Dir.cwd().statFile(io, state_dir, .{});
+    try testing.expectEqual(@as(std.posix.mode_t, 0o700), dir_stat.permissions.toMode() & 0o777);
     const tmp_path = try std.fmt.allocPrint(arena, "{s}.tmp", .{state_path});
     try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, tmp_path, .{}));
 }

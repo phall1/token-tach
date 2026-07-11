@@ -1,9 +1,9 @@
 .{
-    .id = "dev.native_sdk.token-tach",
+    .id = "com.phall.token-tach",
     .name = "token-tach",
     .display_name = "Token Tach",
     .description = "Menu-bar tachometer for AI coding-agent token usage and limits.",
-    .version = "0.3.2",
+    .version = "0.4.0",
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},
     .permissions = .{ "view", "command", "network", "notifications" },
@@ -13,6 +13,7 @@
         .{ .id = "tach.dashboard", .title = "Dashboard" },
         .{ .id = "tach.quit", .title = "Quit Token Tach" },
         .{ .id = "tach.config", .title = "Settings (config file)" },
+        .{ .id = "tach.check-updates", .title = "Check for Updates" },
     },
     .shell = .{
         .windows = .{

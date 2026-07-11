@@ -27,8 +27,9 @@ And yes — the needle does the full ignition sweep every time you open it:
 - **Window utilization** — Claude 5-hour / weekly (server truth) and Codex
   5-hour / weekly (embedded in its own logs), with reset countdowns and
   threshold coloring.
-- **Today's spend** — API-equivalent dollars your subscription absorbed,
-  priced against LiteLLM's model database, on a mechanical odometer.
+- **Today's spend** — API-equivalent dollars for all tracked usage, priced
+  against LiteLLM's model database, on a mechanical odometer. OpenCode usage
+  contributes API-equivalent value; it is not claimed as subscription-covered.
 - **History dashboard** — a second native window with this month's spend,
   subscription-value multiple, 30-day cost bars, and top model/project
   attribution:
@@ -81,6 +82,7 @@ pixel through Metal.
 |---|---|---|
 | Claude Code | tokens per message | tails `~/.claude/projects/**/*.jsonl` (and `$CLAUDE_CONFIG_DIR`), dedupes on `message.id:requestId` |
 | Codex CLI | tokens **and** 5h/weekly limit % | tails `~/.codex/sessions/**` — limits are embedded in the logs |
+| OpenCode | tokens per assistant message | opens one `opencode.db` read-only, selecting only usage/model/time IDs plus the joined session directory; prompt/content/tool/auth data is never queried |
 | Pricing | $/token rates | bundled snapshot of LiteLLM's `model_prices_and_context_window.json` |
 
 **Opt-in (`claude-oauth = true`):** Claude's server-truth utilization via
@@ -121,9 +123,10 @@ tray-format = {burn} → {eta}
 claude-oauth = true        # opt in to server-truth Claude limits
 poll-interval = 180s
 alert-threshold = 70, 90
-source = claude, codex     # enable/disable agents
+source = claude, codex, opencode # enable/disable agents
 # claude-config-dir = ~/some/other/claude-root
 # codex-home = ~/.codex
+# opencode-db = ~/.local/share/opencode/opencode.db
 ```
 
 ## Development

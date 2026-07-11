@@ -24,6 +24,16 @@ pub const Totals = struct {
         self.events += 1;
     }
 
+    pub fn remove(self: *Totals, ev: types.UsageEvent, cost: ?f64) void {
+        self.input_tokens -|= ev.input_tokens;
+        self.output_tokens -|= ev.output_tokens;
+        self.cache_creation_tokens -|= ev.cache_creation_tokens;
+        self.cache_read_tokens -|= ev.cache_read_tokens;
+        self.cost_usd -= cost orelse 0;
+        if (@abs(self.cost_usd) < 1e-12) self.cost_usd = 0;
+        self.events -|= 1;
+    }
+
     pub fn totalTokens(self: Totals) u64 {
         return self.input_tokens + self.output_tokens +
             self.cache_creation_tokens + self.cache_read_tokens;
@@ -68,6 +78,20 @@ pub const Ledger = struct {
 
         try addKeyed(self.allocator, &self.per_model, ev.model, ev, cost);
         if (ev.cwd.len > 0) try addKeyed(self.allocator, &self.per_project, ev.cwd, ev, cost);
+    }
+
+    /// Replace an updated-in-place source row without double-counting it.
+    pub fn replace(self: *Ledger, old: types.UsageEvent, old_cost: ?f64, new: types.UsageEvent, new_cost: ?f64) !void {
+        self.remove(old, old_cost);
+        try self.add(new, new_cost);
+    }
+
+    fn remove(self: *Ledger, ev: types.UsageEvent, cost: ?f64) void {
+        self.all.remove(ev, cost);
+        self.per_agent.getPtr(ev.agent).remove(ev, cost);
+        if (self.per_day.getPtr(dayKey(ev.timestamp_ms, self.tz_offset_min))) |totals| totals.remove(ev, cost);
+        if (self.per_model.getPtr(ev.model)) |totals| totals.remove(ev, cost);
+        if (ev.cwd.len > 0) if (self.per_project.getPtr(ev.cwd)) |totals| totals.remove(ev, cost);
     }
 
     fn addKeyed(
@@ -148,6 +172,20 @@ test "ledger rolls up across all dimensions" {
     try testing.expectEqual(@as(u64, 25), ledger.forAgent(.codex).totalTokens());
     try testing.expectEqual(@as(u64, 100), ledger.per_model.get("claude-fable-5").?.totalTokens());
     try testing.expectEqual(@as(u64, 175), ledger.per_project.get("/w/proj").?.totalTokens());
+}
+
+test "replace updates cumulative row totals without adding an event" {
+    var ledger = Ledger.init(testing.allocator, 0);
+    defer ledger.deinit();
+    const old = types.UsageEvent{ .agent = .opencode, .timestamp_ms = 1_000, .model = "gpt-5.4", .input_tokens = 10, .output_tokens = 20, .cwd = "/old" };
+    const new = types.UsageEvent{ .agent = .opencode, .timestamp_ms = 2_000, .model = "gpt-5.4", .input_tokens = 15, .output_tokens = 30, .cwd = "/new" };
+    try ledger.add(old, 0.1);
+    try ledger.replace(old, 0.1, new, 0.2);
+    try testing.expectEqual(@as(u64, 1), ledger.all.events);
+    try testing.expectEqual(@as(u64, 45), ledger.all.totalTokens());
+    try testing.expectApproxEqAbs(@as(f64, 0.2), ledger.all.cost_usd, 1e-12);
+    try testing.expectEqual(@as(u64, 0), ledger.per_project.get("/old").?.events);
+    try testing.expectEqual(@as(u64, 1), ledger.per_project.get("/new").?.events);
 }
 
 test "today respects the tz offset day boundary" {

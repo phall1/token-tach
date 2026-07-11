@@ -31,11 +31,12 @@ const max_config_bytes: usize = 1 << 20;
 pub const Sources = packed struct {
     claude: bool = true,
     codex: bool = true,
+    opencode: bool = true,
 
-    pub const none: Sources = .{ .claude = false, .codex = false };
+    pub const none: Sources = .{ .claude = false, .codex = false, .opencode = false };
 
     pub fn any(self: Sources) bool {
-        return self.claude or self.codex;
+        return self.claude or self.codex or self.opencode;
     }
 };
 
@@ -66,6 +67,10 @@ pub const Config = struct {
     /// `codex-home` — Codex root, stored verbatim. Empty means auto
     /// (`$CODEX_HOME` or `~/.codex`).
     codex_home: []const u8 = "",
+    /// `opencode-db` — one OpenCode SQLite database. Empty means resolve
+    /// `$OPENCODE_DB`, then `$XDG_DATA_HOME/opencode/opencode.db`, then
+    /// `~/.local/share/opencode/opencode.db`.
+    opencode_db: []const u8 = "",
 };
 
 /// A non-fatal parse problem: unknown key, malformed line, or bad value
@@ -121,6 +126,8 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) error{OutOfMemory}!
             cfg.theme = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, key, "codex-home")) {
             cfg.codex_home = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, key, "opencode-db")) {
+            cfg.opencode_db = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, key, "claude-oauth")) {
             if (parseBool(value)) |b| {
                 cfg.claude_oauth = b;
@@ -165,8 +172,11 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) error{OutOfMemory}!
                 } else if (std.ascii.eqlIgnoreCase(item, "codex")) {
                     sources.codex = true;
                     sources_touched = true;
+                } else if (std.ascii.eqlIgnoreCase(item, "opencode")) {
+                    sources.opencode = true;
+                    sources_touched = true;
                 } else {
-                    try warn(allocator, &warnings, line_no, "source: unknown source \"{s}\" (want claude, codex); skipped", .{item});
+                    try warn(allocator, &warnings, line_no, "source: unknown source \"{s}\" (want claude, codex, opencode); skipped", .{item});
                 }
             }
         } else if (std.mem.eql(u8, key, "claude-config-dir")) {
@@ -305,8 +315,10 @@ test "defaults when empty" {
     try testing.expectEqualStrings("tach-dark", result.config.theme);
     try testing.expect(result.config.sources.claude);
     try testing.expect(result.config.sources.codex);
+    try testing.expect(result.config.sources.opencode);
     try testing.expectEqual(@as(usize, 0), result.config.claude_config_dirs.len);
     try testing.expectEqualStrings("", result.config.codex_home);
+    try testing.expectEqualStrings("", result.config.opencode_db);
 }
 
 test "comments-only file is equivalent to empty" {
@@ -338,6 +350,7 @@ test "full happy-path config" {
         \\source = claude
         \\claude-config-dir = ~/.claude
         \\codex-home = /Users/x/.codex
+        \\opencode-db = /Users/x/.local/share/opencode/opencode.db
     );
     try testing.expectEqual(@as(usize, 0), result.warnings.len);
     try testing.expectEqualStrings("⚡ {burn} → wall {eta}", result.config.tray_format);
@@ -347,9 +360,11 @@ test "full happy-path config" {
     try testing.expectEqualStrings("tach-light", result.config.theme);
     try testing.expect(result.config.sources.claude);
     try testing.expect(!result.config.sources.codex);
+    try testing.expect(!result.config.sources.opencode);
     try testing.expectEqual(@as(usize, 1), result.config.claude_config_dirs.len);
     try testing.expectEqualStrings("~/.claude", result.config.claude_config_dirs[0]);
     try testing.expectEqualStrings("/Users/x/.codex", result.config.codex_home);
+    try testing.expectEqualStrings("/Users/x/.local/share/opencode/opencode.db", result.config.opencode_db);
 }
 
 test "unknown key produces a warning with the line number" {
@@ -391,6 +406,7 @@ test "bad values warn and keep defaults" {
     try testing.expectEqualSlices(u8, &.{ 70, 90 }, result.config.alert_thresholds);
     try testing.expect(result.config.sources.claude);
     try testing.expect(result.config.sources.codex);
+    try testing.expect(result.config.sources.opencode);
 }
 
 test "partially bad list keeps the good items" {

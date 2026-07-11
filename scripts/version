@@ -1,0 +1,91 @@
+#!/bin/zsh
+# Validate and expose the app.zon release version without duplicating it.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+fail() {
+  print -u2 -r -- "FAIL: $*"
+  exit 1
+}
+
+VERSION=$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)".*/\1/p' app.zon)
+[[ $(sed -nE '/^[[:space:]]*\.version = "[^"]+".*/p' app.zon | wc -l | tr -d ' ') == 1 ]] \
+  || fail "app.zon must contain exactly one .version string"
+[[ "$VERSION" =~ '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' ]] \
+  || fail "app.zon version must be strict X.Y.Z SemVer (got: $VERSION)"
+BUILD_PACKAGE_VERSION=$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)".*/\1/p' build.zig.zon)
+[[ "$BUILD_PACKAGE_VERSION" == "$VERSION" ]] \
+  || fail "build.zig.zon version '$BUILD_PACKAGE_VERSION' must mirror app.zon $VERSION"
+
+decimal_gt() {
+  local candidate="$1"
+  local floor="$2"
+  (( ${#candidate} > ${#floor} )) && return 0
+  (( ${#candidate} < ${#floor} )) && return 1
+  [[ "$candidate" > "$floor" ]]
+}
+
+case "${1:-check}" in
+  current)
+    print -r -- "$VERSION"
+    ;;
+  check)
+    print -r -- "version: $VERSION (app.zon)"
+    ;;
+  check-runtime)
+    [[ $# == 2 ]] || fail "usage: scripts/version check-runtime <binary>"
+    [[ -x "$2" ]] || fail "runtime binary is not executable: $2"
+    [[ "$("$2" --version)" == "token-tach $VERSION" ]] \
+      || fail "CLI --version does not match app.zon $VERSION"
+    JSON_VERSION=$("$2" --json | sed -nE 's/^[[:space:]]*"version":[[:space:]]*"([^"]+)".*/\1/p')
+    [[ "$JSON_VERSION" == "$VERSION" ]] \
+      || fail "CLI JSON version '$JSON_VERSION' does not match app.zon $VERSION"
+    print -r -- "runtime versions: $VERSION"
+    ;;
+  check-tag)
+    [[ $# == 2 ]] || fail "usage: scripts/version check-tag <tag>"
+    [[ "$2" == "v$VERSION" ]] || fail "release tag must be v$VERSION (got: $2)"
+    print -r -- "release tag: $2"
+    ;;
+  check-artifact)
+    [[ $# == 2 ]] || fail "usage: scripts/version check-artifact <path>"
+    [[ "${2:t}" == token-tach-${VERSION}-* ]] \
+      || fail "artifact name must start with token-tach-$VERSION- (got: ${2:t})"
+    print -r -- "artifact version: $VERSION"
+    ;;
+  check-bundle)
+    [[ $# == 2 || $# == 3 ]] || fail "usage: scripts/version check-bundle <app> [build-number]"
+    PLIST="$2/Contents/Info.plist"
+    [[ -f "$PLIST" ]] || fail "bundle Info.plist not found: $PLIST"
+    BUNDLE_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
+    [[ "$BUNDLE_VERSION" == "$VERSION" ]] \
+      || fail "bundle version '$BUNDLE_VERSION' does not match app.zon $VERSION"
+    if [[ $# == 3 ]]; then
+      BUNDLE_BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")
+      [[ "$BUNDLE_BUILD" == "$3" ]] \
+        || fail "bundle build '$BUNDLE_BUILD' does not match expected $3"
+    fi
+    print -r -- "bundle version: $VERSION${3:+ (build $3)}"
+    ;;
+  store-build-number)
+    if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+      [[ "$GITHUB_RUN_ID" =~ '^[1-9][0-9]{0,14}$' ]] || fail "invalid GITHUB_RUN_ID"
+      RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
+      [[ "$RUN_ATTEMPT" =~ '^[1-9][0-9]?$' ]] || fail "GITHUB_RUN_ATTEMPT must be 1..99"
+      printf '%s%02d\n' "$GITHUB_RUN_ID" "$RUN_ATTEMPT"
+      exit 0
+    fi
+    BUILD="${STORE_BUILD_NUMBER:-}"
+    FLOOR="${STORE_BUILD_FLOOR:-}"
+    [[ "$BUILD" =~ '^[1-9][0-9]{0,17}$' ]] \
+      || fail "set STORE_BUILD_NUMBER to a positive integer (18 digits maximum)"
+    [[ "$FLOOR" =~ '^(0|[1-9][0-9]{0,17})$' ]] \
+      || fail "set STORE_BUILD_FLOOR to the latest build already submitted (0 for none)"
+    decimal_gt "$BUILD" "$FLOOR" \
+      || fail "STORE_BUILD_NUMBER $BUILD must exceed submitted floor $FLOOR"
+    print -r -- "$BUILD"
+    ;;
+  *)
+    fail "usage: scripts/version {current|check|check-runtime|check-tag|check-artifact|check-bundle|store-build-number}"
+    ;;
+esac

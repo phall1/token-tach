@@ -13,6 +13,7 @@ const types = @import("core/types.zig");
 const config = @import("core/config.zig");
 const claude = @import("core/claude.zig");
 const codex = @import("core/codex.zig");
+const opencode = @import("core/opencode.zig");
 const pricing = @import("core/pricing.zig");
 const ledger_mod = @import("core/ledger.zig");
 const statefile = @import("core/statefile.zig");
@@ -79,6 +80,10 @@ const text_buf_len = 192;
 pub const Model = struct {
     allocator: std.mem.Allocator = undefined,
     ready: bool = false,
+    /// True for the Mac App Store build. Sandboxing forbids launching the
+    /// `security` helper and the store edition never borrows another app's
+    /// OAuth credential.
+    store_sandbox: bool = false,
 
     cfg: config.Config = .{},
     /// Config live-reload state: the resolved config path (owned), the
@@ -91,8 +96,10 @@ pub const Model = struct {
 
     claude_tailer: claude.Tailer = undefined,
     codex_tailer: codex.Tailer = undefined,
+    opencode_poller: opencode.Poller = undefined,
     claude_roots: []const []const u8 = &.{},
     codex_roots: []const []const u8 = &.{},
+    opencode_db: []const u8 = "",
 
     prices: pricing.Db = undefined,
     ledger: ledger_mod.Ledger = undefined,
@@ -134,6 +141,7 @@ pub const Model = struct {
     // and the tick countdown to the next save.
     state_path: []const u8 = "",
     state_saved_events: u64 = 0,
+    state_dirty: bool = false,
     state_save_countdown: u32 = state_save_ticks,
 
     // Display strings bound by app.native — regenerated each sweep, and
@@ -141,12 +149,14 @@ pub const Model = struct {
     glance_text: []const u8 = "",
     claude_text: []const u8 = "",
     codex_text: []const u8 = "",
+    opencode_text: []const u8 = "",
     today_text: []const u8 = "",
     status_text: []const u8 = "starting…",
 
     glance_buf: [text_buf_len]u8 = undefined,
     claude_buf: [text_buf_len]u8 = undefined,
     codex_buf: [text_buf_len]u8 = undefined,
+    opencode_buf: [text_buf_len]u8 = undefined,
     today_buf: [text_buf_len]u8 = undefined,
     status_buf: [text_buf_len]u8 = undefined,
 
@@ -242,6 +252,7 @@ pub fn sourceEnabled(sources: config.Sources, agent: types.Agent) bool {
     return switch (agent) {
         .claude => sources.claude,
         .codex => sources.codex,
+        .opencode => sources.opencode,
     };
 }
 
@@ -253,6 +264,7 @@ pub fn agentIsEmpty(model: *const Model, agent: types.Agent) bool {
     const limits = switch (agent) {
         .claude => model.claude_limits,
         .codex => model.codex_limits,
+        .opencode => null,
     };
     return limits == null;
 }
@@ -263,7 +275,10 @@ pub const Env = struct {
     home: []const u8 = "",
     claude_config_dir: ?[]const u8 = null,
     codex_home: ?[]const u8 = null,
+    opencode_db: ?[]const u8 = null,
+    xdg_data_home: ?[]const u8 = null,
     xdg_state_home: ?[]const u8 = null,
+    store_sandbox: bool = false,
 };
 
 /// Persist tailer+ledger state every N sweep ticks (N × 2 s ≈ 60 s).
@@ -273,6 +288,7 @@ pub const state_save_ticks: u32 = 30;
 /// on the heap-allocated model before the runtime starts.
 pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
     model.allocator = allocator;
+    model.store_sandbox = env.store_sandbox;
 
     const home = env.home;
 
@@ -297,9 +313,11 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
     else
         env.codex_home;
     model.codex_roots = try codex.sessionsDirs(allocator, codex_env, home);
+    model.opencode_db = try opencode.resolvePath(allocator, model.cfg.opencode_db, env.opencode_db, env.xdg_data_home, home);
 
     model.claude_tailer = claude.Tailer.init(allocator);
     model.codex_tailer = codex.Tailer.init(allocator);
+    model.opencode_poller = opencode.Poller.init(allocator);
     model.prices = try pricing.Db.init(allocator);
     model.ledger = ledger_mod.Ledger.init(allocator, 0);
 
@@ -313,6 +331,7 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
             model.state_path,
             &model.claude_tailer,
             &model.codex_tailer,
+            &model.opencode_poller,
             &model.ledger,
         ) catch .invalid; // OOM: hydration may be partial — reset below.
         switch (outcome) {
@@ -321,9 +340,11 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
             .invalid => {
                 model.claude_tailer.deinit();
                 model.codex_tailer.deinit();
+                model.opencode_poller.deinit();
                 model.ledger.deinit();
                 model.claude_tailer = claude.Tailer.init(allocator);
                 model.codex_tailer = codex.Tailer.init(allocator);
+                model.opencode_poller = opencode.Poller.init(allocator);
                 model.ledger = ledger_mod.Ledger.init(allocator, 0);
                 std.log.warn("state file invalid — falling back to full catch-up", .{});
             },
@@ -374,7 +395,7 @@ fn loadConfigFromDisk(model: *Model) bool {
 /// the next gate; disable stops polling but KEEPS the last limit
 /// snapshots — the staleness tag marks them honestly), and
 /// `alert-threshold` (stored for the future notifier). Root-path keys
-/// (`claude-config-dir`, `codex-home`) still require a restart.
+/// (`claude-config-dir`, `codex-home`, `opencode-db`) still require a restart.
 pub fn maybeReloadConfig(model: *Model) ?config.Sources {
     if (model.config_path.len == 0) return null;
     // A deleted config keeps the old values (ghostty behavior).
@@ -396,6 +417,7 @@ pub fn maybeReloadConfig(model: *Model) ?config.Sources {
     return .{
         .claude = model.cfg.sources.claude and !old_sources.claude,
         .codex = model.cfg.sources.codex and !old_sources.codex,
+        .opencode = model.cfg.sources.opencode and !old_sources.opencode,
     };
 }
 
@@ -500,6 +522,7 @@ fn enumerateHistory(model: *Model, only: config.Sources) !void {
                 const known: ?u64 = switch (group.agent) {
                     .claude => model.claude_tailer.offsetFor(path),
                     .codex => model.codex_tailer.offsetFor(path),
+                    .opencode => unreachable,
                 };
                 if (known != null and known.? == stat.size) {
                     model.allocator.free(path);
@@ -547,6 +570,7 @@ fn processCatchupChunk(model: *Model, fx: *Effects) void {
                 model.codex_tailer.poll(io, arena, file.path, &events) catch {};
                 for (events.items) |ev| ingest(model, ev);
             },
+            .opencode => unreachable,
         }
         model.catchup_next += 1;
         if (file.size >= budget) break;
@@ -587,9 +611,10 @@ const config_template =
     \\#poll-interval = 180s
     \\
     \\#alert-threshold = 70, 90
-    \\#source = claude, codex
+    \\#source = claude, codex, opencode
     \\#claude-config-dir = ~/some/other/claude-root
     \\#codex-home = ~/.codex
+    \\#opencode-db = ~/.local/share/opencode/opencode.db
     \\
 ;
 
@@ -624,7 +649,7 @@ fn maybeSaveState(model: *Model) void {
         return;
     }
     model.state_save_countdown = state_save_ticks;
-    if (model.ledger.all.events == model.state_saved_events) return;
+    if (!model.state_dirty and model.ledger.all.events == model.state_saved_events) return;
     saveStateNow(model);
 }
 
@@ -632,11 +657,12 @@ fn saveStateNow(model: *Model) void {
     if (model.state_path.len == 0) return;
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
-    statefile.save(model.allocator, io, model.state_path, &model.claude_tailer, &model.codex_tailer, &model.ledger) catch |err| {
+    statefile.save(model.allocator, io, model.state_path, &model.claude_tailer, &model.codex_tailer, &model.opencode_poller, &model.ledger) catch |err| {
         std.log.warn("state save failed: {s}", .{@errorName(err)});
         return;
     };
     model.state_saved_events = model.ledger.all.events;
+    model.state_dirty = false;
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -781,6 +807,18 @@ fn sweepOnce(model: *Model) void {
         }
     }
 
+    if (model.cfg.sources.opencode) {
+        var changes: std.ArrayList(opencode.Change) = .empty;
+        defer {
+            opencode.freeChanges(arena, changes.items);
+            changes.deinit(arena);
+        }
+        model.opencode_poller.poll(arena, model.opencode_db, &changes) catch |err| {
+            std.log.warn("opencode sweep failed: {s}", .{@errorName(err)});
+        };
+        for (changes.items) |change| ingestOpenCodeChange(model, change);
+    }
+
     refreshDisplay(model);
 }
 
@@ -788,6 +826,27 @@ fn ingest(model: *Model, ev: types.UsageEvent) void {
     const cost = model.prices.costOf(ev);
     model.ledger.add(ev, cost) catch return;
     model.burn.addTokens(ev.timestamp_ms, predict.limitWeightedTokens(ev));
+}
+
+fn ingestOpenCodeChange(model: *Model, change: opencode.Change) void {
+    const new_cost = model.prices.costOf(change.current);
+    if (change.previous) |old| {
+        model.ledger.replace(old, model.prices.costOf(old), change.current, new_cost) catch return;
+        const delta = types.UsageEvent{
+            .agent = .opencode,
+            .timestamp_ms = change.current.timestamp_ms,
+            .model = change.current.model,
+            .input_tokens = change.current.input_tokens -| old.input_tokens,
+            .output_tokens = change.current.output_tokens -| old.output_tokens,
+            .cache_creation_tokens = change.current.cache_creation_tokens -| old.cache_creation_tokens,
+            .cache_read_tokens = change.current.cache_read_tokens -| old.cache_read_tokens,
+        };
+        model.burn.addTokens(delta.timestamp_ms, predict.limitWeightedTokens(delta));
+    } else {
+        model.ledger.add(change.current, new_cost) catch return;
+        model.burn.addTokens(change.current.timestamp_ms, predict.limitWeightedTokens(change.current));
+    }
+    model.state_dirty = true;
 }
 
 /// Keep our own copy of a limit snapshot (arena-born snapshots die with
@@ -842,6 +901,7 @@ fn dispatchAlerts(model: *Model, fx: *Effects) void {
 /// spawn keeps any consent prompt in the child; keychain.zig remains
 /// the path for signed/bundled builds whose ACL entry sticks.
 fn maybeOauthPoll(model: *Model, fx: *Effects) void {
+    if (model.store_sandbox) return;
     if (!model.cfg.claude_oauth) return;
     if (model.oauth_inflight or model.now_ms < model.oauth_next_ms) return;
 
@@ -974,6 +1034,7 @@ fn refreshDisplay(model: *Model) void {
     model.glance_text = trayfmt.render(&model.glance_buf, model.cfg.tray_format, glanceState(model));
     model.claude_text = agentLine(&model.claude_buf, model, .claude, model.claude_limits);
     model.codex_text = agentLine(&model.codex_buf, model, .codex, model.codex_limits);
+    model.opencode_text = agentLine(&model.opencode_buf, model, .opencode, null);
 
     const today = model.ledger.today(model.now_ms);
     {
@@ -1132,6 +1193,7 @@ pub fn planPrice(agent: types.Agent, plan: []const u8) ?PlanPrice {
             if (eq(plan, "pro")) return .{ .lo = 200, .hi = 200 };
             if (eq(plan, "free")) return .{ .lo = 0, .hi = 0 };
         },
+        .opencode => return null,
     }
     return null;
 }
@@ -1394,6 +1456,9 @@ test "subscription value: bands, ambiguity, and the incomplete guard" {
     model.codex_limits = .{ .agent = .codex, .read_at_ms = 0, .plan = "plus", .windows = &codex_windows };
     try model.ledger.add(.{ .agent = .claude, .timestamp_ms = 0, .model = "m", .output_tokens = 1 }, 100.0);
     try model.ledger.add(.{ .agent = .codex, .timestamp_ms = 0, .model = "m", .output_tokens = 1 }, 10.0);
+    // OpenCode contributes to the API-equivalent numerator supplied below,
+    // never to the Claude/Codex subscription-plan denominator.
+    try model.ledger.add(.{ .agent = .opencode, .timestamp_ms = 0, .model = "m", .output_tokens = 1 }, 4_070.0);
 
     var value = subscriptionValue(&model);
     try testing.expectEqual(@as(f64, 120), value.plan_lo_usd);

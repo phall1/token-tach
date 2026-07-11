@@ -1,0 +1,34 @@
+#!/bin/zsh
+# Generate and Ed25519-sign an appcast using Sparkle's pinned release tool.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+[[ $# -ge 2 && $# -le 3 ]] || {
+  print -u2 "usage: scripts/updater-generate-appcast <archives-dir> <https-download-url-prefix> [channel]"
+  exit 2
+}
+
+ARCHIVES_DIR="$1"
+DOWNLOAD_PREFIX="$2"
+CHANNEL="${3:-}"
+[[ -d "$ARCHIVES_DIR" ]] || { print -u2 "FAIL: archives directory does not exist"; exit 1; }
+[[ "$DOWNLOAD_PREFIX" == https://* ]] || { print -u2 "FAIL: download URL prefix must use HTTPS"; exit 1; }
+
+SPARKLE_ROOT=$(scripts/updater-fetch-sparkle)
+ARGS=(--download-url-prefix "$DOWNLOAD_PREFIX" --maximum-versions 10 -o "$ARCHIVES_DIR/appcast.xml")
+[[ -n "$CHANNEL" ]] && ARGS+=(--channel "$CHANNEL")
+[[ -n "${SPARKLE_KEY_ACCOUNT:-}" ]] && ARGS+=(--account "$SPARKLE_KEY_ACCOUNT")
+[[ -n "${SPARKLE_ED_KEY_FILE:-}" ]] && ARGS+=(--ed-key-file "$SPARKLE_ED_KEY_FILE")
+
+"$SPARKLE_ROOT/bin/generate_appcast" "${ARGS[@]}" "$ARCHIVES_DIR"
+[[ -s "$ARCHIVES_DIR/appcast.xml" ]] || { print -u2 "FAIL: appcast.xml was not generated"; exit 1; }
+grep -q 'sparkle:edSignature=' "$ARCHIVES_DIR/appcast.xml" || {
+  print -u2 "FAIL: generated appcast has no Ed25519 update signature"
+  exit 1
+}
+grep -q 'sparkle-signatures:' "$ARCHIVES_DIR/appcast.xml" || {
+  print -u2 "FAIL: generated appcast is not itself signed"
+  exit 1
+}
+print -r -- "SIGNED APPCAST: $ARCHIVES_DIR/appcast.xml"

@@ -1,6 +1,7 @@
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 const main = @import("main.zig");
+const cli = @import("cli.zig");
 const engine = @import("engine.zig");
 const view = @import("view.zig");
 const dashboard = @import("dashboard.zig");
@@ -17,6 +18,7 @@ test {
     _ = @import("core/config.zig");
     _ = @import("core/claude.zig");
     _ = @import("core/codex.zig");
+    _ = @import("core/opencode.zig");
     _ = @import("core/pricing.zig");
     _ = @import("core/oauth.zig");
     _ = @import("core/keychain.zig");
@@ -123,6 +125,7 @@ test "the instrument cluster binds the engine's structured state" {
     // Both agent groups render with their limit windows.
     try testing.expect(containsText(tree.root, "CLAUDE"));
     try testing.expect(containsText(tree.root, "CODEX"));
+    try testing.expect(containsText(tree.root, "OPENCODE"));
     try testing.expect(containsText(tree.root, "67%"));
     try testing.expect(containsText(tree.root, "9%"));
     try testing.expect(containsText(tree.root, "5h"));
@@ -153,12 +156,13 @@ test "dashboard view exposes hero stats and attribution sections" {
     model.claude_plan = model.claude_plan_buf[0..3];
 
     const tree = try buildDashboardTree(arena, &model);
-    try testing.expect(containsText(tree.root, "TOKEN TACH DASH"));
-    try testing.expect(containsText(tree.root, "MONTH API EQUIV"));
+    try testing.expect(containsText(tree.root, "TOKEN TACH / LEDGER"));
+    try testing.expect(containsText(tree.root, "API EQUIVALENT"));
     try testing.expect(containsText(tree.root, "SUBSCRIPTION VALUE"));
     try testing.expect(containsText(tree.root, "30-DAY API-EQUIVALENT COST"));
     try testing.expect(containsText(tree.root, "MODELS"));
     try testing.expect(containsText(tree.root, "PROJECTS"));
+    try testing.expect(containsText(tree.root, "OPENCODE"));
     try testing.expect(containsText(tree.root, "claude-fable-5"));
     try testing.expect(containsText(tree.root, "token-tach"));
 }
@@ -333,13 +337,8 @@ test "the chrome display list emits exactly its declared command counts" {
     try testing.expect(found_blade);
 }
 
-test "menu version string matches the manifest" {
-    // Runs from the repo root under `zig build test`; skip if the layout
-    // ever moves rather than failing a legitimate build.
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    const io = threaded.io();
-    const zon = std.Io.Dir.cwd().readFileAlloc(io, "app.zon", testing.allocator, .limited(16 * 1024)) catch return error.SkipZigTest;
-    defer testing.allocator.free(zon);
-    const needle = "\"" ++ main.app_version ++ "\"";
-    try testing.expect(std.mem.indexOf(u8, zon, needle) != null);
+test "CLI, JSON, and menu versions use the app manifest" {
+    const version = @import("app_version").version;
+    try testing.expectEqualStrings(version, cli.version);
+    try testing.expectEqualStrings(version, main.app_version);
 }
