@@ -2,13 +2,29 @@
 .dolt/
 *.db
 .beads-credential-key
+.beads/.local_version
+.beads/backup/
+.beads/embeddeddolt/
+.beads/last-touched
 .beads/proxieddb/
 
 # macOS noise
 .DS_Store
+.AppleDouble
+.LSOverride
 
 # Native SDK / Zig build artifacts
 .native/
+zig-cache/
 zig-out/
 .zig-cache/
 screenshot-*.png
+
+# Apple signing/upload material (keep outside this public repository)
+*.provisionprofile
+*.mobileprovision
+*.p8
+*.p12
+.env
+.env.*
+!.env.example
