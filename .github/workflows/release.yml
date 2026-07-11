@@ -239,7 +239,10 @@ jobs:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
-          [[ -n "$GH_TOKEN" ]]
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "HOMEBREW_TAP_TOKEN is unset; the tap's hourly release poll will update the cask."
+            exit 0
+          fi
           sha256="$(shasum -a 256 "dist/token-tach-$VERSION-universal2.dmg" | cut -d ' ' -f 1)"
           gh api --method POST repos/phall1/homebrew-tap/dispatches \
             -f event_type=token-tach-release \
