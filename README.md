@@ -35,8 +35,16 @@ And yes — the needle does the full ignition sweep every time you open it:
   attribution:
 
 ![the dashboard](docs/assets/dashboard.png)
+- **System telemetry** — a quiet strip of micro-meters under the odometer:
+  CPU, GPU, memory (kernel pressure-aware), disk, network, battery. Sampled
+  straight from mach/sysctl/IOKit on the same 2-second sweep — no
+  subprocesses, no root, microseconds per reading. Cells only exist for
+  hardware that exists (a desktop shows no battery cell), and any reading
+  can be put in the menu bar via `tray-format` tokens
+  (`{cpu} {gpu} {mem} {disk} {net} {batt}`).
 - **Alerts and CLI** — hysteresis notifications at configured thresholds,
   plus `--json` / `--statusline` for scripting and Claude Code statuslines.
+  `--json` includes the live system telemetry.
 
 ## Why it's fast
 
@@ -128,12 +136,14 @@ Use the Dashboard menu item or the popover's `DASH` button for history.
 
 ```ini
 # the menu-bar template: {burn} {eta} {pct} {tok} {cost}
+#                        {cpu} {gpu} {mem} {disk} {net} {batt}
 tray-format = {burn} → {eta}
 
 claude-oauth = true        # opt in to server-truth Claude limits
 poll-interval = 180s
 alert-threshold = 70, 90
 source = claude, codex, opencode # enable/disable agents
+system-stats = true        # or a list: cpu, gpu, mem, disk, net, battery
 # claude-config-dir = ~/some/other/claude-root
 # codex-home = ~/.codex
 # opencode-db = ~/.local/share/opencode/opencode.db
@@ -160,6 +170,8 @@ src/main.zig    shell: scene, status item, popover, runtime entry
 
 ## Status
 
+v0.5: system telemetry (CPU/GPU/mem/disk/net/battery) joins the cluster,
+on Native SDK v0.5.
 v0.3: history dashboard, notifications, and local-only CLI/statusline mode.
 Follow-up work is tracked in [beads](https://github.com/steveyegge/beads)
 (`bd list`).
