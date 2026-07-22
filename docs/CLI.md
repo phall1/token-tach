@@ -77,9 +77,25 @@ The top-level schema is stable for v0.3.x. New fields may be added.
     "claude_hint": "claude plan limits are OAuth server truth — run the app (claude-oauth = true) to see them"
   },
   "models": [],
-  "projects": []
+  "projects": [],
+  "system": {
+    "cpu": { "utilization": 0.43, "cores": 14, "load_avg_1m": 3.25 },
+    "gpu": { "utilization": 0.12 },
+    "mem": { "used_bytes": 40700000000, "total_bytes": 51500000000, "used_fraction": 0.79, "pressure": "normal" },
+    "disk": { "total_bytes": 994000000000, "free_bytes": 186000000000, "used_fraction": 0.81, "read_bytes_per_sec": 120000, "write_bytes_per_sec": 8000 },
+    "net": { "rx_bytes_per_sec": 1230000, "tx_bytes_per_sec": 88000 },
+    "battery": null
+  }
 }
 ```
+
+`system` (v0.5+) is live machine telemetry sampled at invocation over a
+~150 ms window — mach/sysctl/IOKit reads, no subprocesses, no root. A
+`null` module means the hardware or counter is unavailable on this
+machine (for example `battery: null` on a desktop). Fractions are 0..1;
+`mem.pressure` is the kernel's memorystatus level
+(`normal`/`warn`/`critical`/`unknown`). `--statusline` performs no system
+sampling.
 
 `burn_tokens_per_min` is always `null` in v0.3 CLI mode. The persisted
 ledger stores rollups, not enough recent per-event history for an honest

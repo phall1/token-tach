@@ -10,7 +10,9 @@
 //!   3. ONE incremental sweep picks up bytes appended since the app last
 //!      saved (or, with no state file, cold-parses full history — slower
 //!      but correct),
-//!   4. render.
+//!   4. (--json only) live system telemetry sampled over a ~150 ms
+//!      window — mach/sysctl/IOKit reads, still local-only,
+//!   5. render.
 //!
 //! Guarantees:
 //! - **Read-only.** `statefile.save` is never called; the app's state file
@@ -43,6 +45,7 @@ const pricing = @import("core/pricing.zig");
 const ledger_mod = @import("core/ledger.zig");
 const statefile = @import("core/statefile.zig");
 const trayfmt = @import("core/trayfmt.zig");
+const system = @import("core/system/system.zig");
 
 pub const version: []const u8 = app_version.version;
 
@@ -84,7 +87,15 @@ pub fn maybeRunCli(init: std.process.Init) !bool {
             };
             // Never crash: any collection failure (OOM, pathological fs)
             // degrades to the empty snapshot + note.
-            const snap = collect(arena, init.io, env, now_ms) catch emptySnapshot(now_ms);
+            var snap = collect(arena, init.io, env, now_ms) catch emptySnapshot(now_ms);
+            if (mode == .json) {
+                // Live machine telemetry needs a real-time window for its
+                // delta-based rates; 150 ms keeps --json interactive. The
+                // statusline path skips it entirely (it renders none of
+                // this and is called on a tight cadence).
+                var sampler = system.Sampler.init();
+                snap.system = system.sampleOnce(&sampler, .{}, 150_000);
+            }
             switch (mode) {
                 .json => try writeJson(w, snap),
                 .statusline => try writeStatusline(w, snap),
@@ -176,6 +187,9 @@ pub const Snapshot = struct {
     codex_limits: ?types.LimitSnapshot = null,
     models: []const Entry = &.{},
     projects: []const Entry = &.{},
+    /// Live machine telemetry (--json only; sampled at invocation, not
+    /// read from state). Empty for --statusline.
+    system: system.Snapshot = .{},
 };
 
 pub fn emptySnapshot(now_ms: i64) Snapshot {
@@ -392,7 +406,64 @@ const JsonOut = struct {
     },
     models: []const JsonKeyed,
     projects: []const JsonKeyed,
+    system: JsonSystem,
 };
+
+/// Live machine telemetry, sampled at invocation over a ~150 ms window.
+/// A null module means unavailable on this machine (no battery, no
+/// accelerator). Fractions are 0..1.
+const JsonSystem = struct {
+    cpu: ?struct { utilization: f64, cores: u32, load_avg_1m: f64 },
+    gpu: ?struct { utilization: f64 },
+    mem: ?struct { used_bytes: u64, total_bytes: u64, used_fraction: f64, pressure: []const u8 },
+    disk: ?struct { total_bytes: u64, free_bytes: u64, used_fraction: f64, read_bytes_per_sec: ?u64, write_bytes_per_sec: ?u64 },
+    net: ?struct { rx_bytes_per_sec: ?u64, tx_bytes_per_sec: ?u64 },
+    battery: ?struct { charge: f64, charging: bool, on_ac: bool },
+};
+
+fn jsonSystem(snap: system.Snapshot) JsonSystem {
+    return .{
+        .cpu = if (snap.cpu) |s| .{
+            .utilization = roundFrac(s.total_frac),
+            .cores = s.core_count,
+            .load_avg_1m = roundFrac(s.load_avg_1m),
+        } else null,
+        .gpu = if (snap.gpu) |s| .{ .utilization = roundFrac(s.device_utilization) } else null,
+        .mem = if (snap.mem) |s| .{
+            .used_bytes = s.used_bytes,
+            .total_bytes = s.total_bytes,
+            .used_fraction = roundFrac(s.used_frac),
+            .pressure = @tagName(s.pressure),
+        } else null,
+        .disk = if (snap.disk) |s| .{
+            .total_bytes = s.total_bytes,
+            .free_bytes = s.free_bytes,
+            .used_fraction = roundFrac(s.used_fraction),
+            .read_bytes_per_sec = bpsInt(s.read_bytes_per_sec),
+            .write_bytes_per_sec = bpsInt(s.write_bytes_per_sec),
+        } else null,
+        .net = if (snap.net) |s| .{
+            .rx_bytes_per_sec = bpsInt(s.in_bytes_per_sec),
+            .tx_bytes_per_sec = bpsInt(s.out_bytes_per_sec),
+        } else null,
+        .battery = if (snap.battery) |s| .{
+            .charge = roundFrac(s.charge),
+            .charging = s.charging,
+            .on_ac = s.on_ac,
+        } else null,
+    };
+}
+
+/// Fractions round to 3 decimals for the same legibility reason costs
+/// round to micro-dollars.
+fn roundFrac(v: f64) f64 {
+    return @round(v * 1_000) / 1_000;
+}
+
+fn bpsInt(v: ?f64) ?u64 {
+    const rate = v orelse return null;
+    return @intFromFloat(@max(rate, 0));
+}
 
 fn jsonTotals(t: ledger_mod.Totals) JsonTotals {
     return .{
@@ -481,6 +552,7 @@ pub fn writeJson(w: *std.Io.Writer, snap: Snapshot) !void {
         },
         .models = models,
         .projects = projects,
+        .system = jsonSystem(snap.system),
     };
     try std.json.Stringify.value(out, .{ .whitespace = .indent_2 }, w);
     try w.writeByte('\n');
@@ -778,6 +850,33 @@ test "writeJson: schema fields, note semantics, and claude-limits hint" {
     try testing.expectEqual(@as(f64, 14.0), jsonNumber(windows.items[0].object.get("used_percent").?));
     try testing.expect(root.get("models").?.array.items.len == 3);
     try testing.expect(root.get("projects").?.array.items.len == 2);
+    // The system object is always present; an unsampled snapshot renders
+    // every module as null rather than omitting the key.
+    const sys = root.get("system").?.object;
+    try testing.expect(sys.get("cpu").? == .null);
+    try testing.expect(sys.get("battery").? == .null);
+}
+
+test "jsonSystem maps live readings and rounds fractions" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var snap = emptySnapshot(1);
+    snap.system = .{
+        .cpu = .{ .total_frac = 0.43456, .core_count = 14, .load_avg_1m = 3.25, .p_cluster_frac = null, .e_cluster_frac = null },
+        .mem = .{ .used_bytes = 40, .total_bytes = 100, .used_frac = 0.4, .pressure = .warn },
+        .net = .{ .total_bytes_in = 0, .total_bytes_out = 0, .in_bytes_per_sec = 1_234.9, .out_bytes_per_sec = null },
+    };
+    var aw = std.Io.Writer.Allocating.init(arena);
+    try writeJson(&aw.writer, snap);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, aw.writer.buffered(), .{});
+    const sys = parsed.object.get("system").?.object;
+    try testing.expectEqual(@as(f64, 0.435), jsonNumber(sys.get("cpu").?.object.get("utilization").?));
+    try testing.expectEqualStrings("warn", sys.get("mem").?.object.get("pressure").?.string);
+    try testing.expectEqual(@as(i64, 1234), sys.get("net").?.object.get("rx_bytes_per_sec").?.integer);
+    try testing.expect(sys.get("net").?.object.get("tx_bytes_per_sec").? == .null);
+    try testing.expect(sys.get("gpu").? == .null);
 }
 
 test "writeJson + writeStatusline: empty snapshot never crashes and says why" {
