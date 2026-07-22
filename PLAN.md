@@ -117,6 +117,13 @@ token-tach/
 
 ## Roadmap
 
+- **v0.5 — the swiss-army cluster** (shipped 2026-07-22): the glance
+  thesis generalized beyond tokens — system telemetry (CPU, GPU, memory
+  pressure, disk, network, battery) sampled natively (mach/sysctl/IOKit,
+  no subprocesses, no root) on the same 2 s sweep, surfaced as a quiet
+  micro-meter strip in the popover, `{cpu}`-style tray tokens, and a
+  `system` object in `--json`. Vendored SDK rebased onto upstream v0.5.4.
+
 - **v1.0 — glance + truth**: live tray title (burn + ETA, format-string
   configurable), tray popover (patched) with tach gauge + 5h/weekly bars +
   reset countdowns per agent, Claude JSONL + OAuth, Codex JSONL, pricing,
