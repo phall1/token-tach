@@ -56,9 +56,16 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // src/core/system/* call IOKit (GPU, battery, disk statistics) from
+    // both the app and the test module.
+    if (artifacts.exe.rootModuleTarget().os.tag == .macos) {
+        artifacts.exe.root_module.linkFramework("IOKit", .{});
+    }
+
     // src/core/keychain.zig calls Security/CoreFoundation directly; the SDK
     // links those into the app module but not the test module.
     if (artifacts.tests.rootModuleTarget().os.tag == .macos) {
+        artifacts.tests.root_module.linkFramework("IOKit", .{});
         if (b.sysroot) |sysroot| {
             artifacts.tests.root_module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }) });
         }
