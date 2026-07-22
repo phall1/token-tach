@@ -22,6 +22,7 @@ const alerts = @import("core/alerts.zig");
 const oauth = @import("core/oauth.zig");
 const keychain = @import("core/keychain.zig");
 const trayfmt = @import("core/trayfmt.zig");
+const system = @import("core/system/system.zig");
 
 pub const Effects = native_sdk.Effects(Msg);
 
@@ -105,6 +106,12 @@ pub const Model = struct {
     /// Latest limit snapshots for display (windows slices owned by us).
     claude_limits: ?types.LimitSnapshot = null,
     codex_limits: ?types.LimitSnapshot = null,
+
+    /// System telemetry: per-sampler counter state plus the latest
+    /// snapshot (plain values, refreshed each sweep, ephemeral by
+    /// design — never persisted).
+    system_sampler: system.Sampler = system.Sampler.init(),
+    system_snap: system.Snapshot = .{},
 
     // OAuth poller state.
     oauth_backoff: oauth.Backoff = .{},
@@ -386,8 +393,10 @@ fn loadConfigFromDisk(model: *Model) bool {
 /// render), `source` (panels + sweeps), `claude-oauth` (enable polls on
 /// the next gate; disable stops polling but KEEPS the last limit
 /// snapshots — the staleness tag marks them honestly), and
-/// `alert-threshold` (stored for the future notifier). Root-path keys
-/// (`claude-config-dir`, `codex-home`, `opencode-db`) still require a restart.
+/// `alert-threshold` (stored for the future notifier), and
+/// `system-stats` (the next sweep samples exactly the new module set).
+/// Root-path keys (`claude-config-dir`, `codex-home`, `opencode-db`)
+/// still require a restart.
 pub fn maybeReloadConfig(model: *Model) ?config.Sources {
     if (model.config_path.len == 0) return null;
     // A deleted config keeps the old values (ghostty behavior).
@@ -596,7 +605,12 @@ pub const config_spawn_key: u64 = 8;
 const config_template =
     \\# token-tach configuration — live-reloaded while the app runs.
     \\# Tray template tokens: {burn} {eta} {pct} {tok} {cost}
+    \\#                       {cpu} {gpu} {mem} {disk} {net} {batt}
     \\#tray-format = {burn} → {eta}
+    \\
+    \\# System telemetry strip: true/false, or a module list
+    \\# (cpu, gpu, mem, disk, net, battery).
+    \\#system-stats = true
     \\
     \\# Server-truth Claude limits via your Claude Code OAuth token (Keychain).
     \\#claude-oauth = true
@@ -811,7 +825,22 @@ fn sweepOnce(model: *Model) void {
         for (changes.items) |change| ingestOpenCodeChange(model, change);
     }
 
+    // System telemetry rides the same sweep: microseconds of syscalls,
+    // no subprocesses. A config with the strip off skips the calls and
+    // clears the snapshot so the view (and tray tokens) go quiet.
+    if (model.cfg.system_stats.any()) {
+        model.system_snap = model.system_sampler.sample(systemEnabled(model.cfg.system_stats));
+    } else {
+        model.system_snap = .{};
+    }
+
     refreshDisplay(model);
+}
+
+/// config.SystemStats → system.Enabled, field by field (the two structs
+/// mirror each other but stay decoupled).
+fn systemEnabled(s: config.SystemStats) system.Enabled {
+    return .{ .cpu = s.cpu, .gpu = s.gpu, .mem = s.mem, .disk = s.disk, .net = s.net, .battery = s.battery };
 }
 
 fn ingest(model: *Model, ev: types.UsageEvent) void {
@@ -997,6 +1026,13 @@ pub fn glanceState(model: *const Model) trayfmt.GlanceState {
         .next_reset_ms = nextReset(model),
         .today_tokens = today.totalTokens(),
         .today_cost_usd = today.cost_usd,
+        .cpu_frac = if (model.system_snap.cpu) |s| s.total_frac else null,
+        .gpu_frac = if (model.system_snap.gpu) |s| s.device_utilization else null,
+        .mem_frac = if (model.system_snap.mem) |s| s.used_frac else null,
+        .disk_free_bytes = if (model.system_snap.disk) |s| s.free_bytes else null,
+        .net_rx_bps = if (model.system_snap.net) |s| s.in_bytes_per_sec else null,
+        .net_tx_bps = if (model.system_snap.net) |s| s.out_bytes_per_sec else null,
+        .battery_frac = if (model.system_snap.battery) |s| s.charge else null,
     };
 }
 

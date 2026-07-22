@@ -27,6 +27,7 @@ test {
     _ = @import("core/predict.zig");
     _ = @import("core/alerts.zig");
     _ = @import("core/trayfmt.zig");
+    _ = @import("core/system/system.zig");
     _ = @import("cli.zig");
     _ = @import("dashboard.zig");
     _ = @import("engine.zig");
@@ -135,6 +136,49 @@ test "the instrument cluster binds the engine's structured state" {
     // Dial furniture: unit caption and the sparkline caption.
     try testing.expect(containsText(tree.root, "tok/min ×1000"));
     try testing.expect(containsText(tree.root, "burn · last 15 min"));
+}
+
+test "system strip renders enabled readings and hides absent modules" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = instrumentedModel();
+    model.system_snap = .{
+        .cpu = .{ .total_frac = 0.43, .core_count = 14, .load_avg_1m = 3.2, .p_cluster_frac = null, .e_cluster_frac = null },
+        .gpu = .{ .device_utilization = 0.12 },
+        .mem = .{ .used_bytes = 40_000_000_000, .total_bytes = 51_500_000_000, .used_frac = 0.777, .pressure = .warn },
+        .disk = .{ .total_bytes = 994_000_000_000, .free_bytes = 186_000_000_000, .used_fraction = 0.81 },
+        .net = .{ .total_bytes_in = 0, .total_bytes_out = 0, .in_bytes_per_sec = 1_230_000, .out_bytes_per_sec = 88_000 },
+        // battery deliberately null: the cell must not exist.
+        .net_meter_frac = 0.4,
+    };
+    const tree = try buildTree(arena, &model);
+
+    try testing.expect(findBySemanticsLabel(tree.root, "System telemetry") != null);
+    try testing.expect(containsText(tree.root, "CPU"));
+    try testing.expect(containsText(tree.root, "43%"));
+    try testing.expect(containsText(tree.root, "GPU"));
+    try testing.expect(containsText(tree.root, "12%"));
+    try testing.expect(containsText(tree.root, "MEM"));
+    try testing.expect(containsText(tree.root, "78%"));
+    try testing.expect(containsText(tree.root, "DISK"));
+    try testing.expect(containsText(tree.root, "186G"));
+    try testing.expect(containsText(tree.root, "NET"));
+    try testing.expect(containsText(tree.root, "↓1.2M ↑88k"));
+    try testing.expect(!containsText(tree.root, "BAT"));
+}
+
+test "system strip disappears entirely when config disables it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = instrumentedModel();
+    model.cfg.system_stats = @import("core/config.zig").SystemStats.none;
+    model.system_snap = .{ .gpu = .{ .device_utilization = 0.5 } };
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findBySemanticsLabel(tree.root, "System telemetry") == null);
 }
 
 test "dashboard view exposes hero stats and attribution sections" {

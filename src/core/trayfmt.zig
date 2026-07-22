@@ -21,6 +21,18 @@ pub const GlanceState = struct {
     next_reset_ms: ?i64 = null,
     today_tokens: u64 = 0,
     today_cost_usd: f64 = 0,
+
+    // Live system telemetry, populated when the system sampler is
+    // enabled and the reading exists. An absent reading renders as
+    // nothing, so a template with {cpu} degrades silently on a machine
+    // (or config) without it.
+    cpu_frac: ?f64 = null,
+    gpu_frac: ?f64 = null,
+    mem_frac: ?f64 = null,
+    disk_free_bytes: ?u64 = null,
+    net_rx_bps: ?f64 = null,
+    net_tx_bps: ?f64 = null,
+    battery_frac: ?f64 = null,
 };
 
 /// Template tokens:
@@ -29,6 +41,12 @@ pub const GlanceState = struct {
 ///   {pct}   "67%" hottest window, or ""
 ///   {tok}   "8.2M" today's tokens
 ///   {cost}  "$63.40" today's cost
+///   {cpu}   "43%" CPU utilization, or ""
+///   {gpu}   "12%" GPU utilization, or ""
+///   {mem}   "62%" memory used, or ""
+///   {disk}  "186G" free disk space, or ""
+///   {net}   "↓1.2M ↑88k" network B/s, or ""
+///   {batt}  "87%" battery charge, or ""
 pub fn render(buf: []u8, template: []const u8, state: GlanceState) []const u8 {
     var w = std.Io.Writer.fixed(buf);
     var i: usize = 0;
@@ -87,8 +105,51 @@ fn writeToken(w: *std.Io.Writer, token: []const u8, state: GlanceState) !void {
         try writeHumanTokens(w, state.today_tokens);
     } else if (std.mem.eql(u8, token, "cost")) {
         try writeCost(w, state.today_cost_usd);
+    } else if (std.mem.eql(u8, token, "cpu")) {
+        if (state.cpu_frac) |f| try writePercent(w, f);
+    } else if (std.mem.eql(u8, token, "gpu")) {
+        if (state.gpu_frac) |f| try writePercent(w, f);
+    } else if (std.mem.eql(u8, token, "mem")) {
+        if (state.mem_frac) |f| try writePercent(w, f);
+    } else if (std.mem.eql(u8, token, "disk")) {
+        if (state.disk_free_bytes) |bytes| try writeHumanBytes(w, bytes);
+    } else if (std.mem.eql(u8, token, "net")) {
+        if (state.net_rx_bps != null or state.net_tx_bps != null) {
+            try w.writeAll("↓");
+            try writeHumanBytes(w, @intFromFloat(@max(state.net_rx_bps orelse 0, 0)));
+            try w.writeAll(" ↑");
+            try writeHumanBytes(w, @intFromFloat(@max(state.net_tx_bps orelse 0, 0)));
+        }
+    } else if (std.mem.eql(u8, token, "batt")) {
+        if (state.battery_frac) |f| try writePercent(w, f);
     } else {
         return error.UnknownToken;
+    }
+}
+
+/// Fraction 0..1 as a clamped integer percent: 0.434 -> "43%".
+fn writePercent(w: *std.Io.Writer, frac: f64) !void {
+    const pct: u64 = @intFromFloat(std.math.clamp(frac, 0, 1) * 100 + 0.5);
+    try w.printInt(pct, 10, .lower, .{});
+    try w.writeByte('%');
+}
+
+/// Bytes with a binary-free 1000 step, matching the token scaling the
+/// rest of the cluster uses: 950 -> "950B", 88_000 -> "88k",
+/// 1_230_000 -> "1.2M", 186_000_000_000 -> "186G".
+pub fn writeHumanBytes(w: *std.Io.Writer, bytes: u64) !void {
+    if (bytes >= 1_000_000_000) {
+        try writeScaled(w, bytes, 1_000_000_000);
+        try w.writeByte('G');
+    } else if (bytes >= 1_000_000) {
+        try writeScaled(w, bytes, 1_000_000);
+        try w.writeByte('M');
+    } else if (bytes >= 1_000) {
+        try writeScaled(w, bytes, 1_000);
+        try w.writeByte('k');
+    } else {
+        try w.printInt(bytes, 10, .lower, .{});
+        try w.writeByte('B');
     }
 }
 
@@ -284,6 +345,42 @@ test "clock rendering handles noon and midnight" {
     w = std.Io.Writer.fixed(&buf);
     try writeClock(&w, 12 * 3_600_000, -300); // UTC noon at UTC-5 = 7:00a
     try testing.expectEqualStrings("7:00a", w.buffered());
+}
+
+test "system tokens render from fractions and byte figures" {
+    const got = renderTest("{cpu} {gpu} {mem} {disk} {net} {batt}", .{
+        .now_ms = 0,
+        .cpu_frac = 0.434,
+        .gpu_frac = 0.12,
+        .mem_frac = 0.618,
+        .disk_free_bytes = 186_000_000_000,
+        .net_rx_bps = 1_230_000,
+        .net_tx_bps = 88_000,
+        .battery_frac = 0.87,
+    });
+    try testing.expectEqualStrings("43% 12% 62% 186G ↓1.2M ↑88k 87%", got);
+}
+
+test "system tokens collapse to nothing when readings are absent" {
+    const got = renderTest("cpu {cpu}|{net}|{batt}", .{ .now_ms = 0 });
+    try testing.expectEqualStrings("cpu ||", got);
+}
+
+test "human byte scaling" {
+    var buf: [32]u8 = undefined;
+    const cases = [_]struct { v: u64, want: []const u8 }{
+        .{ .v = 0, .want = "0B" },
+        .{ .v = 950, .want = "950B" },
+        .{ .v = 88_000, .want = "88k" },
+        .{ .v = 1_230_000, .want = "1.2M" },
+        .{ .v = 186_000_000_000, .want = "186G" },
+        .{ .v = 2_000_000_000_000, .want = "2000G" },
+    };
+    for (cases) |case| {
+        var w = std.Io.Writer.fixed(&buf);
+        try writeHumanBytes(&w, case.v);
+        try testing.expectEqualStrings(case.want, w.buffered());
+    }
 }
 
 test "buffer overflow truncates instead of crashing" {

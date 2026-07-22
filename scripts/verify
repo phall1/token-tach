@@ -63,7 +63,11 @@ echo "$SNAP" | grep -q 'models priced\|starting\|scanning' || { echo "FAIL: stat
 
 # Give the first 2s sweep a chance to run, then confirm the app survived it.
 sleep 3
-$NATIVE automate snapshot 2>/dev/null | grep -q 'today \$' || { echo "FAIL: app died or blanked after first sweep"; exit 1 }
+SNAP=$($NATIVE automate snapshot 2>/dev/null)
+echo "$SNAP" | grep -q 'today \$' || { echo "FAIL: app died or blanked after first sweep"; exit 1 }
+# The system telemetry strip needs one sweep to sample; instantaneous
+# modules (mem/gpu/disk) must be there by now.
+echo "$SNAP" | grep -q 'System telemetry' || { echo "FAIL: system telemetry strip missing"; exit 1 }
 $NATIVE automate screenshot main-canvas >/dev/null 2>&1 || true
 
 # Open the model-declared dashboard window and assert its canvas tree exists.

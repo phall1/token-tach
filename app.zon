@@ -21,7 +21,7 @@
                 .label = "main",
                 .title = "Token Tach",
                 .width = 560,
-                .height = 420,
+                .height = 472,
                 .titlebar = "chromeless",
                 .resizable = false,
                 .restore_state = false,

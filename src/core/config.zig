@@ -40,6 +40,22 @@ pub const Sources = packed struct {
     }
 };
 
+/// Which system stat modules are shown (key: `system-stats`).
+pub const SystemStats = packed struct {
+    cpu: bool = true,
+    gpu: bool = true,
+    mem: bool = true,
+    disk: bool = true,
+    net: bool = true,
+    battery: bool = true,
+
+    pub const none: SystemStats = .{ .cpu = false, .gpu = false, .mem = false, .disk = false, .net = false, .battery = false };
+
+    pub fn any(self: SystemStats) bool {
+        return self.cpu or self.gpu or self.mem or self.disk or self.net or self.battery;
+    }
+};
+
 /// Default alert thresholds, in percent.
 pub const default_alert_thresholds = [_]u8{ 70, 90 };
 
@@ -60,6 +76,11 @@ pub const Config = struct {
     theme: []const u8 = "tach-dark",
     /// `source` — enabled agents, comma-separated, appendable.
     sources: Sources = .{},
+    /// `system-stats` — the system telemetry strip. `true`/`all` (default)
+    /// shows every available module, `false`/`none` hides the strip, or a
+    /// comma-separated module list (cpu, gpu, mem, disk, net, battery)
+    /// shows exactly those.
+    system_stats: SystemStats = .{},
     /// `claude-config-dir` — extra Claude config roots, appendable, one per
     /// line. Stored verbatim; `~` expansion is the CALLER's job. Empty
     /// (the default) means auto-discover.
@@ -179,6 +200,50 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) error{OutOfMemory}!
                     try warn(allocator, &warnings, line_no, "source: unknown source \"{s}\" (want claude, codex, opencode); skipped", .{item});
                 }
             }
+        } else if (std.mem.eql(u8, key, "system-stats")) {
+            if (parseBool(value)) |b| {
+                cfg.system_stats = if (b) .{} else SystemStats.none;
+                continue;
+            }
+            if (std.ascii.eqlIgnoreCase(value, "all")) {
+                cfg.system_stats = .{};
+                continue;
+            }
+            if (std.ascii.eqlIgnoreCase(value, "none")) {
+                cfg.system_stats = SystemStats.none;
+                continue;
+            }
+            var picked = SystemStats.none;
+            var any_valid = false;
+            var items = std.mem.splitScalar(u8, value, ',');
+            while (items.next()) |item_raw| {
+                const item = std.mem.trim(u8, item_raw, " \t");
+                if (item.len == 0) continue;
+                if (std.ascii.eqlIgnoreCase(item, "cpu")) {
+                    picked.cpu = true;
+                    any_valid = true;
+                } else if (std.ascii.eqlIgnoreCase(item, "gpu")) {
+                    picked.gpu = true;
+                    any_valid = true;
+                } else if (std.ascii.eqlIgnoreCase(item, "mem") or std.ascii.eqlIgnoreCase(item, "memory")) {
+                    picked.mem = true;
+                    any_valid = true;
+                } else if (std.ascii.eqlIgnoreCase(item, "disk")) {
+                    picked.disk = true;
+                    any_valid = true;
+                } else if (std.ascii.eqlIgnoreCase(item, "net") or std.ascii.eqlIgnoreCase(item, "network")) {
+                    picked.net = true;
+                    any_valid = true;
+                } else if (std.ascii.eqlIgnoreCase(item, "battery") or std.ascii.eqlIgnoreCase(item, "bat")) {
+                    picked.battery = true;
+                    any_valid = true;
+                } else {
+                    try warn(allocator, &warnings, line_no, "system-stats: unknown module \"{s}\" (want cpu, gpu, mem, disk, net, battery); skipped", .{item});
+                }
+            }
+            // A value that named only unknown modules keeps the previous
+            // setting — bad values keep the default, per contract above.
+            if (any_valid) cfg.system_stats = picked;
         } else if (std.mem.eql(u8, key, "claude-config-dir")) {
             if (value.len == 0) {
                 // Explicit clear: back to auto-discovery.
@@ -588,4 +653,37 @@ test "load reads and parses a real file; fileMtimeNs sees it" {
 
     const mtime = fileMtimeNs(path) orelse return error.TestUnexpectedResult;
     try testing.expect(mtime > 0);
+}
+
+test "system-stats accepts booleans, all/none, and module lists" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const off = try parse(arena, "system-stats = false\n");
+    try testing.expect(!off.config.system_stats.any());
+
+    const back_on = try parse(arena, "system-stats = none\nsystem-stats = all\n");
+    try testing.expect(back_on.config.system_stats.cpu);
+    try testing.expect(back_on.config.system_stats.battery);
+
+    const some = try parse(arena, "system-stats = cpu, gpu, memory\n");
+    try testing.expect(some.config.system_stats.cpu);
+    try testing.expect(some.config.system_stats.gpu);
+    try testing.expect(some.config.system_stats.mem);
+    try testing.expect(!some.config.system_stats.disk);
+    try testing.expect(!some.config.system_stats.net);
+    try testing.expect(!some.config.system_stats.battery);
+    try testing.expectEqual(@as(usize, 0), some.warnings.len);
+}
+
+test "system-stats keeps the default when only unknown modules are named" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const result = try parse(arena, "system-stats = fan, vibes\n");
+    try testing.expect(result.config.system_stats.cpu);
+    try testing.expect(result.config.system_stats.battery);
+    try testing.expectEqual(@as(usize, 2), result.warnings.len);
 }

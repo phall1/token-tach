@@ -48,18 +48,21 @@ pub const Ui = canvas.Ui(Msg);
 // ------------------------------------------------------ window geometry
 
 pub const window_width: f32 = 560;
-pub const window_height: f32 = 420;
+pub const window_height: f32 = 472;
 
 const header_y: f32 = 12;
 const panel_y: f32 = 46;
 const panel_h: f32 = 304;
 const strip_y: f32 = 358;
 const strip_h: f32 = 42;
-const footer_y: f32 = 400;
+const system_y: f32 = 406;
+const system_h: f32 = 40;
+const footer_y: f32 = 452;
 
 const gauge_panel = geometry.RectF.init(14, panel_y, 272, panel_h);
 const limits_panel_rect = geometry.RectF.init(298, panel_y, 246, panel_h);
 const strip_rect = geometry.RectF.init(16, strip_y, 528, strip_h);
+const system_rect = geometry.RectF.init(16, system_y, 528, system_h);
 
 // -------------------------------------------------------- dial geometry
 
@@ -105,7 +108,7 @@ pub const needle_edge_id: canvas.ObjectId = chrome_id_base + 17;
 pub const needle_glow_id: canvas.ObjectId = chrome_id_base + 18;
 
 /// Commands painted UNDER the widget tree (cabin + dial face).
-pub const chrome_prefix_commands: usize = 9;
+pub const chrome_prefix_commands: usize = 10;
 /// Commands painted OVER the widget tree (needle metal + glass).
 pub const chrome_suffix_commands: usize = 7;
 
@@ -157,6 +160,7 @@ pub fn buildChrome(
     try bezelWash(builder, chrome_id_base + 2, gauge_panel, 10);
     try bezelWash(builder, chrome_id_base + 3, limits_panel_rect, 10);
     try bezelWash(builder, chrome_id_base + 4, strip_rect, 7);
+    try bezelWash(builder, chrome_id_base + 10, system_rect, 7);
     try builder.fillPath(.{
         .id = chrome_id_base + 5,
         .elements = circlePath(&dial_face_elems, center, dial_r),
@@ -260,6 +264,7 @@ pub fn rootView(ui: *Ui, model: *const Model) Ui.Node {
     gaugeCluster(ui, &nodes, model);
     limitsPanel(ui, &nodes, model);
     odometerStrip(ui, &nodes, model);
+    systemStrip(ui, &nodes, model);
     push(ui, &nodes, ui.statusBar(.{
         .frame = rect(0, footer_y, window_width, window_height - footer_y),
     }, model.status_text));
@@ -749,6 +754,171 @@ fn odometerStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) v
         .size = .sm,
         .style_tokens = .{ .foreground = .text_muted },
     }, "tok"));
+}
+
+// -------------------------------------------------------- system strip
+
+/// One cell of the system telemetry strip: a label, a monospace reading,
+/// and a windowRow-grammar meter underneath.
+const SysCell = struct {
+    label: []const u8,
+    value: []const u8,
+    meter_frac: f64,
+    ink: Color,
+    /// Width weight: NET carries a two-direction reading and gets a
+    /// wider cell so the value never wraps.
+    weight: f32 = 1,
+};
+
+/// The system telemetry strip: CPU / GPU / MEM / DISK / NET / BAT as
+/// quiet micro-meters in the limits-bar grammar. Cells exist only for
+/// modules that are enabled AND produced a reading — no zeros, no
+/// dashes; on a desktop the battery cell simply is not there.
+fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
+    if (!model.cfg.system_stats.any()) return;
+    const snap = model.system_snap;
+
+    var cells: [6]SysCell = undefined;
+    var count: usize = 0;
+    if (snap.cpu) |s| {
+        cells[count] = .{
+            .label = "CPU",
+            .value = ui.fmt("{d}%", .{pctInt(s.total_frac)}),
+            .meter_frac = s.total_frac,
+            .ink = sysColor(s.total_frac),
+        };
+        count += 1;
+    }
+    if (snap.gpu) |s| {
+        cells[count] = .{
+            .label = "GPU",
+            .value = ui.fmt("{d}%", .{pctInt(s.device_utilization)}),
+            .meter_frac = s.device_utilization,
+            .ink = sysColor(s.device_utilization),
+        };
+        count += 1;
+    }
+    if (snap.mem) |s| {
+        // Memory pressure outranks the raw fraction: the kernel saying
+        // "warn" is truer than any percentage cutoff.
+        const ink = switch (s.pressure) {
+            .critical => theme.red,
+            .warn => theme.amber,
+            .normal, .unknown => sysColor(s.used_frac),
+        };
+        cells[count] = .{
+            .label = "MEM",
+            .value = ui.fmt("{d}%", .{pctInt(s.used_frac)}),
+            .meter_frac = s.used_frac,
+            .ink = ink,
+        };
+        count += 1;
+    }
+    if (snap.disk) |s| {
+        cells[count] = .{
+            .label = "DISK",
+            .value = fmtBytes(ui, s.free_bytes),
+            .meter_frac = s.used_fraction,
+            .ink = if (s.used_fraction >= 0.92) theme.red else if (s.used_fraction >= 0.8) theme.amber else theme.green,
+        };
+        count += 1;
+    }
+    if (snap.net) |s| {
+        // Throughput has no natural 100%; the meter runs against the
+        // aggregator's ratcheted peak, and activity is never a warning.
+        cells[count] = .{
+            .label = "NET",
+            .value = ui.fmt("↓{s} ↑{s}", .{
+                fmtBytes(ui, @intFromFloat(@max(s.in_bytes_per_sec orelse 0, 0))),
+                fmtBytes(ui, @intFromFloat(@max(s.out_bytes_per_sec orelse 0, 0))),
+            }),
+            .meter_frac = snap.net_meter_frac orelse 0,
+            .ink = theme.green,
+            .weight = 1.7,
+        };
+        count += 1;
+    }
+    if (snap.battery) |s| {
+        cells[count] = .{
+            .label = if (s.charging) "BAT+" else "BAT",
+            .value = ui.fmt("{d}%", .{pctInt(s.charge)}),
+            .meter_frac = s.charge,
+            .ink = if (s.charge <= 0.15) theme.red else if (s.charge <= 0.35) theme.amber else theme.green,
+        };
+        count += 1;
+    }
+    if (count == 0) return;
+
+    push(ui, nodes, ui.panel(.{
+        .frame = system_rect,
+        .style = .{ .background = theme.transparent, .border = theme.bezel_edge, .stroke_width = 1, .radius = 7 },
+        .semantics = .{ .label = "System telemetry" },
+    }, .{}));
+
+    const inner_x: f32 = system_rect.x + 14;
+    const inner_w: f32 = system_rect.width - 28;
+    var total_weight: f32 = 0;
+    for (cells[0..count]) |cell| total_weight += cell.weight;
+    const unit_w = inner_w / total_weight;
+    var x = inner_x;
+    for (cells[0..count], 0..) |cell, i| {
+        const cell_w = unit_w * cell.weight;
+        defer x += cell_w;
+        if (i > 0) {
+            push(ui, nodes, ui.panel(.{
+                .frame = rect(x - 8, system_y + 8, 1, system_h - 16),
+                .style = .{ .background = theme.hairline, .radius = 0, .stroke_width = 0 },
+            }, .{}));
+        }
+        push(ui, nodes, ui.text(.{
+            .frame = rect(x, system_y + 7, 34, 13),
+            .size = .sm,
+            .style_tokens = .{ .foreground = .text_muted },
+        }, cell.label));
+        push(ui, nodes, ui.paragraph(.{
+            .frame = rect(x + 22, system_y + 6, cell_w - 38, 14),
+            .text_alignment = .end,
+            .style = .{ .foreground = cell.ink },
+        }, &.{.{ .text = cell.value, .monospace = true, .scale = 0.9 }}));
+
+        // The meter, in the windowRow grammar: track, fill, LED tip glow.
+        const track_w = cell_w - 16;
+        push(ui, nodes, ui.panel(.{
+            .frame = rect(x, system_y + 26, track_w, 5),
+            .style = .{ .background = theme.track, .radius = 2, .stroke_width = 0 },
+        }, .{}));
+        const frac: f32 = @floatCast(std.math.clamp(cell.meter_frac, 0, 1));
+        if (frac > 0) {
+            const fill_w = @max(track_w * frac, 2);
+            push(ui, nodes, ui.panel(.{
+                .frame = rect(x, system_y + 26, fill_w, 5),
+                .style = .{ .background = cell.ink, .radius = 2, .stroke_width = 0 },
+            }, .{}));
+            push(ui, nodes, ui.panel(.{
+                .frame = rect(x + fill_w - 3, system_y + 24, 8, 8),
+                .style = .{ .background = withAlpha(cell.ink, 0.35), .radius = 4, .stroke_width = 0 },
+            }, .{}));
+        }
+    }
+}
+
+/// Utilization thresholds for system meters: quiet green until 70%,
+/// amber to 90%, red past it.
+fn sysColor(frac: f64) Color {
+    if (frac >= 0.9) return theme.red;
+    if (frac >= 0.7) return theme.amber;
+    return theme.green;
+}
+
+fn pctInt(frac: f64) u64 {
+    return @intFromFloat(std.math.clamp(frac, 0, 1) * 100 + 0.5);
+}
+
+fn fmtBytes(ui: *Ui, bytes: u64) []const u8 {
+    const buf = ui.arena.alloc(u8, 16) catch return "";
+    var w = std.Io.Writer.fixed(buf);
+    trayfmt.writeHumanBytes(&w, bytes) catch {};
+    return w.buffered();
 }
 
 // ----------------------------------------------------- render animation
