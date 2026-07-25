@@ -1,4 +1,26 @@
-# HANDOFF — continuation playbook (written 2026-07-09 ~14:00 UTC)
+# HANDOFF — continuation playbook
+
+## 2026-07-25 addendum (read first)
+
+- **v0.6.0 shipped** (collector fleet: 11 zero-config sources). Canonical
+  architecture: per-source modules on tailsource/snapsource generic
+  engines + fleet.zig aggregator. A parallel session's single-module
+  harness.zig implementation was superseded in merge a590907 (reachable
+  at e16dd6d; its contested extra formats are tracked in the
+  "Reconcile contested harness formats" bead).
+- **Coordination rule after that collision**: check `bd list` for
+  in_progress issues AND `git fetch && git log origin/main` before
+  starting work on an open bead — another session may be mid-flight.
+  Claim beads with `bd update <id> --status in_progress` first.
+- **GitHub Actions is DOWN account-wide (billing lock)** — CI and the
+  Homebrew tap's poll are dead until the account is unlocked at
+  github.com/settings/billing. v0.6.0 was released manually
+  (scripts/release --universal → gh release create → direct tap cask
+  commit). Re-enable CI verification once billing is fixed.
+
+---
+
+# Original playbook (written 2026-07-09 ~14:00 UTC)
 
 Audience: a fresh agent (Codex or Claude) picking up token-tach mid-wave.
 The prior orchestrator (Claude, 5h window ~93%) may vanish without warning.
