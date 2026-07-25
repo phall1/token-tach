@@ -38,6 +38,16 @@ pub const tz_spawn_key: u64 = 4;
 pub const creds_spawn_key: u64 = 5;
 pub const catchup_timer_key: u64 = 6;
 pub const ignition_timer_key: u64 = 7;
+/// External-source channel (SDK fx.openChannel): a background thread
+/// samples system telemetry on its own cadence and posts each reading,
+/// so the strip is a PUSHED instrument, not a polled one. Shares the
+/// keyed-effects key space (config_spawn_key is 8).
+pub const system_channel_key: u64 = 9;
+
+/// The telemetry producer's own pace, independent of the 2 s usage
+/// sweep. 1 s keeps the strip lively; the delta-based samplers derive
+/// their rates from real elapsed time, so any interval is exact.
+pub const system_sample_interval_ms: u64 = 1_000;
 
 pub const sweep_interval_ms: u32 = 2_000;
 pub const oauth_gate_interval_ms: u32 = 30_000;
@@ -72,6 +82,10 @@ pub const Msg = union(enum) {
     /// Tray "Settings": open ~/.config/token-tach/config in the default
     /// editor (creating a commented template first if absent).
     open_config,
+    /// A telemetry reading (or channel lifecycle event) posted by the
+    /// system-sampler producer thread through the external-source
+    /// channel (SDK fx.openChannel).
+    system_reading: native_sdk.EffectChannelEvent,
     /// Pointer entered a system-telemetry cell — the footer reveals its
     /// full reading until the paired `hover_clear` (SDK on_hover_enter).
     hover_system: HoverTarget,
@@ -132,6 +146,16 @@ pub const Model = struct {
     /// design — never persisted).
     system_sampler: system.Sampler = system.Sampler.init(),
     system_snap: system.Snapshot = .{},
+    /// True when the sampler channel is unavailable (open refused, spawn
+    /// failed, or the channel closed) and the 2 s sweep must sample
+    /// system telemetry itself. False in the normal push path AND under
+    /// replay (where the journaled channel events drive the strip), so
+    /// the tick never double-samples over the channel.
+    system_tick_fallback: bool = false,
+    /// Back-pressure the producer reported on its last delivered reading
+    /// (posts dropped because the UI drain fell behind) — surfaced so a
+    /// stalled strip is honest, never silent.
+    system_drops: u32 = 0,
     /// Which system cell the pointer is over, if any (pure display —
     /// drives the footer reveal). Null = footer shows the status line.
     hovered_system: ?HoverTarget = null,
@@ -513,8 +537,82 @@ pub fn boot(model: *Model, fx: *Effects) void {
         .output = .collect,
         .on_exit = Effects.exitMsg(.tz_done),
     });
+    openSystemChannel(model, fx);
     refreshDisplay(model);
     startIgnition(model, fx);
+}
+
+// -------------------------------------------------- system telemetry channel
+
+/// Open the external-source channel and launch the sampler thread that
+/// feeds it. The thread owns its own `system.Sampler` (prior counters),
+/// shares no mutable state with the loop, and posts a whole Snapshot per
+/// reading — so the strip updates when the machine changes, not when a
+/// timer fires. Under session replay the open PARKS (`live()` is false):
+/// no thread spawns and the journaled readings drive the strip, keeping
+/// replay offline and deterministic.
+fn openSystemChannel(model: *Model, fx: *Effects) void {
+    const handle = fx.openChannel(.{
+        .key = system_channel_key,
+        .on_event = Effects.channelMsg(.system_reading),
+    });
+    if (handle.live()) {
+        startSystemSampler(handle) catch {
+            // No producer will ever post: retire the occupancy and let
+            // the 2 s sweep sample the strip instead of leaving it dead.
+            fx.closeChannel(system_channel_key);
+            model.system_tick_fallback = true;
+            std.log.warn("system sampler thread failed to spawn — falling back to the sweep", .{});
+        };
+    }
+    // `!handle.live()` is the replay path: the journaled events are the
+    // whole stream, so the tick must NOT also sample (fallback stays false).
+}
+
+fn startSystemSampler(handle: native_sdk.ChannelHandle) std.Thread.SpawnError!void {
+    const thread = try std.Thread.spawn(.{}, systemSamplerMain, .{handle});
+    thread.detach();
+}
+
+/// The producer: sample every module on a fixed cadence, post the whole
+/// Snapshot (a fixed-size POD — memcpy-serialized), and let the post's
+/// answer be the whole protocol. `.closed` ends the occupancy (app
+/// teardown or a closeChannel) and the thread returns; the
+/// generation-stamped handle makes a post after close safe without a
+/// join. Config filtering happens on the loop thread (mask on receipt),
+/// so this stays a dumb, allocation-free sampler.
+fn systemSamplerMain(handle: native_sdk.ChannelHandle) void {
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var sampler = system.Sampler.init();
+    const all = system.Enabled{};
+    while (true) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(system_sample_interval_ms), .awake) catch return;
+        const snap = sampler.sample(all);
+        switch (handle.post(std.mem.asBytes(&snap))) {
+            .accepted, .dropped_full => {},
+            .dropped_oversized => unreachable, // a fixed-size Snapshot is far under the bound
+            .closed => return,
+        }
+    }
+}
+
+/// Mask a producer Snapshot down to the modules the config currently
+/// enables — done on the loop thread so live config reloads take effect
+/// (the producer always samples everything). Meter fractions ride their
+/// module: net's meter is meaningless without the net reading.
+fn maskSystemSnapshot(full: system.Snapshot, enabled: config.SystemStats) system.Snapshot {
+    return .{
+        .cpu = if (enabled.cpu) full.cpu else null,
+        .gpu = if (enabled.gpu) full.gpu else null,
+        .mem = if (enabled.mem) full.mem else null,
+        .disk = if (enabled.disk) full.disk else null,
+        .net = if (enabled.net) full.net else null,
+        .battery = if (enabled.battery) full.battery else null,
+        .net_meter_frac = if (enabled.net) full.net_meter_frac else null,
+        .disk_io_meter_frac = if (enabled.disk) full.disk_io_meter_frac else null,
+    };
 }
 
 /// Key-on: arm the ignition sweep (display-only) and the one-shot
@@ -757,9 +855,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 refreshDisplay(model);
             }
             applyLaunchAtLogin(model, fx);
-            // Live system telemetry every tick, even mid-catch-up — it
-            // does not touch the usage tailers and must not wait on them.
-            sampleSystem(model);
+            // System telemetry normally arrives PUSHED through the
+            // sampler channel; the sweep samples it only when that
+            // channel is unavailable (spawn failed / closed / refused).
+            if (model.system_tick_fallback) sampleSystem(model);
             // While catch-up owns the tailers, the steady usage sweep
             // stands down (offsets make overlap safe, but it's wasted
             // work); refreshDisplay still runs so the new system sample
@@ -816,6 +915,27 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             startIgnition(model, fx);
         },
         .open_config => openConfig(model, fx),
+        .system_reading => |event| {
+            model.now_ms = fx.wallMs();
+            switch (event.kind) {
+                .data => {
+                    // The producer posts a whole fixed-size Snapshot;
+                    // guard the length so a stray payload can't misread.
+                    if (event.bytes.len == @sizeOf(system.Snapshot)) {
+                        const full = std.mem.bytesToValue(system.Snapshot, event.bytes[0..@sizeOf(system.Snapshot)]);
+                        model.system_snap = maskSystemSnapshot(full, model.cfg.system_stats);
+                        model.system_drops = event.dropped_total;
+                        refreshDisplay(model);
+                    }
+                },
+                // The channel ended (teardown) or the open was refused —
+                // resume sampling on the sweep so the strip stays live.
+                .closed, .rejected => {
+                    model.system_tick_fallback = true;
+                    model.system_drops = event.dropped_total;
+                },
+            }
+        },
         // Hover reveal is pure display: set the target (or clear it) and
         // let the rebuild re-render the footer. Cheap — hover Msgs fire
         // on containment edges, never per pointer move.
@@ -1623,6 +1743,41 @@ test "month rollup covered cost excludes API-billed agents" {
     model.ledger = ledger;
     const value = subscriptionValue(&model);
     try testing.expectApproxEqAbs(@as(f64, 120.0 / 220.0), value.multipleLowerBound(rollup.covered_cost_usd).?, 1e-9);
+}
+
+test "system snapshot round-trips through the channel byte encoding" {
+    // The producer posts std.mem.asBytes(&snap); the loop decodes with
+    // bytesToValue. A fixed-size POD Snapshot must survive that verbatim.
+    const snap = system.Snapshot{
+        .cpu = .{ .total_frac = 0.42, .core_count = 14, .load_avg_1m = 3.25, .p_cluster_frac = 0.64, .e_cluster_frac = 1.0 },
+        .mem = .{ .used_bytes = 40_000_000_000, .total_bytes = 51_500_000_000, .used_frac = 0.777, .pressure = .warn },
+        .net = .{ .total_bytes_in = 1, .total_bytes_out = 2, .in_bytes_per_sec = 1_230_000, .out_bytes_per_sec = 88_000 },
+        .net_meter_frac = 0.4,
+    };
+    const bytes = std.mem.asBytes(&snap);
+    try testing.expectEqual(@sizeOf(system.Snapshot), bytes.len);
+    const back = std.mem.bytesToValue(system.Snapshot, bytes);
+    try testing.expectEqual(snap.cpu.?.core_count, back.cpu.?.core_count);
+    try testing.expectEqual(snap.cpu.?.p_cluster_frac.?, back.cpu.?.p_cluster_frac.?);
+    try testing.expectEqual(snap.mem.?.pressure, back.mem.?.pressure);
+    try testing.expectEqual(snap.net.?.in_bytes_per_sec.?, back.net.?.in_bytes_per_sec.?);
+    try testing.expectEqual(snap.net_meter_frac.?, back.net_meter_frac.?);
+    try testing.expect(back.gpu == null and back.disk == null and back.battery == null);
+}
+
+test "channel snapshot is masked to the config-enabled modules on receipt" {
+    const full = system.Snapshot{
+        .cpu = .{ .total_frac = 0.4, .core_count = 8, .load_avg_1m = 1, .p_cluster_frac = null, .e_cluster_frac = null },
+        .gpu = .{ .device_utilization = 0.1 },
+        .net = .{ .total_bytes_in = 0, .total_bytes_out = 0, .in_bytes_per_sec = 5, .out_bytes_per_sec = 6 },
+        .net_meter_frac = 0.3,
+    };
+    // Only CPU enabled: gpu and net (and net's meter) are dropped.
+    const masked = maskSystemSnapshot(full, .{ .cpu = true, .gpu = false, .mem = false, .disk = false, .net = false, .battery = false });
+    try testing.expect(masked.cpu != null);
+    try testing.expect(masked.gpu == null);
+    try testing.expect(masked.net == null);
+    try testing.expect(masked.net_meter_frac == null);
 }
 
 test "trailing daily cost fills oldest-first with zeros for silent days" {
