@@ -14,6 +14,8 @@ const config = @import("core/config.zig");
 const claude = @import("core/claude.zig");
 const codex = @import("core/codex.zig");
 const opencode = @import("core/opencode.zig");
+const snapsource = @import("core/snapsource.zig");
+const fleet = @import("core/fleet.zig");
 const pricing = @import("core/pricing.zig");
 const ledger_mod = @import("core/ledger.zig");
 const statefile = @import("core/statefile.zig");
@@ -96,6 +98,11 @@ pub const Model = struct {
     claude_roots: []const []const u8 = &.{},
     codex_roots: []const []const u8 = &.{},
     opencode_db: []const u8 = "",
+
+    /// The tt-hr8 collector fleet (pi/gemini/qwen/kimi/goose/kilo/
+    /// cline/roo). Built in setup; null until ready (or when fleet
+    /// construction failed — the core agents still run).
+    fleet: ?fleet.Fleet = null,
 
     prices: pricing.Db = undefined,
     ledger: ledger_mod.Ledger = undefined,
@@ -281,7 +288,39 @@ pub const Env = struct {
     opencode_db: ?[]const u8 = null,
     xdg_data_home: ?[]const u8 = null,
     xdg_state_home: ?[]const u8 = null,
+    pi_home: ?[]const u8 = null,
+    gemini_cli_home: ?[]const u8 = null,
+    qwen_runtime_dir: ?[]const u8 = null,
+    qwen_home: ?[]const u8 = null,
+    kimi_share_dir: ?[]const u8 = null,
+    goose_path_root: ?[]const u8 = null,
+    kilo_db: ?[]const u8 = null,
+    cline_dir: ?[]const u8 = null,
+    cline_data_dir: ?[]const u8 = null,
 };
+
+/// engine.Env -> fleet.Env, field by field (the two structs mirror each
+/// other but stay decoupled, same pattern as systemEnabled).
+fn fleetEnv(env: Env) fleet.Env {
+    return .{
+        .home = env.home,
+        .pi_home = env.pi_home,
+        .gemini_cli_home = env.gemini_cli_home,
+        .qwen_runtime_dir = env.qwen_runtime_dir,
+        .qwen_home = env.qwen_home,
+        .kimi_share_dir = env.kimi_share_dir,
+        .goose_path_root = env.goose_path_root,
+        .xdg_data_home = env.xdg_data_home,
+        .kilo_db = env.kilo_db,
+        .cline_dir = env.cline_dir,
+        .cline_data_dir = env.cline_data_dir,
+    };
+}
+
+fn fleetPtr(model: *Model) ?*fleet.Fleet {
+    if (model.fleet) |*fl| return fl;
+    return null;
+}
 
 /// Persist tailer+ledger state every N sweep ticks (N × 2 s ≈ 60 s).
 pub const state_save_ticks: u32 = 30;
@@ -318,6 +357,12 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
     model.claude_tailer = claude.Tailer.init(allocator);
     model.codex_tailer = codex.Tailer.init(allocator);
     model.opencode_poller = opencode.Poller.init(allocator);
+    // Collector fleet AFTER config load (env drives its roots). A failed
+    // build degrades to core-agents-only rather than blocking startup.
+    model.fleet = fleet.Fleet.init(allocator, fleetEnv(env)) catch |err| blk: {
+        std.log.warn("collector fleet init failed: {s}", .{@errorName(err)});
+        break :blk null;
+    };
     model.prices = try pricing.Db.init(allocator);
     model.ledger = ledger_mod.Ledger.init(allocator, 0);
 
@@ -332,6 +377,7 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
             &model.claude_tailer,
             &model.codex_tailer,
             &model.opencode_poller,
+            fleetPtr(model),
             &model.ledger,
         ) catch .invalid; // OOM: hydration may be partial — reset below.
         switch (outcome) {
@@ -346,6 +392,8 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
                 model.codex_tailer = codex.Tailer.init(allocator);
                 model.opencode_poller = opencode.Poller.init(allocator);
                 model.ledger = ledger_mod.Ledger.init(allocator, 0);
+                if (model.fleet) |*fl| fl.deinit();
+                model.fleet = fleet.Fleet.init(allocator, fleetEnv(env)) catch null;
                 std.log.warn("state file invalid — falling back to full catch-up", .{});
             },
         }
@@ -665,7 +713,7 @@ fn saveStateNow(model: *Model) void {
     if (model.state_path.len == 0) return;
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
-    statefile.save(model.allocator, io, model.state_path, &model.claude_tailer, &model.codex_tailer, &model.opencode_poller, &model.ledger) catch |err| {
+    statefile.save(model.allocator, io, model.state_path, &model.claude_tailer, &model.codex_tailer, &model.opencode_poller, fleetPtr(model), &model.ledger) catch |err| {
         std.log.warn("state save failed: {s}", .{@errorName(err)});
         return;
     };
@@ -828,6 +876,22 @@ fn sweepOnce(model: *Model) void {
         for (changes.items) |change| ingestOpenCodeChange(model, change);
     }
 
+    // The tt-hr8 collector fleet: JSONL tailers + SQLite pollers append
+    // events, snapshot pollers append add/replace changes. Per-source
+    // failures are logged inside sweep and never stall the tick.
+    if (model.fleet) |*fl| {
+        var events: std.ArrayList(types.UsageEvent) = .empty;
+        defer events.deinit(arena);
+        var changes: std.ArrayList(snapsource.Change) = .empty;
+        defer {
+            snapsource.freeChanges(arena, changes.items);
+            changes.deinit(arena);
+        }
+        fl.sweep(arena, io, model.cfg.sources, model.now_ms, &events, &changes);
+        for (events.items) |ev| ingest(model, ev);
+        for (changes.items) |change| ingestChange(model, change.previous, change.current);
+    }
+
     // System telemetry rides the same sweep: microseconds of syscalls,
     // no subprocesses. A config with the strip off skips the calls and
     // clears the snapshot so the view (and tray tokens) go quiet.
@@ -853,22 +917,30 @@ fn ingest(model: *Model, ev: types.UsageEvent) void {
 }
 
 fn ingestOpenCodeChange(model: *Model, change: opencode.Change) void {
-    const new_cost = model.prices.costOf(change.current);
-    if (change.previous) |old| {
-        model.ledger.replace(old, model.prices.costOf(old), change.current, new_cost) catch return;
+    ingestChange(model, change.previous, change.current);
+}
+
+/// Shared add/replace ledgering for row-shaped sources (opencode rows
+/// and the fleet's snapshot pollers — same Change shape, distinct
+/// types, so the helper takes the two events directly). A replace
+/// feeds only the token DELTA to the burn gauge.
+fn ingestChange(model: *Model, previous: ?types.UsageEvent, current: types.UsageEvent) void {
+    const new_cost = model.prices.costOf(current);
+    if (previous) |old| {
+        model.ledger.replace(old, model.prices.costOf(old), current, new_cost) catch return;
         const delta = types.UsageEvent{
-            .agent = .opencode,
-            .timestamp_ms = change.current.timestamp_ms,
-            .model = change.current.model,
-            .input_tokens = change.current.input_tokens -| old.input_tokens,
-            .output_tokens = change.current.output_tokens -| old.output_tokens,
-            .cache_creation_tokens = change.current.cache_creation_tokens -| old.cache_creation_tokens,
-            .cache_read_tokens = change.current.cache_read_tokens -| old.cache_read_tokens,
+            .agent = current.agent,
+            .timestamp_ms = current.timestamp_ms,
+            .model = current.model,
+            .input_tokens = current.input_tokens -| old.input_tokens,
+            .output_tokens = current.output_tokens -| old.output_tokens,
+            .cache_creation_tokens = current.cache_creation_tokens -| old.cache_creation_tokens,
+            .cache_read_tokens = current.cache_read_tokens -| old.cache_read_tokens,
         };
         model.burn.addTokens(delta.timestamp_ms, predict.limitWeightedTokens(delta));
     } else {
-        model.ledger.add(change.current, new_cost) catch return;
-        model.burn.addTokens(change.current.timestamp_ms, predict.limitWeightedTokens(change.current));
+        model.ledger.add(current, new_cost) catch return;
+        model.burn.addTokens(current.timestamp_ms, predict.limitWeightedTokens(current));
     }
     model.state_dirty = true;
 }

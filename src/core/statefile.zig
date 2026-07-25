@@ -8,7 +8,7 @@
 //! file, and re-hydrates freshly-initialized tailers/ledger from it so
 //! catch-up only touches bytes appended since the last save.
 //!
-//! Format: a single JSON object, `{"version": 2, ...}`, written atomically
+//! Format: a single JSON object, `{"version": 3, ...}`, written atomically
 //! (tmp file + rename) at a caller-provided path (`defaultPath` yields
 //! `$XDG_STATE_HOME/token-tach/tailers.json`, falling back to
 //! `~/.local/state/...`) with mode 0600 inside a mode-0700 app state directory.
@@ -42,9 +42,15 @@ const types = @import("types.zig");
 const claude = @import("claude.zig");
 const codex = @import("codex.zig");
 const opencode = @import("opencode.zig");
+const snapsource = @import("snapsource.zig");
+const fleet_mod = @import("fleet.zig");
 const ledger_mod = @import("ledger.zig");
 
-pub const format_version: u32 = 2;
+/// v3 adds the collector-fleet sections (`tailers`, `sqlite`,
+/// `snapshots`) and `ledger.others`. v2 files still restore — the fleet
+/// sections simply default to empty (cold catch-up for those sources).
+pub const format_version: u32 = 3;
+const min_supported_version: u32 = 2;
 
 /// Hard ceiling on a plausible state file; anything bigger is corrupt.
 const max_state_bytes = 64 * 1024 * 1024;
@@ -128,12 +134,57 @@ const WireLimits = struct {
 const WireDay = struct { day: i64, totals: WireTotals };
 const WireKeyed = struct { key: []const u8, totals: WireTotals };
 
+/// One fleet JSONL-tailer file: line-boundary offset plus the cwd
+/// attribution captured from meta lines before that offset.
+const WireTailerFile = struct {
+    path: []const u8,
+    offset: u64,
+    cwd: []const u8 = "",
+};
+
+/// One fleet JSONL tailer, keyed by the agent's stable label.
+const WireTailer = struct {
+    agent: []const u8,
+    files: []const WireTailerFile = &.{},
+    seen: []const []const u8 = &.{},
+};
+
+/// One fleet SQLite poller's high-water mark (goose rowid / kilo
+/// time_updated ms), keyed by the agent's stable label.
+const WireSqlite = struct {
+    agent: []const u8,
+    high_water: i64 = 0,
+};
+
+/// One snapshot-poller file: the mtime/size change gate plus every
+/// stable record baseline (snapsource.Poller.WireRecord is JSON-shaped).
+const WireSnapFile = struct {
+    path: []const u8,
+    mtime_ns: i96 = 0,
+    size: u64 = 0,
+    records: []const snapsource.Poller.WireRecord = &.{},
+};
+
+/// One fleet snapshot poller, keyed by its stable fleet.SnapName tag.
+const WireSnapPoller = struct {
+    name: []const u8,
+    files: []const WireSnapFile = &.{},
+};
+
+/// Per-agent all-time totals for every agent beyond claude/codex/
+/// opencode that has events, keyed by the agent's stable label.
+const WireAgentTotals = struct {
+    agent: []const u8,
+    totals: WireTotals = .{},
+};
+
 const WireLedger = struct {
     tz_offset_min: i32 = 0,
     all: WireTotals = .{},
     claude: WireTotals = .{},
     codex: WireTotals = .{},
     opencode: WireTotals = .{},
+    others: []const WireAgentTotals = &.{},
     per_day: []const WireDay = &.{},
     per_model: []const WireKeyed = &.{},
     per_project: []const WireKeyed = &.{},
@@ -146,8 +197,22 @@ const WireState = struct {
     codex_files: []const WireCodexFile = &.{},
     codex_limits: ?WireLimits = null,
     opencode_rows: []const WireOpenCodeRow = &.{},
+    tailers: []const WireTailer = &.{},
+    sqlite: []const WireSqlite = &.{},
+    snapshots: []const WireSnapPoller = &.{},
     ledger: WireLedger = .{},
 };
+
+/// Stable label -> Agent (labels are the persisted identity; enum
+/// ordinals may reorder freely across versions). Unknown labels are
+/// skipped by callers, so removed agents degrade gracefully.
+fn agentFromLabel(label: []const u8) ?types.Agent {
+    inline for (@typeInfo(types.Agent).@"enum".fields) |field| {
+        const agent: types.Agent = @enumFromInt(field.value);
+        if (std.mem.eql(u8, agent.label(), label)) return agent;
+    }
+    return null;
+}
 
 fn wireTotals(t: ledger_mod.Totals) WireTotals {
     return .{
@@ -175,9 +240,11 @@ fn unwireTotals(w: WireTotals) ledger_mod.Totals {
 // Save
 // ---------------------------------------------------------------------------
 
-/// Snapshot both tailers and the ledger to `path` (atomic: `<path>.tmp` +
-/// rename). Parent directories are created as needed. Call only from the
-/// engine thread — the tailers must not be mid-feed.
+/// Snapshot the tailers, the collector fleet (when given), and the
+/// ledger to `path` (atomic: `<path>.tmp` + rename). Parent directories
+/// are created as needed. Call only from the engine thread — the
+/// tailers must not be mid-feed. `fleet_opt` may be null (tests that
+/// don't care); the fleet sections are then omitted.
 pub fn save(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -185,13 +252,14 @@ pub fn save(
     claude_tailer: *const claude.Tailer,
     codex_tailer: *const codex.Tailer,
     opencode_poller: *const opencode.Poller,
+    fleet_opt: ?*const fleet_mod.Fleet,
     ledger: *const ledger_mod.Ledger,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const state = try toWire(arena, claude_tailer, codex_tailer, opencode_poller, ledger);
+    const state = try toWire(arena, claude_tailer, codex_tailer, opencode_poller, fleet_opt, ledger);
     const json = try std.json.Stringify.valueAlloc(arena, state, .{});
 
     var cwd = std.Io.Dir.cwd();
@@ -218,6 +286,7 @@ fn toWire(
     claude_tailer: *const claude.Tailer,
     codex_tailer: *const codex.Tailer,
     opencode_poller: *const opencode.Poller,
+    fleet_opt: ?*const fleet_mod.Fleet,
     ledger: *const ledger_mod.Ledger,
 ) !WireState {
     var state = WireState{ .version = format_version };
@@ -295,6 +364,66 @@ fn toWire(
         }
     }
 
+    // Collector fleet: JSONL offsets + dedup keys, SQLite high-water
+    // marks, and snapshot-poller record baselines.
+    if (fleet_opt) |fl| {
+        var tailers: std.ArrayList(WireTailer) = .empty;
+        for (fleet_mod.jsonl_agents) |agent| {
+            const t = fl.tailerConst(agent) orelse continue;
+            var files: std.ArrayList(WireTailerFile) = .empty;
+            var it = t.files();
+            while (it.next()) |entry| {
+                try files.append(arena, .{
+                    .path = entry.path,
+                    .offset = entry.offset,
+                    .cwd = entry.cwd,
+                });
+            }
+            var seen: std.ArrayList([]const u8) = .empty;
+            var kit = t.seen.keyIterator();
+            while (kit.next()) |key| try seen.append(arena, key.*);
+            if (files.items.len == 0 and seen.items.len == 0) continue;
+            try tailers.append(arena, .{
+                .agent = agent.label(),
+                .files = try files.toOwnedSlice(arena),
+                .seen = try seen.toOwnedSlice(arena),
+            });
+        }
+        state.tailers = try tailers.toOwnedSlice(arena);
+
+        var sqlite: std.ArrayList(WireSqlite) = .empty;
+        for (fleet_mod.sqlite_agents) |agent| {
+            const high_water = fl.highWater(agent) orelse continue;
+            if (high_water == 0) continue;
+            try sqlite.append(arena, .{ .agent = agent.label(), .high_water = high_water });
+        }
+        state.sqlite = try sqlite.toOwnedSlice(arena);
+
+        var snaps: std.ArrayList(WireSnapPoller) = .empty;
+        inline for (comptime std.enums.values(fleet_mod.SnapName)) |name| {
+            var files: std.ArrayList(WireSnapFile) = .empty;
+            var fit = fl.snapPollerConst(name).files();
+            while (fit.next()) |entry| {
+                var records: std.ArrayList(snapsource.Poller.WireRecord) = .empty;
+                var rit = entry.records;
+                while (rit.next()) |record| try records.append(arena, record);
+                try files.append(arena, .{
+                    .path = entry.path,
+                    .mtime_ns = entry.mtime_ns,
+                    .size = entry.size,
+                    .records = try records.toOwnedSlice(arena),
+                });
+            }
+            if (files.items.len != 0) {
+                try snaps.append(arena, .{
+                    .name = @tagName(name),
+                    .files = try files.toOwnedSlice(arena),
+                });
+            }
+        }
+        state.snapshots = try snaps.toOwnedSlice(arena);
+    }
+
     // Ledger rollups.
     {
         var days: std.ArrayList(WireDay) = .empty;
@@ -312,12 +441,29 @@ fn toWire(
         while (pit.next()) |entry| {
             try projects.append(arena, .{ .key = entry.key_ptr.*, .totals = wireTotals(entry.value_ptr.*) });
         }
+        var others: std.ArrayList(WireAgentTotals) = .empty;
+        inline for (@typeInfo(types.Agent).@"enum".fields) |field| {
+            const agent: types.Agent = @enumFromInt(field.value);
+            switch (agent) {
+                .claude, .codex, .opencode => {},
+                else => {
+                    const totals = ledger.per_agent.get(agent);
+                    if (totals.events != 0) {
+                        try others.append(arena, .{
+                            .agent = agent.label(),
+                            .totals = wireTotals(totals),
+                        });
+                    }
+                },
+            }
+        }
         state.ledger = .{
             .tz_offset_min = ledger.tz_offset_min,
             .all = wireTotals(ledger.all),
             .claude = wireTotals(ledger.per_agent.get(.claude)),
             .codex = wireTotals(ledger.per_agent.get(.codex)),
             .opencode = wireTotals(ledger.per_agent.get(.opencode)),
+            .others = try others.toOwnedSlice(arena),
             .per_day = try days.toOwnedSlice(arena),
             .per_model = try models.toOwnedSlice(arena),
             .per_project = try projects.toOwnedSlice(arena),
@@ -331,11 +477,13 @@ fn toWire(
 // Restore
 // ---------------------------------------------------------------------------
 
-/// Re-hydrate freshly-initialized tailers and ledger from `path`. Never
-/// touches the arguments unless the file parsed cleanly at the right
-/// version (so `.absent`/`.invalid` leave them pristine for a full
-/// catch-up). Only OutOfMemory propagates — and can leave the arguments
-/// partially hydrated; treat it as fatal or reinit everything.
+/// Re-hydrate freshly-initialized tailers, the collector fleet (when
+/// given), and the ledger from `path`. Accepts v2 (fleet sections
+/// default-empty — those sources cold-scan) and v3. Never touches the
+/// arguments unless the file parsed cleanly at a supported version (so
+/// `.absent`/`.invalid` leave them pristine for a full catch-up). Only
+/// OutOfMemory propagates — and can leave the arguments partially
+/// hydrated; treat it as fatal or reinit everything.
 pub fn restore(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -343,6 +491,7 @@ pub fn restore(
     claude_tailer: *claude.Tailer,
     codex_tailer: *codex.Tailer,
     opencode_poller: *opencode.Poller,
+    fleet_opt: ?*fleet_mod.Fleet,
     ledger: *ledger_mod.Ledger,
 ) error{OutOfMemory}!RestoreOutcome {
     var cwd = std.Io.Dir.cwd();
@@ -361,7 +510,7 @@ pub fn restore(
         error.OutOfMemory => return error.OutOfMemory,
         else => return .invalid,
     };
-    if (state.version != format_version) return .invalid;
+    if (state.version < min_supported_version or state.version > format_version) return .invalid;
 
     for (state.claude_files) |f| try claude_tailer.restoreFile(f.path, f.offset);
     for (state.claude_seen) |key| try claude_tailer.restoreSeen(key);
@@ -395,11 +544,36 @@ pub fn restore(
         });
     }
 
+    if (fleet_opt) |fl| {
+        for (state.tailers) |wt| {
+            const agent = agentFromLabel(wt.agent) orelse continue;
+            const t = fl.tailer(agent) orelse continue;
+            for (wt.files) |f| {
+                try t.seedOffset(f.path, f.offset);
+                if (f.cwd.len > 0) try t.seedCwd(f.path, f.cwd);
+            }
+            for (wt.seen) |key| try t.seedSeen(key);
+        }
+        for (state.sqlite) |ws| {
+            const agent = agentFromLabel(ws.agent) orelse continue;
+            fl.seedHighWater(agent, ws.high_water);
+        }
+        for (state.snapshots) |wp| {
+            const name = std.meta.stringToEnum(fleet_mod.SnapName, wp.name) orelse continue;
+            const poller = fl.snapPoller(name);
+            for (wp.files) |f| try poller.seed(f.path, f.mtime_ns, f.size, f.records);
+        }
+    }
+
     ledger.tz_offset_min = state.ledger.tz_offset_min;
     ledger.all = unwireTotals(state.ledger.all);
     ledger.per_agent.set(.claude, unwireTotals(state.ledger.claude));
     ledger.per_agent.set(.codex, unwireTotals(state.ledger.codex));
     ledger.per_agent.set(.opencode, unwireTotals(state.ledger.opencode));
+    for (state.ledger.others) |o| {
+        const agent = agentFromLabel(o.agent) orelse continue;
+        ledger.per_agent.set(agent, unwireTotals(o.totals));
+    }
     for (state.ledger.per_day) |d| try ledger.putDay(d.day, unwireTotals(d.totals));
     for (state.ledger.per_model) |m| try ledger.putModel(m.key, unwireTotals(m.totals));
     for (state.ledger.per_project) |p| try ledger.putProject(p.key, unwireTotals(p.totals));
@@ -415,6 +589,8 @@ const testing = std.testing;
 
 const claude_fixture = @embedFile("fixtures/claude/session1.jsonl");
 const codex_fixture = @embedFile("fixtures/codex/rollout-basic.jsonl");
+const pi_fixture = @embedFile("fixtures/pi/session1.jsonl");
+const cline_sdk_fixture = @embedFile("fixtures/cline/session1.messages.json");
 
 const claude_session_id = "11111111-2222-4333-8444-555555555555";
 const claude_session_rel = "claude/projects/slug/" ++ claude_session_id ++ ".jsonl";
@@ -524,15 +700,69 @@ test "statefile round-trip: identical totals, no re-reads, dedup survives restar
     };
     try h1.opencode_poller.restore("msg_state", 1_783_483_000_100, opencode_event);
     try h1.ledger.add(opencode_event, 0.0042);
-    try save(testing.allocator, io, state_path, &h1.claude_tailer, &h1.codex_tailer, &h1.opencode_poller, &h1.ledger);
+
+    // Collector fleet: pi JSONL history + a cline SDK session store on
+    // disk, goose/kilo high-water marks seeded as if polled.
+    try tmp.dir.createDirPath(io, "pihome/agent/sessions");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pihome/agent/sessions/2026-01-05T00-00-00_019faaaa-bbbb-7ccc-8ddd-eeeeffff0001.jsonl",
+        .data = pi_fixture,
+    });
+    try tmp.dir.createDirPath(io, "clinedata/sessions/s1");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "clinedata/sessions/s1/s1.messages.json",
+        .data = cline_sdk_fixture,
+    });
+    const fleet_env = fleet_mod.Env{
+        .home = try std.fmt.allocPrint(arena, "{s}/home", .{base}),
+        .pi_home = try std.fmt.allocPrint(arena, "{s}/pihome", .{base}),
+        .cline_data_dir = try std.fmt.allocPrint(arena, "{s}/clinedata", .{base}),
+    };
+    var f1 = try fleet_mod.Fleet.init(testing.allocator, fleet_env);
+    defer f1.deinit();
+    {
+        var events: std.ArrayList(types.UsageEvent) = .empty;
+        var changes: std.ArrayList(snapsource.Change) = .empty;
+        f1.sweep(arena, io, .{}, 1_000_000, &events, &changes);
+        try testing.expectEqual(@as(usize, 2), events.items.len); // pi fixture
+        try testing.expectEqual(@as(usize, 2), changes.items.len); // cline sdk fixture
+        for (events.items) |ev| try h1.ledger.add(ev, 0.001);
+        for (changes.items) |change| try h1.ledger.add(change.current, 0.002);
+    }
+    f1.seedHighWater(.goose, 42);
+    f1.seedHighWater(.kilo, 1_234);
+
+    try save(testing.allocator, io, state_path, &h1.claude_tailer, &h1.codex_tailer, &h1.opencode_poller, &f1, &h1.ledger);
 
     // Fresh everything; restore.
     var h2 = Harness.init(0);
     defer h2.deinit();
+    var f2 = try fleet_mod.Fleet.init(testing.allocator, fleet_env);
+    defer f2.deinit();
     try testing.expectEqual(
         RestoreOutcome.restored,
-        try restore(testing.allocator, io, state_path, &h2.claude_tailer, &h2.codex_tailer, &h2.opencode_poller, &h2.ledger),
+        try restore(testing.allocator, io, state_path, &h2.claude_tailer, &h2.codex_tailer, &h2.opencode_poller, &f2, &h2.ledger),
     );
+
+    // Fleet state survived: pi offsets sit at EOF with the dedup keys
+    // back, the cline snapshot gate holds, high-water marks persist —
+    // a post-restore sweep re-reads and re-emits nothing.
+    try testing.expectEqual(f1.pi.seen.count(), f2.pi.seen.count());
+    try testing.expect(f2.pi.seen.count() > 0);
+    try testing.expectEqual(@as(?i64, 42), f2.highWater(.goose));
+    try testing.expectEqual(@as(?i64, 1_234), f2.highWater(.kilo));
+    {
+        var events: std.ArrayList(types.UsageEvent) = .empty;
+        var changes: std.ArrayList(snapsource.Change) = .empty;
+        f2.sweep(arena, io, .{}, 1_060_000, &events, &changes);
+        try testing.expectEqual(@as(usize, 0), events.items.len);
+        try testing.expectEqual(@as(usize, 0), changes.items.len);
+    }
+    // ledger.others round-trips the fleet agents' rollups bit-exactly.
+    try expectTotalsEqual(h1.ledger.forAgent(.pi), h2.ledger.forAgent(.pi));
+    try expectTotalsEqual(h1.ledger.forAgent(.cline), h2.ledger.forAgent(.cline));
+    try testing.expectEqual(@as(u64, 2), h2.ledger.forAgent(.pi).events);
+    try testing.expectEqual(@as(u64, 2), h2.ledger.forAgent(.cline).events);
 
     // Ledger rollups come back bit-identical (including the tz offset the
     // day buckets were computed with).
@@ -643,7 +873,7 @@ test "restore outcomes: absent, corrupted, and version mismatch leave state pris
     const missing = try std.fmt.allocPrint(arena, "{s}/nope.json", .{base});
     try testing.expectEqual(
         RestoreOutcome.absent,
-        try restore(testing.allocator, io, missing, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.ledger),
+        try restore(testing.allocator, io, missing, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, null, &h.ledger),
     );
 
     // Corrupted JSON.
@@ -651,7 +881,7 @@ test "restore outcomes: absent, corrupted, and version mismatch leave state pris
     const corrupt = try std.fmt.allocPrint(arena, "{s}/corrupt.json", .{base});
     try testing.expectEqual(
         RestoreOutcome.invalid,
-        try restore(testing.allocator, io, corrupt, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.ledger),
+        try restore(testing.allocator, io, corrupt, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, null, &h.ledger),
     );
 
     // Valid JSON, wrong version (with fields v1 has never heard of).
@@ -662,7 +892,18 @@ test "restore outcomes: absent, corrupted, and version mismatch leave state pris
     const future = try std.fmt.allocPrint(arena, "{s}/future.json", .{base});
     try testing.expectEqual(
         RestoreOutcome.invalid,
-        try restore(testing.allocator, io, future, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.ledger),
+        try restore(testing.allocator, io, future, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, null, &h.ledger),
+    );
+
+    // Pre-fleet v1 is below the supported floor.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "v1.json",
+        .data = "{\"version\": 1, \"claude_files\": [{\"path\": \"/x\", \"offset\": 5}]}",
+    });
+    const v1 = try std.fmt.allocPrint(arena, "{s}/v1.json", .{base});
+    try testing.expectEqual(
+        RestoreOutcome.invalid,
+        try restore(testing.allocator, io, v1, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, null, &h.ledger),
     );
 
     // Nothing leaked into the state on any failed path.
@@ -671,6 +912,47 @@ test "restore outcomes: absent, corrupted, and version mismatch leave state pris
     try testing.expectEqual(@as(u32, 0), h.codex_tailer.files.count());
     try testing.expectEqual(@as(u64, 0), h.ledger.all.events);
     try testing.expectEqual(@as(usize, 0), h.ledger.per_day.count());
+}
+
+test "a version-2 state file restores with fleet sections default-empty" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A minimal pre-fleet save: legacy sections only.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "v2.json",
+        .data = "{\"version\":2,\"claude_files\":[{\"path\":\"/x/s1.jsonl\",\"offset\":57}]," ++
+            "\"claude_seen\":[\"msg_v2|req_v2\"]," ++
+            "\"ledger\":{\"tz_offset_min\":-300,\"all\":{\"input\":10,\"output\":2,\"events\":1}," ++
+            "\"claude\":{\"input\":10,\"output\":2,\"events\":1}}}",
+    });
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/v2.json", .{base});
+
+    var h = Harness.init(0);
+    defer h.deinit();
+    var fl = try fleet_mod.Fleet.init(testing.allocator, .{ .home = "/nonexistent/v2-test" });
+    defer fl.deinit();
+
+    try testing.expectEqual(
+        RestoreOutcome.restored,
+        try restore(testing.allocator, io, path, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &fl, &h.ledger),
+    );
+    // Legacy sections hydrated as always…
+    try testing.expectEqual(@as(u32, 1), h.claude_tailer.files.count());
+    try testing.expectEqual(@as(u32, 1), h.claude_tailer.seen.count());
+    try testing.expectEqual(@as(i32, -300), h.ledger.tz_offset_min);
+    try testing.expectEqual(@as(u64, 1), h.ledger.all.events);
+    // …while the fleet stays pristine (cold catch-up for those sources).
+    for (fleet_mod.jsonl_agents) |agent| {
+        var it = fl.tailerConst(agent).?.files();
+        try testing.expect(it.next() == null);
+    }
+    try testing.expectEqual(@as(?i64, 0), fl.highWater(.goose));
+    try testing.expectEqual(@as(?i64, 0), fl.highWater(.kilo));
 }
 
 test "save writes atomically and creates parent directories" {
@@ -687,12 +969,12 @@ test "save writes atomically and creates parent directories" {
 
     var h = Harness.init(0);
     defer h.deinit();
-    try save(testing.allocator, io, state_path, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.ledger);
+    try save(testing.allocator, io, state_path, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, null, &h.ledger);
 
     // The final file exists; the tmp staging file does not.
     const data = try std.Io.Dir.cwd().readFileAlloc(io, state_path, testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(data);
-    try testing.expect(std.mem.indexOf(u8, data, "\"version\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "\"version\":3") != null);
     const state_stat = try std.Io.Dir.cwd().statFile(io, state_path, .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), state_stat.permissions.toMode() & 0o777);
     const state_dir = std.fs.path.dirname(state_path).?;

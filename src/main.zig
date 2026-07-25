@@ -175,6 +175,15 @@ pub fn main(init: std.process.Init) !void {
         .opencode_db = init.environ_map.get("OPENCODE_DB"),
         .xdg_data_home = init.environ_map.get("XDG_DATA_HOME"),
         .xdg_state_home = init.environ_map.get("XDG_STATE_HOME"),
+        .pi_home = init.environ_map.get("PI_HOME"),
+        .gemini_cli_home = init.environ_map.get("GEMINI_CLI_HOME"),
+        .qwen_runtime_dir = init.environ_map.get("QWEN_RUNTIME_DIR"),
+        .qwen_home = init.environ_map.get("QWEN_HOME"),
+        .kimi_share_dir = init.environ_map.get("KIMI_SHARE_DIR"),
+        .goose_path_root = init.environ_map.get("GOOSE_PATH_ROOT"),
+        .kilo_db = init.environ_map.get("KILO_DB"),
+        .cline_dir = init.environ_map.get("CLINE_DIR"),
+        .cline_data_dir = init.environ_map.get("CLINE_DATA_DIR"),
     }) catch |err| {
         std.log.err("engine setup failed: {s} — running with empty state", .{@errorName(err)});
     };

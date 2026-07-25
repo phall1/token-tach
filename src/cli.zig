@@ -41,6 +41,8 @@ const config = @import("core/config.zig");
 const claude = @import("core/claude.zig");
 const codex = @import("core/codex.zig");
 const opencode = @import("core/opencode.zig");
+const snapsource = @import("core/snapsource.zig");
+const fleet_mod = @import("core/fleet.zig");
 const pricing = @import("core/pricing.zig");
 const ledger_mod = @import("core/ledger.zig");
 const statefile = @import("core/statefile.zig");
@@ -84,6 +86,15 @@ pub fn maybeRunCli(init: std.process.Init) !bool {
                 .opencode_db = init.environ_map.get("OPENCODE_DB"),
                 .xdg_data_home = init.environ_map.get("XDG_DATA_HOME"),
                 .xdg_state_home = init.environ_map.get("XDG_STATE_HOME"),
+                .pi_home = init.environ_map.get("PI_HOME"),
+                .gemini_cli_home = init.environ_map.get("GEMINI_CLI_HOME"),
+                .qwen_runtime_dir = init.environ_map.get("QWEN_RUNTIME_DIR"),
+                .qwen_home = init.environ_map.get("QWEN_HOME"),
+                .kimi_share_dir = init.environ_map.get("KIMI_SHARE_DIR"),
+                .goose_path_root = init.environ_map.get("GOOSE_PATH_ROOT"),
+                .kilo_db = init.environ_map.get("KILO_DB"),
+                .cline_dir = init.environ_map.get("CLINE_DIR"),
+                .cline_data_dir = init.environ_map.get("CLINE_DATA_DIR"),
             };
             // Never crash: any collection failure (OOM, pathological fs)
             // degrades to the empty snapshot + note.
@@ -162,6 +173,15 @@ pub const Env = struct {
     opencode_db: ?[]const u8 = null,
     xdg_data_home: ?[]const u8 = null,
     xdg_state_home: ?[]const u8 = null,
+    pi_home: ?[]const u8 = null,
+    gemini_cli_home: ?[]const u8 = null,
+    qwen_runtime_dir: ?[]const u8 = null,
+    qwen_home: ?[]const u8 = null,
+    kimi_share_dir: ?[]const u8 = null,
+    goose_path_root: ?[]const u8 = null,
+    kilo_db: ?[]const u8 = null,
+    cline_dir: ?[]const u8 = null,
+    cline_data_dir: ?[]const u8 = null,
 };
 
 /// One (model|project, totals) rollup row.
@@ -231,12 +251,30 @@ pub fn collect(arena: std.mem.Allocator, io: std.Io, env: Env, now_ms: i64) !Sna
     var codex_tailer = codex.Tailer.init(arena);
     var opencode_poller = opencode.Poller.init(arena);
     var ledger = ledger_mod.Ledger.init(arena, 0);
+    // The tt-hr8 collector fleet, resolved exactly like engine.setup. A
+    // failed build degrades to core-agents-only (never crash the CLI).
+    const fleet_env = fleet_mod.Env{
+        .home = env.home,
+        .pi_home = env.pi_home,
+        .gemini_cli_home = env.gemini_cli_home,
+        .qwen_runtime_dir = env.qwen_runtime_dir,
+        .qwen_home = env.qwen_home,
+        .kimi_share_dir = env.kimi_share_dir,
+        .goose_path_root = env.goose_path_root,
+        .xdg_data_home = env.xdg_data_home,
+        .kilo_db = env.kilo_db,
+        .cline_dir = env.cline_dir,
+        .cline_data_dir = env.cline_data_dir,
+    };
+    var fl: ?fleet_mod.Fleet = fleet_mod.Fleet.init(arena, fleet_env) catch null;
+    var fleet_ptr: ?*fleet_mod.Fleet = null;
+    if (fl) |*f| fleet_ptr = f;
 
     // Warm path: restore offsets + rollups so the sweep below only reads
     // appended bytes. READ-ONLY — this module never calls statefile.save,
     // so it cannot corrupt the app's state or race a running instance.
     if (statefile.defaultPath(arena, env.xdg_state_home, env.home) catch null) |state_path| {
-        snap.state = try statefile.restore(arena, io, state_path, &claude_tailer, &codex_tailer, &opencode_poller, &ledger);
+        snap.state = try statefile.restore(arena, io, state_path, &claude_tailer, &codex_tailer, &opencode_poller, fleet_ptr, &ledger);
         if (snap.state == .invalid) {
             // Restore guarantees pristine args on .invalid, but stay in
             // lockstep with engine.setup's belt-and-suspenders reinit.
@@ -244,6 +282,9 @@ pub fn collect(arena: std.mem.Allocator, io: std.Io, env: Env, now_ms: i64) !Sna
             codex_tailer = codex.Tailer.init(arena);
             opencode_poller = opencode.Poller.init(arena);
             ledger = ledger_mod.Ledger.init(arena, 0);
+            fl = fleet_mod.Fleet.init(arena, fleet_env) catch null;
+            fleet_ptr = null;
+            if (fl) |*f| fleet_ptr = f;
         }
     }
 
@@ -280,6 +321,22 @@ pub fn collect(arena: std.mem.Allocator, io: std.Io, env: Env, now_ms: i64) !Sna
             } else ledger.add(change.current, new_cost) catch {};
         }
     }
+    // Collector fleet: one sweep over every enabled fleet source (its
+    // internal error handling means a broken source degrades quietly).
+    if (fleet_ptr) |f| {
+        var events: std.ArrayList(types.UsageEvent) = .empty;
+        var changes: std.ArrayList(snapsource.Change) = .empty;
+        f.sweep(arena, io, cfg.sources, now_ms, &events, &changes);
+        for (events.items) |ev| {
+            ledger.add(ev, if (prices) |*db| db.costOf(ev) else null) catch {};
+        }
+        for (changes.items) |change| {
+            const new_cost = if (prices) |*db| db.costOf(change.current) else null;
+            if (change.previous) |old| {
+                ledger.replace(old, if (prices) |*db| db.costOf(old) else null, change.current, new_cost) catch {};
+            } else ledger.add(change.current, new_cost) catch {};
+        }
+    }
 
     snap.tz_offset_min = ledger.tz_offset_min;
     snap.today = ledger.today(now_ms);
@@ -293,6 +350,14 @@ pub fn collect(arena: std.mem.Allocator, io: std.Io, env: Env, now_ms: i64) !Sna
     snap.coverage.getPtr(.claude).detected = claude_roots.len > 0;
     snap.coverage.getPtr(.codex).detected = codex_roots.len > 0;
     snap.coverage.getPtr(.opencode).detected = opencode_path.len > 0;
+    // Fleet agents: did the source's data location exist on this
+    // machine? (Null stays for agents the fleet does not own.)
+    if (fleet_ptr) |f| {
+        inline for (@typeInfo(types.Agent).@"enum".fields) |field| {
+            const agent: types.Agent = @enumFromInt(field.value);
+            if (f.detected(agent)) |d| snap.coverage.getPtr(agent).detected = d;
+        }
+    }
     snap.models = try topEntries(arena, ledger.per_model.keys(), ledger.per_model.values());
     snap.projects = try topEntries(arena, ledger.per_project.keys(), ledger.per_project.values());
     return snap;
@@ -843,7 +908,7 @@ test "collect: warm restore does not double-count and keeps the saved tz" {
         for (events.items) |ev| try ledger.add(ev, 0.25);
 
         const state_path = try statefile.defaultPath(arena, env.xdg_state_home, env.home);
-        try statefile.save(arena, io, state_path, &claude_tailer, &codex_tailer, &opencode_poller, &ledger);
+        try statefile.save(arena, io, state_path, &claude_tailer, &codex_tailer, &opencode_poller, null, &ledger);
     }
 
     const snap = try collect(arena, io, env, fixture_now_ms);

@@ -91,7 +91,22 @@ pixel through Metal.
 | Claude Code | tokens per message | tails `~/.claude/projects/**/*.jsonl` (and `$CLAUDE_CONFIG_DIR`), dedupes on `message.id:requestId` |
 | Codex CLI | tokens **and** 5h/weekly limit % | tails `~/.codex/sessions/**` — limits are embedded in the logs |
 | OpenCode | tokens per assistant message | opens one `opencode.db` read-only, selecting only usage/model/time IDs plus the joined session directory; prompt/content/tool/auth data is never queried |
+| Pi | tokens per message | tails `~/.pi/agent/sessions/**/*.jsonl`, dedupes fork re-logs |
+| Gemini CLI | tokens per response | tails `~/.gemini/tmp/*/chats/*.jsonl`; cache reads are a subset of prompt tokens and never double count |
+| Qwen Code | tokens per response | tails `~/.qwen/{projects,tmp}/**/*.jsonl` |
+| Kimi CLI | tokens per call | tails `~/.kimi/sessions/**/wire.jsonl` (model id not logged — counted, unpriced) |
+| Goose | tokens per call | reads the `usage_ledger` table of `sessions.db` read-only |
+| Kilo Code | tokens per turn | reads `~/.local/share/kilo/kilo.db` read-only (usage fields only, never content) |
+| Cline | tokens per request | snapshots `~/.cline/data/sessions/*.messages.json` and legacy VS Code task stores |
+| Roo Code | tokens per request | snapshots the Roo VS Code task store (`ui_messages.json`) |
 | Pricing | $/token rates | bundled snapshot of LiteLLM's `model_prices_and_context_window.json` |
+
+Every collector is zero-config (auto-discovered if the harness's data
+exists, silent if not), read-only, and exact — token counts come from the
+harnesses' own logs, never estimated. `token-tach --json` reports per-source
+coverage (enabled / detected / events) so you can see exactly what is and
+isn't being counted. Harnesses that don't persist exact local token data
+(Cursor, Windsurf, Grok Build, Amazon Q, ...) are deliberately excluded.
 
 **Opt-in (`claude-oauth = true`):** Claude's server-truth utilization via
 `GET https://api.anthropic.com/api/oauth/usage` with your existing Claude
@@ -142,7 +157,9 @@ tray-format = {burn} → {eta}
 claude-oauth = true        # opt in to server-truth Claude limits
 poll-interval = 180s
 alert-threshold = 70, 90
-source = claude, codex, opencode # enable/disable agents
+# enable/disable agents (default: all). Known: claude, codex, opencode,
+# pi, gemini, qwen, kimi, goose, kilo, cline, roo
+source = claude, codex, opencode
 system-stats = true        # or a list: cpu, gpu, mem, disk, net, battery
 launch-at-login = true     # login item (installed app); unset = never touched
 # claude-config-dir = ~/some/other/claude-root

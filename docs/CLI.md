@@ -64,6 +64,12 @@ The top-level schema is stable for v0.3.x. New fields may be added.
       "opencode": {}
     }
   },
+  "coverage": [
+    { "agent": "claude", "enabled": true, "detected": true, "events": 31245 },
+    { "agent": "pi", "enabled": true, "detected": true, "events": 7163 },
+    { "agent": "gemini", "enabled": true, "detected": false, "events": 0 },
+    { "agent": "copilot", "enabled": true, "detected": null, "events": 0 }
+  ],
   "burn_tokens_per_min": null,
   "limits": {
     "codex": {
@@ -96,6 +102,12 @@ machine (for example `battery: null` on a desktop). Fractions are 0..1;
 `mem.pressure` is the kernel's memorystatus level
 (`normal`/`warn`/`critical`/`unknown`). `--statusline` performs no system
 sampling.
+
+`coverage` (v0.6+) reports every known agent: whether its source is
+enabled in config, whether its data location exists on this machine
+(`null` = no collector probes it yet), and how many events it has
+contributed. `all_time.by_agent` carries a totals object per agent,
+keyed by the agent's identifier (`continue_cli` for Continue).
 
 `burn_tokens_per_min` is always `null` in v0.3 CLI mode. The persisted
 ledger stores rollups, not enough recent per-event history for an honest

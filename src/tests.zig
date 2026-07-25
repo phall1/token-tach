@@ -19,6 +19,17 @@ test {
     _ = @import("core/claude.zig");
     _ = @import("core/codex.zig");
     _ = @import("core/opencode.zig");
+    _ = @import("core/tailsource.zig");
+    _ = @import("core/snapsource.zig");
+    _ = @import("core/pisrc.zig");
+    _ = @import("core/geminisrc.zig");
+    _ = @import("core/qwensrc.zig");
+    _ = @import("core/kimisrc.zig");
+    _ = @import("core/goosesrc.zig");
+    _ = @import("core/kilosrc.zig");
+    _ = @import("core/clinesrc.zig");
+    _ = @import("core/roosrc.zig");
+    _ = @import("core/fleet.zig");
     _ = @import("core/pricing.zig");
     _ = @import("core/oauth.zig");
     _ = @import("core/keychain.zig");
