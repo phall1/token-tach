@@ -4,17 +4,54 @@
 const std = @import("std");
 
 /// Which agent produced an event or limit reading.
+///
+/// The first three are the "core" agents with dedicated popover UI
+/// (claude/codex limit groups, the opencode row); everything after is
+/// the tt-hr8 expansion — collected with exact local token telemetry,
+/// aggregated compactly in the popover, itemized in the dashboard and
+/// CLI. Adding a member here auto-extends `source =` config parsing
+/// (config.Sources), ledger rollups (EnumArray), CLI coverage, and the
+/// dashboard agents table; the engine still needs a collector wired in
+/// sweepOnce.
 pub const Agent = enum {
     claude,
     codex,
     opencode,
+    pi,
+    gemini,
+    qwen,
+    kimi,
+    goose,
+    kilo,
+    cline,
+    roo,
+    copilot,
+    continue_cli,
+    droid,
 
     pub fn label(self: Agent) []const u8 {
         return switch (self) {
             .claude => "claude",
             .codex => "codex",
             .opencode => "opencode",
+            .pi => "pi",
+            .gemini => "gemini",
+            .qwen => "qwen",
+            .kimi => "kimi",
+            .goose => "goose",
+            .kilo => "kilo",
+            .cline => "cline",
+            .roo => "roo",
+            .copilot => "copilot",
+            .continue_cli => "continue",
+            .droid => "droid",
         };
+    }
+
+    /// Agents with dedicated popover panels (limit windows, staleness).
+    /// Everything else renders through the aggregate treatment.
+    pub fn hasLimitsPanel(self: Agent) bool {
+        return self == .claude or self == .codex;
     }
 };
 

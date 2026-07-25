@@ -488,7 +488,7 @@ fn limitsPanel(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
         .style = .{ .background = theme.hairline, .radius = 0, .stroke_width = 0 },
     }, .{}));
     _ = agentGroup(ui, nodes, model, .codex, model.codex_limits, y + 10);
-    compactOpenCodeRow(ui, nodes, model);
+    compactOthersRow(ui, nodes, model);
 
     // Burn history trace pinned to the panel foot: an area-filled scope
     // line on a square-root scale, so one spike no longer flattens the
@@ -530,10 +530,12 @@ fn agentGroup(
     const enabled = engine.sourceEnabled(model.cfg.sources, agent);
     const empty = enabled and engine.agentIsEmpty(model, agent);
     const stale_min: ?u64 = if (agent == .claude) engine.oauthStaleMin(model) else null;
+    // Only the limits-panel agents reach this fn (rootView calls it for
+    // claude/codex; everything else takes the aggregate treatment).
     const name: []const u8 = switch (agent) {
         .claude => "CLAUDE",
         .codex => "CODEX",
-        .opencode => "OPENCODE",
+        else => "OPENCODE",
     };
 
     var name_spans: [3]canvas.TextSpan = .{
@@ -600,30 +602,80 @@ fn agentGroup(
         }, switch (agent) {
             .claude => "set claude-oauth = true in config",
             .codex => "none embedded in recent rollouts",
-            .opencode => "API-equivalent usage only",
+            else => "API-equivalent usage only",
         }));
         y += row_h + 14;
     }
     return y + 4;
 }
 
-fn compactOpenCodeRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
+/// The aggregate row for every agent beyond the claude/codex limit
+/// groups (tt-hr8): opencode plus whatever collectors found usage.
+/// One quiet line — the label names up to three contributors, the right
+/// side sums their API-equivalent value. The dashboard itemizes.
+fn compactOthersRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
     const y = panel_y + 194;
-    const enabled = model.cfg.sources.enabled(.opencode);
-    const totals = model.ledger.forAgent(.opencode);
-    const empty = enabled and engine.agentIsEmpty(model, .opencode);
+
+    var combined: u64 = 0;
+    var combined_cost: f64 = 0;
+    var active_count: usize = 0;
+    var any_enabled = false;
+    // Top contributor names by cost, small fixed lineup.
+    var top_names: [3][]const u8 = undefined;
+    var top_costs: [3]f64 = .{ -1, -1, -1 };
+    inline for (@typeInfo(types.Agent).@"enum".fields) |field| {
+        const agent: types.Agent = @enumFromInt(field.value);
+        if (!agent.hasLimitsPanel()) {
+            if (model.cfg.sources.enabled(agent)) any_enabled = true;
+            const totals = model.ledger.forAgent(agent);
+            if (totals.events > 0) {
+                combined += totals.totalTokens();
+                combined_cost += totals.cost_usd;
+                active_count += 1;
+                var i: usize = 0;
+                while (i < top_costs.len) : (i += 1) {
+                    if (totals.cost_usd > top_costs[i]) {
+                        var j: usize = top_costs.len - 1;
+                        while (j > i) : (j -= 1) {
+                            top_costs[j] = top_costs[j - 1];
+                            top_names[j] = top_names[j - 1];
+                        }
+                        top_costs[i] = totals.cost_usd;
+                        top_names[i] = agent.label();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    var name_spans: [2]canvas.TextSpan = .{
+        .{ .text = "OTHERS", .weight = .bold, .monospace = true },
+        .{ .text = "", .color = .text_muted, .monospace = true, .scale = 0.9 },
+    };
+    if (active_count > 0) {
+        name_spans[1].text = switch (@min(active_count, 3)) {
+            1 => ui.fmt("  {s}", .{top_names[0]}),
+            2 => ui.fmt("  {s}·{s}", .{ top_names[0], top_names[1] }),
+            else => if (active_count > 3)
+                ui.fmt("  {s}·{s}+{d}", .{ top_names[0], top_names[1], active_count - 2 })
+            else
+                ui.fmt("  {s}·{s}·{s}", .{ top_names[0], top_names[1], top_names[2] }),
+        };
+    }
     push(ui, nodes, ui.paragraph(.{
-        .frame = rect(bars_x, y, 100, 16),
-        .semantics = .{ .label = "OpenCode API-equivalent usage" },
-    }, &.{.{ .text = "OPENCODE", .weight = .bold, .monospace = true }}));
-    const value: []const u8 = if (!enabled)
+        .frame = rect(bars_x, y, 160, 16),
+        .semantics = .{ .label = "Other agents API-equivalent usage" },
+    }, &name_spans));
+
+    const value: []const u8 = if (!any_enabled)
         "disabled"
-    else if (empty)
-        "no messages found"
+    else if (active_count == 0)
+        "no usage found"
     else
-        ui.fmt("{s} · {s}", .{ fmtTokens(ui, totals.totalTokens()), fmtCost(ui, totals.cost_usd) });
+        ui.fmt("{s} · {s}", .{ fmtTokens(ui, combined), fmtCost(ui, combined_cost) });
     push(ui, nodes, ui.text(.{
-        .frame = rect(bars_right - 140, y + 1, 140, 14),
+        .frame = rect(bars_right - 120, y + 1, 120, 14),
         .size = .sm,
         .text_alignment = .end,
         .style_tokens = .{ .foreground = .text_muted },

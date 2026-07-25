@@ -168,12 +168,53 @@ fn agentSplit(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void
         .style_tokens = .{ .foreground = .text_muted },
     }, "AGENT / SHARE"));
 
-    const claude_total = model.ledger.forAgent(.claude);
-    const codex_total = model.ledger.forAgent(.codex);
-    const opencode_total = model.ledger.forAgent(.opencode);
-    agentRow(ui, nodes, "CLAUDE", claude_total, model.ledger.all.cost_usd, frame.y + 42);
-    agentRow(ui, nodes, "CODEX", codex_total, model.ledger.all.cost_usd, frame.y + 88);
-    agentRow(ui, nodes, "OPENCODE", opencode_total, model.ledger.all.cost_usd, frame.y + 134);
+    // Dynamic top-3 by cost across every agent the ledger has seen
+    // (tt-hr8: the collector fleet can be a dozen agents; three rows +
+    // an overflow line keep the card honest without growing it).
+    const agent_count = @typeInfo(types.Agent).@"enum".fields.len;
+    var rows: [agent_count]struct { agent: types.Agent, totals: ledger_mod.Totals } = undefined;
+    var n: usize = 0;
+    inline for (@typeInfo(types.Agent).@"enum".fields) |field| {
+        const agent: types.Agent = @enumFromInt(field.value);
+        const totals = model.ledger.forAgent(agent);
+        if (totals.events > 0) {
+            rows[n] = .{ .agent = agent, .totals = totals };
+            n += 1;
+        }
+    }
+    std.mem.sort(@TypeOf(rows[0]), rows[0..n], {}, struct {
+        fn lt(_: void, a: @TypeOf(rows[0]), b: @TypeOf(rows[0])) bool {
+            return a.totals.cost_usd > b.totals.cost_usd;
+        }
+    }.lt);
+
+    const shown = @min(n, 3);
+    for (rows[0..shown], 0..) |row, i| {
+        agentRow(ui, nodes, upperLabel(ui, row.agent), row.totals, model.ledger.all.cost_usd, frame.y + 42 + 46 * @as(f32, @floatFromInt(i)));
+    }
+    if (n > shown) {
+        var rest_cost: f64 = 0;
+        for (rows[shown..n]) |row| rest_cost += row.totals.cost_usd;
+        push(ui, nodes, ui.text(.{
+            .frame = rect(706, frame.y + 162, 170, 14),
+            .size = .sm,
+            .style_tokens = .{ .foreground = .text_muted },
+        }, ui.fmt("+{d} more · {s}", .{ n - shown, fmtCost(ui, rest_cost) })));
+    } else if (n == 0) {
+        push(ui, nodes, ui.text(.{
+            .frame = rect(706, frame.y + 50, 170, 16),
+            .style_tokens = .{ .foreground = .text_muted },
+        }, "No usage data yet"));
+    }
+}
+
+fn upperLabel(ui: *Ui, agent: types.Agent) []const u8 {
+    const label = agent.label();
+    const out = ui.arena.alloc(u8, label.len) catch {
+        ui.failed = true;
+        return label;
+    };
+    return std.ascii.upperString(out, label);
 }
 
 fn agentRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), name: []const u8, totals: ledger_mod.Totals, all_cost: f64, y: f32) void {

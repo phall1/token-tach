@@ -1,0 +1,7 @@
+{"sessionId":"f00dfeed-1111-2222-3333-444455556666","projectHash":"3f7a1b2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8","startTime":"2026-07-09T06:27:51.352Z","kind":"metadata"}
+{"id":"msg-0001","timestamp":"2026-07-09T06:28:22.025Z","type":"user","content":"hello from the fixture"}
+{"id":"msg-0002","timestamp":"2026-07-09T06:28:25.410Z","type":"gemini","content":"first reply","model":"gemini-2.5-pro"}
+{"id":"msg-0002","timestamp":"2026-07-09T06:28:25.410Z","type":"gemini","content":"first reply","model":"gemini-2.5-pro","tokens":{"input":5369,"output":97,"cached":1024,"thoughts":44,"tool":128,"total":5510}}
+{"id":"msg-0003","timestamp":"2026-07-09T06:28:27.039Z","type":"gemini","content":"second reply","model":"gemini-2.5-pro","tokens":{"input":800,"output":50,"cached":0,"thoughts":10,"tool":0,"total":860}}
+{"$set":{"ui":{"footer":"visible"}}}
+this line is not JSON at all {{{

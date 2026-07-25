@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "sessionId": "0197a1b2-3456-7890-abcd-ef0123456789",
+  "createdAt": 1783600000000,
+  "messages": [
+    {
+      "id": "msg-user-001",
+      "type": "user",
+      "ts": 1783600000000,
+      "content": [{ "type": "text", "text": "add a feature" }]
+    },
+    {
+      "id": "msg-asst-002",
+      "type": "assistant",
+      "ts": 1783600004200,
+      "modelInfo": { "id": "claude-sonnet-5", "provider": "anthropic" },
+      "metrics": {
+        "inputTokens": 1200,
+        "outputTokens": 340,
+        "cacheReadTokens": 5600,
+        "cacheWriteTokens": 800,
+        "cost": 0.0123
+      },
+      "content": [{ "type": "text", "text": "on it" }]
+    },
+    {
+      "id": "msg-asst-003",
+      "type": "assistant",
+      "ts": 1783600009000,
+      "modelInfo": { "id": "claude-sonnet-5", "provider": "anthropic" },
+      "metrics": {
+        "inputTokens": 74,
+        "outputTokens": 21,
+        "cacheReadTokens": 6400,
+        "cacheWriteTokens": 0,
+        "cost": 0.0045
+      },
+      "content": [{ "type": "text", "text": "done" }]
+    },
+    {
+      "id": "msg-asst-004",
+      "type": "assistant",
+      "ts": 1783600009500,
+      "metrics": {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0,
+        "cost": 0
+      },
+      "content": []
+    }
+  ]
+}

@@ -126,7 +126,7 @@ test "the instrument cluster binds the engine's structured state" {
     // Both agent groups render with their limit windows.
     try testing.expect(containsText(tree.root, "CLAUDE"));
     try testing.expect(containsText(tree.root, "CODEX"));
-    try testing.expect(containsText(tree.root, "OPENCODE"));
+    try testing.expect(containsText(tree.root, "OTHERS"));
     try testing.expect(containsText(tree.root, "67%"));
     try testing.expect(containsText(tree.root, "9%"));
     try testing.expect(containsText(tree.root, "5h"));
@@ -222,6 +222,13 @@ test "dashboard view exposes hero stats and attribution sections" {
         .output_tokens = 1_000,
         .cwd = "/tmp/token-tach",
     }, 42.0);
+    // A second agent so the dynamic AGENT/SHARE card renders >1 row.
+    try model.ledger.add(.{
+        .agent = .opencode,
+        .timestamp_ms = model.now_ms,
+        .model = "gpt-5.4",
+        .output_tokens = 500,
+    }, 3.0);
     @memcpy(model.claude_plan_buf[0..3], "max");
     model.claude_plan = model.claude_plan_buf[0..3];
 

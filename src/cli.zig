@@ -181,15 +181,24 @@ pub const Snapshot = struct {
     today: ledger_mod.Totals = .{},
     month: ledger_mod.Totals = .{},
     all: ledger_mod.Totals = .{},
-    claude_total: ledger_mod.Totals = .{},
-    codex_total: ledger_mod.Totals = .{},
-    opencode_total: ledger_mod.Totals = .{},
+    /// Per-agent all-time rollup, one slot per Agent member.
+    per_agent: std.EnumArray(types.Agent, ledger_mod.Totals) = .initFill(.{}),
+    /// Source coverage: is the source enabled in config, and did its
+    /// data location resolve/exist on this machine (tt-hr8 "clear
+    /// coverage status"). `detected == null` means not probed.
+    coverage: std.EnumArray(types.Agent, Coverage) = .initFill(.{}),
     codex_limits: ?types.LimitSnapshot = null,
     models: []const Entry = &.{},
     projects: []const Entry = &.{},
     /// Live machine telemetry (--json only; sampled at invocation, not
     /// read from state). Empty for --statusline.
     system: system.Snapshot = .{},
+};
+
+/// One agent's collection status.
+pub const Coverage = struct {
+    enabled: bool = false,
+    detected: ?bool = null,
 };
 
 pub fn emptySnapshot(now_ms: i64) Snapshot {
@@ -276,9 +285,14 @@ pub fn collect(arena: std.mem.Allocator, io: std.Io, env: Env, now_ms: i64) !Sna
     snap.today = ledger.today(now_ms);
     snap.month = monthTotals(&ledger, now_ms);
     snap.all = ledger.all;
-    snap.claude_total = ledger.forAgent(.claude);
-    snap.codex_total = ledger.forAgent(.codex);
-    snap.opencode_total = ledger.forAgent(.opencode);
+    inline for (@typeInfo(types.Agent).@"enum".fields) |field| {
+        const agent: types.Agent = @enumFromInt(field.value);
+        snap.per_agent.set(agent, ledger.forAgent(agent));
+        snap.coverage.set(agent, .{ .enabled = cfg.sources.enabled(agent) });
+    }
+    snap.coverage.getPtr(.claude).detected = claude_roots.len > 0;
+    snap.coverage.getPtr(.codex).detected = codex_roots.len > 0;
+    snap.coverage.getPtr(.opencode).detected = opencode_path.len > 0;
     snap.models = try topEntries(arena, ledger.per_model.keys(), ledger.per_model.values());
     snap.projects = try topEntries(arena, ledger.per_project.keys(), ledger.per_project.values());
     return snap;
@@ -394,8 +408,12 @@ const JsonOut = struct {
         cost_usd: f64,
         tokens: u64,
         events: u64,
-        by_agent: struct { claude: JsonTotals, codex: JsonTotals, opencode: JsonTotals },
+        by_agent: JsonByAgent,
     },
+    /// Source coverage (tt-hr8): every known agent, whether its source
+    /// is enabled, whether its data location exists on this machine
+    /// (null = not probed), and how many events it has contributed.
+    coverage: []const JsonCoverage,
     /// Always null in v1 — see the module doc for why.
     burn_tokens_per_min: ?f64,
     limits: struct {
@@ -465,6 +483,44 @@ fn bpsInt(v: ?f64) ?u64 {
     return @intFromFloat(@max(rate, 0));
 }
 
+/// One JsonTotals field per Agent member, keyed by the enum tag name.
+/// Zig 0.16 removed struct reification, so the list is spelled out; the
+/// comptime block below fails the build the moment types.Agent gains a
+/// member this struct lacks (or vice versa).
+const JsonByAgent = struct {
+    claude: JsonTotals,
+    codex: JsonTotals,
+    opencode: JsonTotals,
+    pi: JsonTotals,
+    gemini: JsonTotals,
+    qwen: JsonTotals,
+    kimi: JsonTotals,
+    goose: JsonTotals,
+    kilo: JsonTotals,
+    cline: JsonTotals,
+    roo: JsonTotals,
+    copilot: JsonTotals,
+    continue_cli: JsonTotals,
+    droid: JsonTotals,
+};
+
+comptime {
+    const agent_fields = @typeInfo(types.Agent).@"enum".fields;
+    if (agent_fields.len != @typeInfo(JsonByAgent).@"struct".fields.len)
+        @compileError("JsonByAgent is out of sync with types.Agent");
+    for (agent_fields) |f| {
+        if (!@hasField(JsonByAgent, f.name))
+            @compileError("JsonByAgent missing agent field: " ++ f.name);
+    }
+}
+
+const JsonCoverage = struct {
+    agent: []const u8,
+    enabled: bool,
+    detected: ?bool,
+    events: u64,
+};
+
 fn jsonTotals(t: ledger_mod.Totals) JsonTotals {
     return .{
         .cost_usd = roundUsd(t.cost_usd),
@@ -527,6 +583,22 @@ pub fn writeJson(w: *std.Io.Writer, snap: Snapshot) !void {
     const models = fillKeyed(&model_buf, snap.models);
     const projects = fillKeyed(&project_buf, snap.projects);
 
+    const agent_count = @typeInfo(types.Agent).@"enum".fields.len;
+    var by_agent: JsonByAgent = undefined;
+    var coverage_buf: [agent_count]JsonCoverage = undefined;
+    inline for (@typeInfo(types.Agent).@"enum".fields, 0..) |field, i| {
+        const agent: types.Agent = @enumFromInt(field.value);
+        const totals = snap.per_agent.get(agent);
+        @field(by_agent, field.name) = jsonTotals(totals);
+        const cov = snap.coverage.get(agent);
+        coverage_buf[i] = .{
+            .agent = agent.label(),
+            .enabled = cov.enabled,
+            .detected = cov.detected,
+            .events = totals.events,
+        };
+    }
+
     const out = JsonOut{
         .version = version,
         .generated_at_ms = snap.generated_at_ms,
@@ -538,11 +610,7 @@ pub fn writeJson(w: *std.Io.Writer, snap: Snapshot) !void {
             .cost_usd = roundUsd(snap.all.cost_usd),
             .tokens = snap.all.totalTokens(),
             .events = snap.all.events,
-            .by_agent = .{
-                .claude = jsonTotals(snap.claude_total),
-                .codex = jsonTotals(snap.codex_total),
-                .opencode = jsonTotals(snap.opencode_total),
-            },
+            .by_agent = by_agent,
         },
         .burn_tokens_per_min = null,
         .limits = .{
@@ -552,6 +620,7 @@ pub fn writeJson(w: *std.Io.Writer, snap: Snapshot) !void {
         },
         .models = models,
         .projects = projects,
+        .coverage = &coverage_buf,
         .system = jsonSystem(snap.system),
     };
     try std.json.Stringify.value(out, .{ .whitespace = .indent_2 }, w);
@@ -714,8 +783,8 @@ test "collect: cold scan aggregates fixtures, splits today/month, captures codex
 
     try testing.expectEqual(statefile.RestoreOutcome.absent, snap.state);
     try testing.expectEqual(@as(u64, 11), snap.all.events);
-    try testing.expectEqual(@as(u64, 8), snap.claude_total.events);
-    try testing.expectEqual(@as(u64, 3), snap.codex_total.events);
+    try testing.expectEqual(@as(u64, 8), snap.per_agent.get(.claude).events);
+    try testing.expectEqual(@as(u64, 3), snap.per_agent.get(.codex).events);
     // The bundled pricing db prices the fixture models.
     try testing.expect(snap.all.cost_usd > 0);
 

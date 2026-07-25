@@ -322,6 +322,17 @@ pub fn agentName(agent: types.Agent) []const u8 {
         .claude => "Claude",
         .codex => "Codex",
         .opencode => "OpenCode",
+        .pi => "Pi",
+        .gemini => "Gemini",
+        .qwen => "Qwen",
+        .kimi => "Kimi",
+        .goose => "Goose",
+        .kilo => "Kilo",
+        .cline => "Cline",
+        .roo => "Roo",
+        .copilot => "Copilot",
+        .continue_cli => "Continue",
+        .droid => "Droid",
     };
 }
 

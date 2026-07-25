@@ -1,0 +1,23 @@
+[
+  { "ts": 1783600300000, "type": "say", "say": "task", "text": "Fix the flaky test" },
+  {
+    "ts": 1783600301500,
+    "type": "say",
+    "say": "api_req_started",
+    "text": "{\"request\":\"[task placeholder, never stored]\",\"tokensIn\":2100,\"tokensOut\":180,\"cacheWrites\":650,\"cacheReads\":4300,\"cost\":0.0217}"
+  },
+  {
+    "ts": 1783600302250,
+    "type": "say",
+    "say": "api_req_started",
+    "text": "{\"tokensIn\":oops this blob is not valid json"
+  },
+  { "ts": 1783600303000, "type": "say", "say": "text", "text": "working on it" },
+  {
+    "ts": 1783600304750,
+    "type": "say",
+    "say": "deleted_api_reqs",
+    "text": "{\"tokensIn\":900,\"tokensOut\":75,\"cacheWrites\":0,\"cacheReads\":1200,\"cost\":0.0088}"
+  },
+  { "ts": 1783600305000, "type": "ask", "ask": "followup", "text": "anything else?" }
+]

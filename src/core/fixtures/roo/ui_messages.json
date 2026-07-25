@@ -1,0 +1,23 @@
+[
+  { "ts": 1783601000000, "type": "say", "say": "task", "text": "Refactor the parser" },
+  {
+    "ts": 1783601002500,
+    "type": "say",
+    "say": "api_req_started",
+    "text": "{\"request\":\"[task placeholder, never stored]\",\"tokensIn\":3200,\"tokensOut\":410,\"cacheWrites\":128,\"cacheReads\":7600,\"cost\":0.0341,\"apiProtocol\":\"anthropic\"}"
+  },
+  { "ts": 1783601003000, "type": "say", "say": "checkpoint_saved", "text": "abc123" },
+  {
+    "ts": 1783601004250,
+    "type": "say",
+    "say": "api_req_started",
+    "text": "not even braces, wholly malformed"
+  },
+  {
+    "ts": 1783601006000,
+    "type": "say",
+    "say": "api_req_started",
+    "text": "{\"tokensIn\":55,\"tokensOut\":12,\"cacheWrites\":0,\"cacheReads\":8100,\"cost\":0.0102,\"cancelReason\":null}"
+  },
+  { "ts": 1783601007000, "type": "ask", "ask": "completion_result", "text": "" }
+]

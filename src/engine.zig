@@ -267,7 +267,7 @@ pub fn agentIsEmpty(model: *const Model, agent: types.Agent) bool {
     const limits = switch (agent) {
         .claude => model.claude_limits,
         .codex => model.codex_limits,
-        .opencode => null,
+        else => null,
     };
     return limits == null;
 }
@@ -520,7 +520,9 @@ fn enumerateHistory(model: *Model, only: config.Sources) !void {
                 const known: ?u64 = switch (group.agent) {
                     .claude => model.claude_tailer.offsetFor(path),
                     .codex => model.codex_tailer.offsetFor(path),
-                    .opencode => unreachable,
+                    // Only claude/codex enqueue history catch-up files;
+                    // tt-hr8 collectors cold-scan inline on first sweep.
+                    else => unreachable,
                 };
                 if (known != null and known.? == stat.size) {
                     model.allocator.free(path);
@@ -568,7 +570,7 @@ fn processCatchupChunk(model: *Model, fx: *Effects) void {
                 model.codex_tailer.poll(io, arena, file.path, &events) catch {};
                 for (events.items) |ev| ingest(model, ev);
             },
-            .opencode => unreachable,
+            else => unreachable,
         }
         model.catchup_next += 1;
         if (file.size >= budget) break;
@@ -1240,7 +1242,7 @@ pub fn planPrice(agent: types.Agent, plan: []const u8) ?PlanPrice {
             if (eq(plan, "pro")) return .{ .lo = 200, .hi = 200 };
             if (eq(plan, "free")) return .{ .lo = 0, .hi = 0 };
         },
-        .opencode => return null,
+        else => return null,
     }
     return null;
 }

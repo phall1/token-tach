@@ -1,0 +1,667 @@
+//! Generic rewritten-whole-JSON usage poller ("stable record snapshots").
+//!
+//! Several harnesses (Cline, Roo Code, Continue CLI, Factory Droid) persist
+//! usage in JSON files that are REWRITTEN in full on every mutation, not
+//! appended — so byte-offset tailing (tailsource.zig) cannot work. Instead,
+//! a harness adapter parses the whole file into records with STABLE per-
+//! record keys, and this module keeps a per-file snapshot of the last-seen
+//! usage numbers per key. On re-parse it emits opencode-style Changes:
+//!
+//! - new key                       -> `.{ .previous = null, .current = ev }`
+//! - existing key, numbers moved   -> `.{ .previous = old,  .current = ev }`
+//!   (so the ledger's replace() keeps totals exact)
+//! - unchanged key                 -> nothing
+//!
+//! Records that DISAPPEAR from a file (truncated/cleared/deleted history)
+//! are intentionally NOT retracted: the spend happened, so the ledger keeps
+//! it, and the snapshot keeps the record so a later rewrite that re-lists
+//! it does not double-count. If two records in one file share a key (e.g. a
+//! millisecond-timestamp collision), the later one replaces the earlier via
+//! a replace Change — the net ledger effect is the last record's numbers.
+//!
+//! Steady-state cost is ~zero: each poll stats every matching file and
+//! re-reads/re-parses only files whose mtime OR size moved.
+//!
+//! Ownership: emitted Change events are duped with the allocator passed to
+//! scanFile/sweep (free with `freeChanges`; arenas make it free). Internal
+//! snapshots live on the allocator given to `init` and die with `deinit`.
+//! Record slices returned by an adapter's `parseFile` must be allocated in
+//! (or outlive) the arena it is handed — the engine copies what it keeps.
+
+const std = @import("std");
+const types = @import("types.zig");
+const Allocator = std.mem.Allocator;
+
+/// One ledger mutation. `previous == null` means add; otherwise the ledger
+/// must replace `previous`'s contribution with `current`'s.
+pub const Change = struct {
+    previous: ?types.UsageEvent = null,
+    current: types.UsageEvent,
+};
+
+/// What the poller knows about the file being parsed, handed to the
+/// adapter's `parseFile` (e.g. to derive a session id from the path).
+pub const FileContext = struct {
+    /// Path of the file being parsed (as passed to scan/sweep).
+    path: []const u8,
+    /// The agent tag the poller was configured with.
+    agent: types.Agent,
+};
+
+/// One usage-bearing record extracted from a file: a per-file-stable key
+/// (message id, timestamp string, ...) plus the usage event it maps to.
+/// Keys are compared per file — the same key in two files is two records.
+pub const Record = struct {
+    key: []const u8,
+    event: types.UsageEvent,
+};
+
+/// Parse one whole file. Must tolerate garbage: malformed input returns an
+/// empty slice (or any error — both are treated as "no records", and the
+/// file's mtime/size are still recorded so a permanently-bad file costs one
+/// stat per poll, never a re-read). Everything returned must be allocated
+/// in `arena` (or be static / a slice of `bytes`/`ctx.path`).
+pub const ParseFileFn = *const fn (arena: Allocator, bytes: []const u8, ctx: FileContext) anyerror![]Record;
+
+/// Everything harness-specific about one rewritten-JSON usage source.
+pub const Adapter = struct {
+    /// Only files whose path ends with this are parsed
+    /// (e.g. ".messages.json", "ui_messages.json").
+    file_suffix: []const u8,
+    parseFile: ParseFileFn,
+};
+
+/// Free the events of Changes emitted by scanFile/sweep (they are duped
+/// with the allocator passed to those calls).
+pub fn freeChanges(allocator: Allocator, changes: []const Change) void {
+    for (changes) |change| {
+        if (change.previous) |ev| freeEvent(allocator, ev);
+        freeEvent(allocator, change.current);
+    }
+}
+
+/// Rewritten-JSON usage poller: per-file {key -> last-seen usage} snapshots
+/// with mtime/size gating. One Poller per (agent, adapter) pair.
+pub const Poller = struct {
+    allocator: Allocator,
+    agent: types.Agent,
+    adapter: Adapter,
+    snapshots: std.StringHashMapUnmanaged(FileSnapshot) = .empty,
+
+    const FileSnapshot = struct {
+        mtime_ns: i96 = 0,
+        size: u64 = 0,
+        /// key (owned) -> last-seen event (strings owned).
+        records: std.StringHashMapUnmanaged(types.UsageEvent) = .empty,
+
+        fn deinit(self: *FileSnapshot, gpa: Allocator) void {
+            var it = self.records.iterator();
+            while (it.next()) |entry| {
+                gpa.free(entry.key_ptr.*);
+                freeEvent(gpa, entry.value_ptr.*);
+            }
+            self.records.deinit(gpa);
+            self.* = undefined;
+        }
+    };
+
+    pub fn init(allocator: Allocator, agent: types.Agent, adapter: Adapter) Poller {
+        return .{ .allocator = allocator, .agent = agent, .adapter = adapter };
+    }
+
+    pub fn deinit(self: *Poller) void {
+        var it = self.snapshots.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.snapshots.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistence surface (statefile save/restore)
+    // -----------------------------------------------------------------------
+
+    /// One snapshotted record, as the statefile saver wants it — exactly
+    /// the fields the ledger needs to reconstruct a replace() baseline
+    /// (mirrors what statefile persists for opencode rows).
+    pub const WireRecord = struct {
+        key: []const u8,
+        timestamp_ms: i64,
+        model: []const u8 = "",
+        input: u64 = 0,
+        output: u64 = 0,
+        cache_creation: u64 = 0,
+        cache_read: u64 = 0,
+        session_id: []const u8 = "",
+        cwd: []const u8 = "",
+    };
+
+    pub const RecordIterator = struct {
+        inner: std.StringHashMapUnmanaged(types.UsageEvent).Iterator,
+
+        pub fn next(self: *RecordIterator) ?WireRecord {
+            const entry = self.inner.next() orelse return null;
+            const ev = entry.value_ptr.*;
+            return .{
+                .key = entry.key_ptr.*,
+                .timestamp_ms = ev.timestamp_ms,
+                .model = ev.model,
+                .input = ev.input_tokens,
+                .output = ev.output_tokens,
+                .cache_creation = ev.cache_creation_tokens,
+                .cache_read = ev.cache_read_tokens,
+                .session_id = ev.session_id,
+                .cwd = ev.cwd,
+            };
+        }
+    };
+
+    /// One tracked file with its change-gate fingerprint and records.
+    pub const FileEntry = struct {
+        path: []const u8,
+        mtime_ns: i96,
+        size: u64,
+        records: RecordIterator,
+    };
+
+    pub const FileIterator = struct {
+        inner: std.StringHashMapUnmanaged(FileSnapshot).Iterator,
+
+        pub fn next(self: *FileIterator) ?FileEntry {
+            const entry = self.inner.next() orelse return null;
+            return .{
+                .path = entry.key_ptr.*,
+                .mtime_ns = entry.value_ptr.mtime_ns,
+                .size = entry.value_ptr.size,
+                .records = .{ .inner = entry.value_ptr.records.iterator() },
+            };
+        }
+    };
+
+    /// Iterate every tracked file for statefile save. Borrowed slices —
+    /// valid until the next mutating call on the poller.
+    pub fn files(self: *const Poller) FileIterator {
+        return .{ .inner = self.snapshots.iterator() };
+    }
+
+    /// Statefile restore: re-seed one file's snapshot. Restored records
+    /// suppress re-emission of already-ledgered history; the mtime/size
+    /// pair suppresses the initial re-read entirely when the file has not
+    /// changed since the save. All strings are duped; caller keeps theirs.
+    pub fn seed(self: *Poller, path: []const u8, mtime_ns: i96, size: u64, records: []const WireRecord) !void {
+        const snap = try self.snapFor(path);
+        snap.mtime_ns = mtime_ns;
+        snap.size = size;
+        for (records) |w| {
+            try self.putStored(snap, w.key, .{
+                .agent = self.agent,
+                .timestamp_ms = w.timestamp_ms,
+                .model = w.model,
+                .input_tokens = w.input,
+                .output_tokens = w.output,
+                .cache_creation_tokens = w.cache_creation,
+                .cache_read_tokens = w.cache_read,
+                .session_id = w.session_id,
+                .cwd = w.cwd,
+            });
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Polling
+    // -----------------------------------------------------------------------
+
+    /// Stat `path` and, only when its mtime or size moved, re-read and
+    /// re-parse it, appending add/replace Changes to `out`. Emitted event
+    /// strings are duped with `event_allocator` (free with `freeChanges`),
+    /// which is also used for transient read/parse scratch via an arena.
+    /// A vanished or unreadable file is silently skipped.
+    pub fn scanFile(
+        self: *Poller,
+        event_allocator: Allocator,
+        io: std.Io,
+        path: []const u8,
+        out: *std.ArrayList(Change),
+    ) !void {
+        var cwd = std.Io.Dir.cwd();
+        const stat = cwd.statFile(io, path, .{}) catch return;
+        if (self.snapshots.getPtr(path)) |snap| {
+            if (snap.mtime_ns == stat.mtime.nanoseconds and snap.size == stat.size) return;
+        }
+
+        var file = cwd.openFile(io, path, .{}) catch return;
+        defer file.close(io);
+        const size = file.length(io) catch return;
+
+        var arena_state = std.heap.ArenaAllocator.init(event_allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const buf = try arena.alloc(u8, @intCast(size));
+        const n = file.readPositionalAll(io, buf, 0) catch return;
+
+        const empty: []Record = &.{};
+        const records: []const Record = self.adapter.parseFile(arena, buf[0..n], .{
+            .path = path,
+            .agent = self.agent,
+        }) catch empty;
+
+        const snap = try self.snapFor(path);
+        for (records) |rec| {
+            if (rec.key.len == 0) continue;
+            var current = rec.event;
+            current.agent = self.agent;
+
+            if (snap.records.getPtr(rec.key)) |old| {
+                if (eventEqual(old.*, current)) continue;
+                const cur_owned = try dupeEvent(event_allocator, current);
+                errdefer freeEvent(event_allocator, cur_owned);
+                const prev_owned = try dupeEvent(event_allocator, old.*);
+                errdefer freeEvent(event_allocator, prev_owned);
+                try out.append(event_allocator, .{ .previous = prev_owned, .current = cur_owned });
+            } else {
+                const cur_owned = try dupeEvent(event_allocator, current);
+                errdefer freeEvent(event_allocator, cur_owned);
+                try out.append(event_allocator, .{ .previous = null, .current = cur_owned });
+            }
+            try self.putStored(snap, rec.key, current);
+        }
+        // Disappeared keys stay in the snapshot on purpose (see module doc).
+        snap.mtime_ns = stat.mtime.nanoseconds;
+        snap.size = stat.size;
+    }
+
+    /// Recursively find every file matching the adapter's suffix under each
+    /// root and scanFile it. Unreadable roots and files are skipped, not
+    /// errors: polls race live writers. `event_allocator` doubles as walk
+    /// scratch (arena-friendly).
+    pub fn sweep(
+        self: *Poller,
+        event_allocator: Allocator,
+        io: std.Io,
+        roots: []const []const u8,
+        out: *std.ArrayList(Change),
+    ) !void {
+        var cwd = std.Io.Dir.cwd();
+        for (roots) |root| {
+            var dir = cwd.openDir(io, root, .{ .iterate = true }) catch continue;
+            defer dir.close(io);
+            var walker = try dir.walk(event_allocator);
+            defer walker.deinit();
+            while (true) {
+                const entry = (walker.next(io) catch break) orelse break;
+                if (entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, entry.path, self.adapter.file_suffix)) continue;
+                const path = try std.fs.path.join(event_allocator, &.{ root, entry.path });
+                defer event_allocator.free(path);
+                self.scanFile(event_allocator, io, path, out) catch continue;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Internals
+    // -----------------------------------------------------------------------
+
+    fn snapFor(self: *Poller, path: []const u8) !*FileSnapshot {
+        const gop = try self.snapshots.getOrPut(self.allocator, path);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, path) catch |err| {
+                self.snapshots.removeByPtr(gop.key_ptr);
+                return err;
+            };
+            gop.value_ptr.* = .{};
+        }
+        return gop.value_ptr;
+    }
+
+    fn putStored(self: *Poller, snap: *FileSnapshot, key: []const u8, event: types.UsageEvent) !void {
+        const owned_event = try dupeEvent(self.allocator, event);
+        errdefer freeEvent(self.allocator, owned_event);
+        if (snap.records.getPtr(key)) |slot| {
+            freeEvent(self.allocator, slot.*);
+            slot.* = owned_event;
+            return;
+        }
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+        try snap.records.put(self.allocator, owned_key, owned_event);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Event helpers
+// ---------------------------------------------------------------------------
+
+fn dupeEvent(allocator: Allocator, ev: types.UsageEvent) !types.UsageEvent {
+    const model = try allocator.dupe(u8, ev.model);
+    errdefer allocator.free(model);
+    const session_id = try allocator.dupe(u8, ev.session_id);
+    errdefer allocator.free(session_id);
+    const cwd = try allocator.dupe(u8, ev.cwd);
+    return .{
+        .agent = ev.agent,
+        .timestamp_ms = ev.timestamp_ms,
+        .model = model,
+        .input_tokens = ev.input_tokens,
+        .output_tokens = ev.output_tokens,
+        .cache_creation_tokens = ev.cache_creation_tokens,
+        .cache_read_tokens = ev.cache_read_tokens,
+        .session_id = session_id,
+        .cwd = cwd,
+    };
+}
+
+fn freeEvent(allocator: Allocator, ev: types.UsageEvent) void {
+    allocator.free(ev.model);
+    allocator.free(ev.session_id);
+    allocator.free(ev.cwd);
+}
+
+fn eventEqual(a: types.UsageEvent, b: types.UsageEvent) bool {
+    return a.timestamp_ms == b.timestamp_ms and a.input_tokens == b.input_tokens and
+        a.output_tokens == b.output_tokens and a.cache_creation_tokens == b.cache_creation_tokens and
+        a.cache_read_tokens == b.cache_read_tokens and std.mem.eql(u8, a.model, b.model) and
+        std.mem.eql(u8, a.session_id, b.session_id) and std.mem.eql(u8, a.cwd, b.cwd);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// Trivial test format, one record per line:
+///   `<key> <ts_ms> <input> <output> <model> <session_id>`
+/// Malformed lines are skipped. Counts invocations so the mtime gate is
+/// observable ("unchanged file -> zero work").
+var test_parse_calls: usize = 0;
+
+fn testParseFile(arena: Allocator, bytes: []const u8, ctx: FileContext) anyerror![]Record {
+    test_parse_calls += 1;
+    var list: std.ArrayList(Record) = .empty;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        var it = std.mem.splitScalar(u8, std.mem.trim(u8, line, " \t\r"), ' ');
+        const key = it.next() orelse continue;
+        if (key.len == 0) continue;
+        const ts = std.fmt.parseInt(i64, it.next() orelse continue, 10) catch continue;
+        const input = std.fmt.parseInt(u64, it.next() orelse continue, 10) catch continue;
+        const output = std.fmt.parseInt(u64, it.next() orelse continue, 10) catch continue;
+        const model = it.next() orelse continue;
+        const session_id = it.next() orelse continue;
+        try list.append(arena, .{
+            .key = key,
+            .event = .{
+                .agent = ctx.agent,
+                .timestamp_ms = ts,
+                .model = model,
+                .input_tokens = input,
+                .output_tokens = output,
+                .session_id = session_id,
+            },
+        });
+    }
+    return list.toOwnedSlice(arena);
+}
+
+const test_adapter = Adapter{
+    .file_suffix = ".snap",
+    .parseFile = testParseFile,
+};
+
+/// Stand-in agent tag: tests exercise the engine mechanics; real adapters
+/// get their variant of types.Agent with engine wiring.
+const test_agent: types.Agent = .opencode;
+
+test "initial parse adds, rewrite replaces and adds, disappearance keeps history" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "s1.snap",
+        .data = "k1 1000 10 1 model-a sess-1\nnot a record\n",
+    });
+
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/s1.snap", .{base});
+
+    var poller = Poller.init(testing.allocator, test_agent, test_adapter);
+    defer poller.deinit();
+    var out: std.ArrayList(Change) = .empty;
+    defer {
+        freeChanges(testing.allocator, out.items);
+        out.deinit(testing.allocator);
+    }
+
+    try poller.scanFile(testing.allocator, io, path, &out);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expect(out.items[0].previous == null);
+    const e1 = out.items[0].current;
+    try testing.expectEqual(test_agent, e1.agent);
+    try testing.expectEqual(@as(i64, 1000), e1.timestamp_ms);
+    try testing.expectEqual(@as(u64, 10), e1.input_tokens);
+    try testing.expectEqual(@as(u64, 1), e1.output_tokens);
+    try testing.expectEqualStrings("model-a", e1.model);
+    try testing.expectEqualStrings("sess-1", e1.session_id);
+
+    // Rewrite: k1 grew, k2 is new -> one replace Change + one add Change.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "s1.snap",
+        .data = "k1 1000 25 3 model-a sess-1\nk2 2000 5 1 model-b sess-1\n",
+    });
+    freeChanges(testing.allocator, out.items);
+    out.clearRetainingCapacity();
+    try poller.scanFile(testing.allocator, io, path, &out);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    const replaced = out.items[0];
+    try testing.expect(replaced.previous != null);
+    try testing.expectEqual(@as(u64, 10), replaced.previous.?.input_tokens);
+    try testing.expectEqual(@as(u64, 1), replaced.previous.?.output_tokens);
+    try testing.expectEqual(@as(u64, 25), replaced.current.input_tokens);
+    try testing.expectEqual(@as(u64, 3), replaced.current.output_tokens);
+    const added = out.items[1];
+    try testing.expect(added.previous == null);
+    try testing.expectEqualStrings("model-b", added.current.model);
+
+    // Truncation: k1 vanishes. No retraction; snapshot still remembers it,
+    // and the unchanged k2 record emits nothing.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "s1.snap",
+        .data = "k2 2000 5 1 model-b sess-1\n",
+    });
+    freeChanges(testing.allocator, out.items);
+    out.clearRetainingCapacity();
+    try poller.scanFile(testing.allocator, io, path, &out);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+
+    var fit = poller.files();
+    const entry = fit.next() orelse return error.TestExpectedEntry;
+    try testing.expectEqualStrings(path, entry.path);
+    var keys_seen: usize = 0;
+    var rit = entry.records;
+    while (rit.next()) |_| keys_seen += 1;
+    try testing.expectEqual(@as(usize, 2), keys_seen); // k1 kept, k2
+    try testing.expect(fit.next() == null);
+
+    // A re-listed k1 with the old numbers is already snapshotted: no
+    // double count when history reappears (size changed -> re-parse).
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "s1.snap",
+        .data = "k1 1000 25 3 model-a sess-1\nk2 2000 5 1 model-b sess-1\n",
+    });
+    try poller.scanFile(testing.allocator, io, path, &out);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "unchanged file is zero work: the mtime/size gate skips the parse" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "s1.snap",
+        .data = "k1 1000 10 1 model-a sess-1\n",
+    });
+
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/s1.snap", .{base});
+
+    var poller = Poller.init(testing.allocator, test_agent, test_adapter);
+    defer poller.deinit();
+    var out: std.ArrayList(Change) = .empty;
+    defer {
+        freeChanges(testing.allocator, out.items);
+        out.deinit(testing.allocator);
+    }
+
+    const calls_before = test_parse_calls;
+    try poller.scanFile(testing.allocator, io, path, &out);
+    try testing.expectEqual(calls_before + 1, test_parse_calls);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+
+    // No rewrite: the gate short-circuits before open/read/parse.
+    try poller.scanFile(testing.allocator, io, path, &out);
+    try poller.scanFile(testing.allocator, io, path, &out);
+    try testing.expectEqual(calls_before + 1, test_parse_calls);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+}
+
+test "sweep walks roots, matches the suffix, and skips other files" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "sessions/aa");
+    try tmp.dir.createDirPath(io, "sessions/bb");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sessions/aa/s1.snap", .data = "k1 1000 10 1 m sess-a\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sessions/bb/s2.snap", .data = "k1 2000 20 2 m sess-b\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sessions/bb/notes.txt", .data = "k9 9 9 9 m s\n" });
+
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "{s}/sessions", .{base});
+    const roots = [_][]const u8{root};
+
+    var poller = Poller.init(testing.allocator, test_agent, test_adapter);
+    defer poller.deinit();
+    var out: std.ArrayList(Change) = .empty;
+    defer {
+        freeChanges(testing.allocator, out.items);
+        out.deinit(testing.allocator);
+    }
+
+    try poller.sweep(testing.allocator, io, &roots, &out);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    // Same key "k1" in two files stays two independent records.
+    var input_sum: u64 = 0;
+    for (out.items) |ch| input_sum += ch.current.input_tokens;
+    try testing.expectEqual(@as(u64, 30), input_sum);
+
+    // Quiet second sweep: nothing re-emitted.
+    try poller.sweep(testing.allocator, io, &roots, &out);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+}
+
+test "seed restores snapshots: no re-emission, replaces carry the seeded previous" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const history = "k1 1000 10 1 model-a sess-1\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "s1.snap", .data = history });
+
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/s1.snap", .{base});
+    var cwd = std.Io.Dir.cwd();
+    const stat = try cwd.statFile(io, path, .{});
+
+    // Fresh poller restored from a statefile save.
+    var poller = Poller.init(testing.allocator, test_agent, test_adapter);
+    defer poller.deinit();
+    try poller.seed(path, stat.mtime.nanoseconds, stat.size, &.{.{
+        .key = "k1",
+        .timestamp_ms = 1000,
+        .model = "model-a",
+        .input = 10,
+        .output = 1,
+        .session_id = "sess-1",
+    }});
+
+    var out: std.ArrayList(Change) = .empty;
+    defer {
+        freeChanges(testing.allocator, out.items);
+        out.deinit(testing.allocator);
+    }
+
+    // Unchanged since the save: the gate holds, nothing parsed or emitted.
+    const calls_before = test_parse_calls;
+    try poller.scanFile(testing.allocator, io, path, &out);
+    try testing.expectEqual(calls_before, test_parse_calls);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+
+    // Grown record after restore: replace Change with the SEEDED previous.
+    try tmp.dir.writeFile(io, .{ .sub_path = "s1.snap", .data = "k1 1000 100 12 model-a sess-1\n" });
+    try poller.scanFile(testing.allocator, io, path, &out);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expect(out.items[0].previous != null);
+    try testing.expectEqual(@as(u64, 10), out.items[0].previous.?.input_tokens);
+    try testing.expectEqual(@as(u64, 100), out.items[0].current.input_tokens);
+    try testing.expectEqualStrings("sess-1", out.items[0].previous.?.session_id);
+}
+
+test "files() round-trips through seed()" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "s1.snap",
+        .data = "k1 1000 10 1 model-a sess-1\nk2 2000 20 2 model-b sess-1\n",
+    });
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/s1.snap", .{base});
+
+    var poller = Poller.init(testing.allocator, test_agent, test_adapter);
+    defer poller.deinit();
+    var out: std.ArrayList(Change) = .empty;
+    defer {
+        freeChanges(testing.allocator, out.items);
+        out.deinit(testing.allocator);
+    }
+    try poller.scanFile(testing.allocator, io, path, &out);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+
+    // Save: copy what files() yields, restore into a second poller.
+    var restored = Poller.init(testing.allocator, test_agent, test_adapter);
+    defer restored.deinit();
+    var fit = poller.files();
+    while (fit.next()) |entry| {
+        var recs: std.ArrayList(Poller.WireRecord) = .empty;
+        defer recs.deinit(testing.allocator);
+        var rit = entry.records;
+        while (rit.next()) |w| try recs.append(testing.allocator, w);
+        try restored.seed(entry.path, entry.mtime_ns, entry.size, recs.items);
+    }
+
+    // The restored poller sees the same on-disk state as already known.
+    var out2: std.ArrayList(Change) = .empty;
+    defer {
+        freeChanges(testing.allocator, out2.items);
+        out2.deinit(testing.allocator);
+    }
+    try restored.scanFile(testing.allocator, io, path, &out2);
+    try testing.expectEqual(@as(usize, 0), out2.items.len);
+}
