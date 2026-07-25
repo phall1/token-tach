@@ -106,7 +106,9 @@ exists, silent if not), read-only, and exact — token counts come from the
 harnesses' own logs, never estimated. `token-tach --json` reports per-source
 coverage (enabled / detected / events) so you can see exactly what is and
 isn't being counted. Harnesses that don't persist exact local token data
-(Cursor, Windsurf, Grok Build, Amazon Q, ...) are deliberately excluded.
+(Cursor, Windsurf, Grok Build, Amazon Q, ...) are deliberately excluded —
+the full matrix, including honest gaps, lives in
+[docs/COVERAGE.md](docs/COVERAGE.md).
 
 **Opt-in (`claude-oauth = true`):** Claude's server-truth utilization via
 `GET https://api.anthropic.com/api/oauth/usage` with your existing Claude

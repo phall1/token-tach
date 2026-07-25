@@ -100,10 +100,20 @@ token-tach/
   `{used_percent, window_minutes, resets_at (epoch sec)}` + `plan_type`.
   Current limits = last token_count line of newest rollout file.
 
-### Later sources (plugin seam)
-- opencode (`~/.local/share/opencode/storage/`, JSON, has per-message tokens/cost),
-  Gemini CLI (requires user-enabled local OTEL telemetry), others behind the
-  `Source` interface. Cursor/Copilot are server-side only — out of scope.
+### Local harness coverage (v0.6, the collector fleet)
+- Automatic exact-token collectors: Claude Code, Codex CLI, OpenCode, Pi,
+  Gemini CLI, Qwen Code, Kimi CLI, Goose, Kilo Code, Cline, Roo Code —
+  built on two generic engines (tailsource for append-only JSONL,
+  snapsource for rewritten-JSON snapshots) plus read-only SQLite pollers.
+- Stable per-record keys reconcile through add/replace or dedup semantics;
+  tailer offsets, SQLite high-waters, and snapshot records persist in
+  statefile v3 for warm restarts.
+- `--json.coverage` reports enabled/detected/events per source. Copilot CLI,
+  Continue CLI, Factory Droid, and Grok Build are enum-reserved but pending
+  format reconciliation (two research passes disagreed; see bead tracker) —
+  exact-only is the bar, so contested formats don't ship counters.
+- Cursor, Windsurf, Aider, Amp, Zed, Amazon Q, and Crush remain explicit
+  gaps until they expose durable exact counters (see docs/COVERAGE.md).
 
 ## Prediction (the differentiator)
 
@@ -134,8 +144,9 @@ token-tach/
 - **v1.2**: notifications — threshold crossings (70/90 %), predicted wall
   within N min, window-reset all-clear. Quiet hours.
 - **v1.3**: `token-tach --json` CLI / statusline output from the same core.
-- **v2**: plugin sources (opencode, Gemini), themes, maybe WidgetKit companion
-  (requires a small Swift extension — separate decision).
+- **v2**: provider/gateway reconciliation adapters, isolated subprocess source
+  plugins, themes, and maybe a WidgetKit companion (requires a small Swift
+  extension — separate decision).
 
 ## Distribution / trust story
 
