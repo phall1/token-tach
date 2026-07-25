@@ -242,7 +242,11 @@ test "a disabled source says so instead of showing dead bars" {
     defer arena_state.deinit();
 
     var model = instrumentedModel();
-    model.cfg.sources = .{ .claude = false, .codex = true };
+    model.cfg.sources = blk: {
+        var s = @import("core/config.zig").Sources.none;
+        s.enable(.codex);
+        break :blk s;
+    };
     const tree = try buildTree(arena_state.allocator(), &model);
 
     try testing.expect(containsText(tree.root, "disabled"));

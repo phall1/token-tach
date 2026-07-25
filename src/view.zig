@@ -609,7 +609,7 @@ fn agentGroup(
 
 fn compactOpenCodeRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
     const y = panel_y + 194;
-    const enabled = model.cfg.sources.opencode;
+    const enabled = model.cfg.sources.enabled(.opencode);
     const totals = model.ledger.forAgent(.opencode);
     const empty = enabled and engine.agentIsEmpty(model, .opencode);
     push(ui, nodes, ui.paragraph(.{

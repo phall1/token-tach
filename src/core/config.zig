@@ -23,20 +23,35 @@
 //! arena — that is the intended usage.
 
 const std = @import("std");
+const types = @import("types.zig");
 
 /// Refuse to slurp config files larger than this (something is wrong).
 const max_config_bytes: usize = 1 << 20;
 
-/// Which usage sources are enabled (key: `source`).
-pub const Sources = packed struct {
-    claude: bool = true,
-    codex: bool = true,
-    opencode: bool = true,
+/// Which usage sources are enabled (key: `source`). Backed by the Agent
+/// enum, so a new collector extends the config surface (and the `source`
+/// key's accepted names) by existing — no parser edits.
+pub const Sources = struct {
+    set: std.EnumSet(types.Agent) = std.EnumSet(types.Agent).initFull(),
 
-    pub const none: Sources = .{ .claude = false, .codex = false, .opencode = false };
+    pub const none: Sources = .{ .set = std.EnumSet(types.Agent).initEmpty() };
+
+    pub fn enabled(self: Sources, agent: types.Agent) bool {
+        return self.set.contains(agent);
+    }
+
+    pub fn enable(self: *Sources, agent: types.Agent) void {
+        self.set.insert(agent);
+    }
 
     pub fn any(self: Sources) bool {
-        return self.claude or self.codex or self.opencode;
+        return self.set.count() > 0;
+    }
+
+    /// Sources in `self` but not in `other` — "what did this reload
+    /// newly enable".
+    pub fn addedSince(self: Sources, other: Sources) Sources {
+        return .{ .set = self.set.differenceWith(other.set) };
     }
 };
 
@@ -198,17 +213,18 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) error{OutOfMemory}!
             while (items.next()) |item_raw| {
                 const item = std.mem.trim(u8, item_raw, " \t");
                 if (item.len == 0) continue;
-                if (std.ascii.eqlIgnoreCase(item, "claude")) {
-                    sources.claude = true;
-                    sources_touched = true;
-                } else if (std.ascii.eqlIgnoreCase(item, "codex")) {
-                    sources.codex = true;
-                    sources_touched = true;
-                } else if (std.ascii.eqlIgnoreCase(item, "opencode")) {
-                    sources.opencode = true;
+                const matched: ?types.Agent = blk: {
+                    inline for (@typeInfo(types.Agent).@"enum".fields) |field| {
+                        const agent: types.Agent = @enumFromInt(field.value);
+                        if (std.ascii.eqlIgnoreCase(item, agent.label())) break :blk agent;
+                    }
+                    break :blk null;
+                };
+                if (matched) |agent| {
+                    sources.enable(agent);
                     sources_touched = true;
                 } else {
-                    try warn(allocator, &warnings, line_no, "source: unknown source \"{s}\" (want claude, codex, opencode); skipped", .{item});
+                    try warn(allocator, &warnings, line_no, "source: unknown source \"{s}\"; skipped", .{item});
                 }
             }
         } else if (std.mem.eql(u8, key, "system-stats")) {
@@ -389,9 +405,9 @@ test "defaults when empty" {
     try testing.expectEqual(false, result.config.claude_oauth);
     try testing.expectEqual(@as(u32, 180), result.config.poll_interval_s);
     try testing.expectEqualStrings("tach-dark", result.config.theme);
-    try testing.expect(result.config.sources.claude);
-    try testing.expect(result.config.sources.codex);
-    try testing.expect(result.config.sources.opencode);
+    try testing.expect(result.config.sources.enabled(.claude));
+    try testing.expect(result.config.sources.enabled(.codex));
+    try testing.expect(result.config.sources.enabled(.opencode));
     try testing.expectEqual(@as(usize, 0), result.config.claude_config_dirs.len);
     try testing.expectEqualStrings("", result.config.codex_home);
     try testing.expectEqualStrings("", result.config.opencode_db);
@@ -434,9 +450,9 @@ test "full happy-path config" {
     try testing.expectEqual(true, result.config.claude_oauth);
     try testing.expectEqual(@as(u32, 180), result.config.poll_interval_s);
     try testing.expectEqualStrings("tach-light", result.config.theme);
-    try testing.expect(result.config.sources.claude);
-    try testing.expect(!result.config.sources.codex);
-    try testing.expect(!result.config.sources.opencode);
+    try testing.expect(result.config.sources.enabled(.claude));
+    try testing.expect(!result.config.sources.enabled(.codex));
+    try testing.expect(!result.config.sources.enabled(.opencode));
     try testing.expectEqual(@as(usize, 1), result.config.claude_config_dirs.len);
     try testing.expectEqualStrings("~/.claude", result.config.claude_config_dirs[0]);
     try testing.expectEqualStrings("/Users/x/.codex", result.config.codex_home);
@@ -480,9 +496,9 @@ test "bad values warn and keep defaults" {
     try testing.expectEqual(false, result.config.claude_oauth);
     try testing.expectEqual(@as(u32, 180), result.config.poll_interval_s);
     try testing.expectEqualSlices(u8, &.{ 70, 90 }, result.config.alert_thresholds);
-    try testing.expect(result.config.sources.claude);
-    try testing.expect(result.config.sources.codex);
-    try testing.expect(result.config.sources.opencode);
+    try testing.expect(result.config.sources.enabled(.claude));
+    try testing.expect(result.config.sources.enabled(.codex));
+    try testing.expect(result.config.sources.enabled(.opencode));
 }
 
 test "partially bad list keeps the good items" {
@@ -538,8 +554,8 @@ test "list keys append across repeated occurrences" {
     try testing.expectEqual(@as(usize, 2), result.config.claude_config_dirs.len);
     try testing.expectEqualStrings("~/.claude", result.config.claude_config_dirs[0]);
     try testing.expectEqualStrings("~/work/.config/claude", result.config.claude_config_dirs[1]);
-    try testing.expect(result.config.sources.claude);
-    try testing.expect(result.config.sources.codex);
+    try testing.expect(result.config.sources.enabled(.claude));
+    try testing.expect(result.config.sources.enabled(.codex));
 }
 
 test "empty list value clears to empty" {

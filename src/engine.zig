@@ -256,11 +256,7 @@ pub fn oauthStaleMin(model: *const Model) ?u64 {
 
 /// Is this agent's source enabled in config?
 pub fn sourceEnabled(sources: config.Sources, agent: types.Agent) bool {
-    return switch (agent) {
-        .claude => sources.claude,
-        .codex => sources.codex,
-        .opencode => sources.opencode,
-    };
+    return sources.enabled(agent);
 }
 
 /// True when an agent has nothing to report: source enabled but zero
@@ -420,11 +416,7 @@ pub fn maybeReloadConfig(model: *Model) ?config.Sources {
         model.oauth_backoff = .{};
         model.oauth_next_ms = model.now_ms;
     }
-    return .{
-        .claude = model.cfg.sources.claude and !old_sources.claude,
-        .codex = model.cfg.sources.codex and !old_sources.codex,
-        .opencode = model.cfg.sources.opencode and !old_sources.opencode,
-    };
+    return model.cfg.sources.addedSince(old_sources);
 }
 
 pub fn boot(model: *Model, fx: *Effects) void {
@@ -504,8 +496,8 @@ fn enumerateHistory(model: *Model, only: config.Sources) !void {
     defer walk_arena.deinit();
 
     const groups = [_]struct { agent: types.Agent, roots: []const []const u8, enabled: bool }{
-        .{ .agent = .claude, .roots = model.claude_roots, .enabled = only.claude },
-        .{ .agent = .codex, .roots = model.codex_roots, .enabled = only.codex },
+        .{ .agent = .claude, .roots = model.claude_roots, .enabled = only.enabled(.claude) },
+        .{ .agent = .codex, .roots = model.codex_roots, .enabled = only.enabled(.codex) },
     };
     for (groups) |group| {
         if (!group.enabled) continue;
@@ -792,7 +784,7 @@ fn sweepOnce(model: *Model) void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    if (model.cfg.sources.claude) {
+    if (model.cfg.sources.enabled(.claude)) {
         var sink = claude.ListSink.init(model.allocator);
         defer sink.deinit();
         _ = model.claude_tailer.sweepIncremental(arena, io, model.claude_roots, sink.sink(), model.now_ms) catch |err| blk: {
@@ -802,7 +794,7 @@ fn sweepOnce(model: *Model) void {
         for (sink.events.items) |ev| ingest(model, ev);
     }
 
-    if (model.cfg.sources.codex) {
+    if (model.cfg.sources.enabled(.codex)) {
         var events: std.ArrayList(types.UsageEvent) = .empty;
         defer events.deinit(arena);
         _ = model.codex_tailer.sweepIncremental(io, arena, model.codex_roots, &events, model.now_ms) catch |err| blk: {
@@ -822,7 +814,7 @@ fn sweepOnce(model: *Model) void {
         }
     }
 
-    if (model.cfg.sources.opencode) {
+    if (model.cfg.sources.enabled(.opencode)) {
         var changes: std.ArrayList(opencode.Change) = .empty;
         defer {
             opencode.freeChanges(arena, changes.items);
@@ -1386,10 +1378,10 @@ test "config live-reload: mtime change reapplies, unchanged mtime does not" {
     // First observation (mtime unknown at setup): reload. Claude was
     // already enabled by default, so nothing is NEWLY enabled by v1.
     const first = maybeReloadConfig(&model) orelse return error.TestUnexpectedResult;
-    try testing.expect(!first.claude and !first.codex);
+    try testing.expect(!first.enabled(.claude) and !first.enabled(.codex));
     try testing.expectEqualStrings("AAA", model.cfg.tray_format);
-    try testing.expect(!model.cfg.sources.claude);
-    try testing.expect(model.cfg.sources.codex);
+    try testing.expect(!model.cfg.sources.enabled(.claude));
+    try testing.expect(model.cfg.sources.enabled(.codex));
 
     // Unchanged mtime: no reload, no churn.
     try testing.expectEqual(@as(?config.Sources, null), maybeReloadConfig(&model));
@@ -1408,8 +1400,8 @@ test "config live-reload: mtime change reapplies, unchanged mtime does not" {
         });
     }
     const second = maybeReloadConfig(&model) orelse return error.TestUnexpectedResult;
-    try testing.expect(second.claude);
-    try testing.expect(!second.codex);
+    try testing.expect(second.enabled(.claude));
+    try testing.expect(!second.enabled(.codex));
     try testing.expectEqualStrings("BBB", model.cfg.tray_format);
     try testing.expect(model.cfg.claude_oauth);
     // Fresh opt-in reopens the poll gate immediately.

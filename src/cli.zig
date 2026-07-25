@@ -243,14 +243,14 @@ pub fn collect(arena: std.mem.Allocator, io: std.Io, env: Env, now_ms: i64) !Sna
     // ONE incremental sweep per enabled source: appended bytes on the warm
     // path, full history on the cold path. Sweep errors degrade to
     // whatever was restored; they never fail the snapshot.
-    if (cfg.sources.claude) {
+    if (cfg.sources.enabled(.claude)) {
         var sink = claude.ListSink.init(arena);
         _ = claude_tailer.sweepIncremental(arena, io, claude_roots, sink.sink(), now_ms) catch false;
         for (sink.events.items) |ev| {
             ledger.add(ev, if (prices) |*db| db.costOf(ev) else null) catch {};
         }
     }
-    if (cfg.sources.codex) {
+    if (cfg.sources.enabled(.codex)) {
         var events: std.ArrayList(types.UsageEvent) = .empty;
         _ = codex_tailer.sweepIncremental(io, arena, codex_roots, &events, now_ms) catch false;
         for (events.items) |ev| {
@@ -261,7 +261,7 @@ pub fn collect(arena: std.mem.Allocator, io: std.Io, env: Env, now_ms: i64) !Sna
         // borrowed slices are arena-owned, so they outlive the tailer var.
         snap.codex_limits = codex_tailer.lastLimits();
     }
-    if (cfg.sources.opencode) {
+    if (cfg.sources.enabled(.opencode)) {
         var changes: std.ArrayList(opencode.Change) = .empty;
         opencode_poller.poll(arena, opencode_path, &changes) catch {};
         for (changes.items) |change| {
