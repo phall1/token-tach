@@ -77,6 +77,12 @@ pixel through Metal.
   from the same OAuth endpoint Claude Code's `/usage` uses. Codex is even
   better: it writes its `rate_limits` straight into its rollout files —
   zero network for OpenAI numbers.
+- **Telemetry is pushed, not polled.** The system strip is fed by a background
+  sampler thread that owns its own counters and `post`s each reading through
+  a Native SDK [external-source channel](https://github.com/vercel-labs/native) —
+  the UI updates when the machine changes, on its own cadence, replay-safe,
+  with no shared mutable state. Hover any cell and the footer reveals its full
+  precision via the SDK's `on_hover_enter`/`on_hover_leave` Msg bindings.
 - **Everything is fixture-tested.** ~100 tests over the UI-free core
   (tailers, pricing, prediction, ledger, config, state), and `scripts/verify`
   launches the real app headlessly, toggles the actual popover, walks the
@@ -190,6 +196,8 @@ src/main.zig    shell: scene, status item, popover, runtime entry
 
 ## Status
 
+v0.8: pushed system telemetry via a Native SDK external-source channel;
+hover-reveal detail on every strip cell.
 v0.7: rebased onto Native SDK v0.6; dashboard accuracy pass (honest
 subscription-value multiple, synchronous timezone resolution, live system
 strip from the first frame).
