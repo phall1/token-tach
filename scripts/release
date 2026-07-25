@@ -96,9 +96,14 @@ if [[ "$UNIVERSAL" == 1 ]]; then
   lipo "$APP_BIN" -verify_arch arm64 x86_64
 fi
 
-echo "==> signature verification"
-codesign --verify --deep --strict --verbose=2 "$APP"
+# Signing and the strict deep verification both happen INSIDE
+# `native package` (SDK tooling/codesign.zig): a bundle that signs but
+# does not verify fails the package step itself, so re-running codesign
+# --verify here would only duplicate the SDK's own gate (tt-3qb). What
+# the SDK does NOT check is release policy — that the signature is by
+# the *requested* Developer ID and team — so that stays here.
 if [[ -n "$IDENTITY" ]]; then
+  echo "==> signature policy"
   SIGNATURE_INFO="$(mktemp)"
   trap 'rm -f "$SIGNATURE_INFO"' EXIT
   codesign -d --verbose=4 "$APP" 2>"$SIGNATURE_INFO"
@@ -130,6 +135,10 @@ else
   exit 1
 fi
 
+# Notarization stays in shell: the SDK's codesign.notarize() speaks
+# Apple-ID/keychain-profile auth only, while CI uses App Store Connect
+# API keys (NOTARY_KEY_*) — the argv below matches the SDK's
+# notarizeSubmitArgv/stapleArgv shapes for the parts both cover.
 if [[ "$NOTARIZE" == 1 ]]; then
   echo "==> notarize"
   if [[ -n "${NOTARY_KEY_PATH:-}" || -n "${NOTARY_KEY_ID:-}" || -n "${NOTARY_ISSUER_ID:-}" ]]; then
