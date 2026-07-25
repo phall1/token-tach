@@ -144,6 +144,7 @@ poll-interval = 180s
 alert-threshold = 70, 90
 source = claude, codex, opencode # enable/disable agents
 system-stats = true        # or a list: cpu, gpu, mem, disk, net, battery
+launch-at-login = true     # login item (installed app); unset = never touched
 # claude-config-dir = ~/some/other/claude-root
 # codex-home = ~/.codex
 # opencode-db = ~/.local/share/opencode/opencode.db

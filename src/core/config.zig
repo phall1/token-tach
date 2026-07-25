@@ -69,6 +69,11 @@ pub const Config = struct {
     alert_thresholds: []const u8 = &default_alert_thresholds,
     /// `claude-oauth` — opt-in to Keychain OAuth limit polling.
     claude_oauth: bool = false,
+    /// `launch-at-login` — register/unregister the app as a login item
+    /// (macOS 13+, packaged .app only). Absent (the default) means the
+    /// app never touches the OS registration; true/false enforce it on
+    /// start and on live reload.
+    launch_at_login: ?bool = null,
     /// `poll-interval` — OAuth poll cadence in seconds. Accepts a bare
     /// number of seconds or an `s`/`m`/`h` suffix ("180", "180s", "3m", "1h").
     poll_interval_s: u32 = 180,
@@ -149,6 +154,12 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) error{OutOfMemory}!
             cfg.codex_home = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, key, "opencode-db")) {
             cfg.opencode_db = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, key, "launch-at-login")) {
+            if (parseBool(value)) |b| {
+                cfg.launch_at_login = b;
+            } else {
+                try warn(allocator, &warnings, line_no, "launch-at-login: invalid boolean \"{s}\" (want true/false/yes/no/1/0); keeping unset", .{value});
+            }
         } else if (std.mem.eql(u8, key, "claude-oauth")) {
             if (parseBool(value)) |b| {
                 cfg.claude_oauth = b;
@@ -686,4 +697,20 @@ test "system-stats keeps the default when only unknown modules are named" {
     try testing.expect(result.config.system_stats.cpu);
     try testing.expect(result.config.system_stats.battery);
     try testing.expectEqual(@as(usize, 2), result.warnings.len);
+}
+
+test "launch-at-login parses as tri-state" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const unset = try parse(arena, "theme = x\n");
+    try testing.expectEqual(@as(?bool, null), unset.config.launch_at_login);
+
+    const on = try parse(arena, "launch-at-login = yes\n");
+    try testing.expectEqual(@as(?bool, true), on.config.launch_at_login);
+
+    const bad = try parse(arena, "launch-at-login = maybe\n");
+    try testing.expectEqual(@as(?bool, null), bad.config.launch_at_login);
+    try testing.expectEqual(@as(usize, 1), bad.warnings.len);
 }

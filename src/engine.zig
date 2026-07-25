@@ -113,6 +113,11 @@ pub const Model = struct {
     system_sampler: system.Sampler = system.Sampler.init(),
     system_snap: system.Snapshot = .{},
 
+    /// The launch-at-login value last pushed to the OS (null = never
+    /// pushed). Applying is idempotent-guarded on this so config
+    /// reload polls don't hammer SMAppService.
+    launch_at_login_applied: ?bool = null,
+
     // OAuth poller state.
     oauth_backoff: oauth.Backoff = .{},
     oauth_next_ms: i64 = 0,
@@ -616,6 +621,9 @@ const config_template =
     \\#claude-oauth = true
     \\#poll-interval = 180s
     \\
+    \\# Register as a login item (installed app, macOS 13+). Unset = never touch it.
+    \\#launch-at-login = true
+    \\
     \\#alert-threshold = 70, 90
     \\#source = claude, codex, opencode
     \\#claude-config-dir = ~/some/other/claude-root
@@ -684,6 +692,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 }
                 refreshDisplay(model);
             }
+            applyLaunchAtLogin(model, fx);
             // While catch-up owns the tailers, the steady sweep stands
             // down (offsets make overlap safe, but it's wasted work).
             if (!model.catchup_active) {
@@ -883,6 +892,25 @@ fn storeLimits(model: *Model, slot: *?types.LimitSnapshot, snap: types.LimitSnap
         model.allocator.free(old.plan);
     }
     slot.* = .{ .agent = snap.agent, .read_at_ms = snap.read_at_ms, .plan = plan, .windows = windows };
+}
+
+/// Enforce the config's `launch-at-login` preference (tt-rex). Absent
+/// key = never touch the OS registration. Guarded on the last pushed
+/// value, so this is a no-op on every tick until the config changes.
+/// A bare dev binary reports RequiresAppBundle — logged once, not an
+/// error status (the packaged app is where the preference is real).
+fn applyLaunchAtLogin(model: *Model, fx: *Effects) void {
+    const want = model.cfg.launch_at_login orelse return;
+    if (model.launch_at_login_applied == want) return;
+    const services = fx.services orelse return;
+    // Mark attempted either way: a failing environment (dev binary,
+    // macOS < 13) will not succeed on retry, so don't retry every tick.
+    model.launch_at_login_applied = want;
+    services.setLaunchAtLogin(want) catch |err| {
+        std.log.warn("launch-at-login = {}: not applied ({s}) — the packaged app (macOS 13+) is required", .{ want, @errorName(err) });
+        return;
+    };
+    std.log.info("launch-at-login: {}", .{want});
 }
 
 fn dispatchAlerts(model: *Model, fx: *Effects) void {
