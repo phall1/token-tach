@@ -190,8 +190,11 @@ src/main.zig    shell: scene, status item, popover, runtime entry
 
 ## Status
 
-v0.5: system telemetry (CPU/GPU/mem/disk/net/battery) joins the cluster,
-on Native SDK v0.5.
+v0.7: rebased onto Native SDK v0.6; dashboard accuracy pass (honest
+subscription-value multiple, synchronous timezone resolution, live system
+strip from the first frame).
+v0.6: the collector fleet — 11 zero-config usage sources.
+v0.5: system telemetry (CPU/GPU/mem/disk/net/battery) joins the cluster.
 v0.3: history dashboard, notifications, and local-only CLI/statusline mode.
 Follow-up work is tracked in [beads](https://github.com/steveyegge/beads)
 (`bd list`).
