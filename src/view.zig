@@ -620,9 +620,6 @@ fn compactOthersRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model
     var combined_cost: f64 = 0;
     var active_count: usize = 0;
     var any_enabled = false;
-    // Top contributor names by cost, small fixed lineup.
-    var top_names: [3][]const u8 = undefined;
-    var top_costs: [3]f64 = .{ -1, -1, -1 };
     inline for (@typeInfo(types.Agent).@"enum".fields) |field| {
         const agent: types.Agent = @enumFromInt(field.value);
         if (!agent.hasLimitsPanel()) {
@@ -632,39 +629,20 @@ fn compactOthersRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model
                 combined += totals.totalTokens();
                 combined_cost += totals.cost_usd;
                 active_count += 1;
-                var i: usize = 0;
-                while (i < top_costs.len) : (i += 1) {
-                    if (totals.cost_usd > top_costs[i]) {
-                        var j: usize = top_costs.len - 1;
-                        while (j > i) : (j -= 1) {
-                            top_costs[j] = top_costs[j - 1];
-                            top_names[j] = top_names[j - 1];
-                        }
-                        top_costs[i] = totals.cost_usd;
-                        top_names[i] = agent.label();
-                        break;
-                    }
-                }
             }
         }
     }
 
+    // Just the aggregate: which agents feed it is the dashboard's job
+    // (AGENT/SHARE card); a name lineup here wraps into the sparkline
+    // caption at the sizes this row affords.
     var name_spans: [2]canvas.TextSpan = .{
         .{ .text = "OTHERS", .weight = .bold, .monospace = true },
-        .{ .text = "", .color = .text_muted, .monospace = true, .scale = 0.9 },
+        .{ .text = "", .color = .text_muted, .monospace = true, .scale = 0.85 },
     };
-    if (active_count > 0) {
-        name_spans[1].text = switch (@min(active_count, 3)) {
-            1 => ui.fmt("  {s}", .{top_names[0]}),
-            2 => ui.fmt("  {s}·{s}", .{ top_names[0], top_names[1] }),
-            else => if (active_count > 3)
-                ui.fmt("  {s}·{s}+{d}", .{ top_names[0], top_names[1], active_count - 2 })
-            else
-                ui.fmt("  {s}·{s}·{s}", .{ top_names[0], top_names[1], top_names[2] }),
-        };
-    }
+    if (active_count > 1) name_spans[1].text = ui.fmt(" ×{d}", .{active_count});
     push(ui, nodes, ui.paragraph(.{
-        .frame = rect(bars_x, y, 160, 16),
+        .frame = rect(bars_x, y, 100, 16),
         .semantics = .{ .label = "Other agents API-equivalent usage" },
     }, &name_spans));
 
