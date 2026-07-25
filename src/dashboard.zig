@@ -78,7 +78,10 @@ fn hero(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
     stat(ui, nodes, "TOKENS PROCESSED", fmtTokens(ui, rollup.totals.totalTokens()), rect(276, 104, 180, 58), theme.cluster_colors.text);
 
     const value = engine.subscriptionValue(model);
-    const multiple_text = if (value.multipleLowerBound(rollup.totals.cost_usd)) |m|
+    // Numerator is the subscription-COVERED (claude/codex) month cost —
+    // API-billed agents (opencode + the fleet) must not inflate the
+    // multiple, so `rollup.totals.cost_usd` would be wrong here.
+    const multiple_text = if (value.multipleLowerBound(rollup.covered_cost_usd)) |m|
         ui.fmt("≥{d:.1}×", .{m})
     else if (value.incomplete)
         "plan unknown"
@@ -91,7 +94,7 @@ fn hero(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
     panel(ui, nodes, rect(674, 78, 1, 92), theme.hairline, 0);
 
     const plan_text = if (value.plan_hi_usd > 0)
-        ui.fmt("C/C plan denominator: {s}/mo. OpenCode: API-equivalent only.", .{
+        ui.fmt("≥ = covered (Claude/Codex) API-equiv this month over {s}/mo of plans. API-billed agents excluded.", .{
             planBand(ui, value),
         })
     else
@@ -164,9 +167,9 @@ fn agentSplit(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void
     const frame = rect(690, 204, 206, 184);
     card(ui, nodes, frame);
     push(ui, nodes, ui.text(.{
-        .frame = rect(frame.x + 16, frame.y + 14, 160, 16),
+        .frame = rect(frame.x + 16, frame.y + 14, 180, 16),
         .style_tokens = .{ .foreground = .text_muted },
-    }, "AGENT / SHARE"));
+    }, "AGENT / SHARE · ALL-TIME"));
 
     // Dynamic top-3 by cost across every agent the ledger has seen
     // (tt-hr8: the collector fleet can be a dozen agents; three rows +

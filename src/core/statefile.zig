@@ -8,7 +8,7 @@
 //! file, and re-hydrates freshly-initialized tailers/ledger from it so
 //! catch-up only touches bytes appended since the last save.
 //!
-//! Format: a single JSON object, `{"version": 3, ...}`, written atomically
+//! Format: a single JSON object, `{"version": 4, ...}`, written atomically
 //! (tmp file + rename) at a caller-provided path (`defaultPath` yields
 //! `$XDG_STATE_HOME/token-tach/tailers.json`, falling back to
 //! `~/.local/state/...`) with mode 0600 inside a mode-0700 app state directory.
@@ -47,10 +47,11 @@ const fleet_mod = @import("fleet.zig");
 const ledger_mod = @import("ledger.zig");
 
 /// v3 adds the collector-fleet sections (`tailers`, `sqlite`,
-/// `snapshots`) and `ledger.others`. v2 files still restore — the fleet
-/// sections simply default to empty (cold catch-up for those sources).
-pub const format_version: u32 = 3;
-const min_supported_version: u32 = 2;
+/// `snapshots`) and `ledger.others`. v4 adds `ledger.covered_per_day`
+/// (subscription-value numerator). v2/v3 files still restore — the newer
+/// sections default to empty (cold catch-up / a current-month under-read
+/// that self-heals).
+pub const format_version: u32 = 4;
 
 /// Hard ceiling on a plausible state file; anything bigger is corrupt.
 const max_state_bytes = 64 * 1024 * 1024;
@@ -132,6 +133,9 @@ const WireLimits = struct {
 };
 
 const WireDay = struct { day: i64, totals: WireTotals };
+/// Subscription-covered cost for one day; f64 bit pattern for an exact
+/// round-trip like WireTotals.cost_usd_bits.
+const WireCoveredDay = struct { day: i64, cost_usd_bits: u64 = 0 };
 const WireKeyed = struct { key: []const u8, totals: WireTotals };
 
 /// One fleet JSONL-tailer file: line-boundary offset plus the cwd
@@ -186,6 +190,7 @@ const WireLedger = struct {
     opencode: WireTotals = .{},
     others: []const WireAgentTotals = &.{},
     per_day: []const WireDay = &.{},
+    covered_per_day: []const WireCoveredDay = &.{},
     per_model: []const WireKeyed = &.{},
     per_project: []const WireKeyed = &.{},
 };
@@ -431,6 +436,11 @@ fn toWire(
         while (dit.next()) |entry| {
             try days.append(arena, .{ .day = entry.key_ptr.*, .totals = wireTotals(entry.value_ptr.*) });
         }
+        var covered_days: std.ArrayList(WireCoveredDay) = .empty;
+        var cit = ledger.covered_per_day.iterator();
+        while (cit.next()) |entry| {
+            try covered_days.append(arena, .{ .day = entry.key_ptr.*, .cost_usd_bits = @bitCast(entry.value_ptr.*) });
+        }
         var models: std.ArrayList(WireKeyed) = .empty;
         var mit = ledger.per_model.iterator();
         while (mit.next()) |entry| {
@@ -465,6 +475,7 @@ fn toWire(
             .opencode = wireTotals(ledger.per_agent.get(.opencode)),
             .others = try others.toOwnedSlice(arena),
             .per_day = try days.toOwnedSlice(arena),
+            .covered_per_day = try covered_days.toOwnedSlice(arena),
             .per_model = try models.toOwnedSlice(arena),
             .per_project = try projects.toOwnedSlice(arena),
         };
@@ -510,7 +521,12 @@ pub fn restore(
         error.OutOfMemory => return error.OutOfMemory,
         else => return .invalid,
     };
-    if (state.version < min_supported_version or state.version > format_version) return .invalid;
+    // Warm restore requires the exact current format. An older readable
+    // file re-derives once: covered_per_day (v4) can only be rebuilt by
+    // re-parsing history, so `.invalid` here routes the boot path through
+    // a one-time full catch-up, after which the next save is current.
+    // A newer file (downgrade) is never guessed at.
+    if (state.version != format_version) return .invalid;
 
     for (state.claude_files) |f| try claude_tailer.restoreFile(f.path, f.offset);
     for (state.claude_seen) |key| try claude_tailer.restoreSeen(key);
@@ -575,6 +591,10 @@ pub fn restore(
         ledger.per_agent.set(agent, unwireTotals(o.totals));
     }
     for (state.ledger.per_day) |d| try ledger.putDay(d.day, unwireTotals(d.totals));
+    // Absent on v2/v3 files (covered_per_day is a v4 section): the
+    // subscription-value multiple under-reads for the current month
+    // until a cold rescan or month rollover repopulates it.
+    for (state.ledger.covered_per_day) |c| try ledger.putCoveredDay(c.day, @bitCast(c.cost_usd_bits));
     for (state.ledger.per_model) |m| try ledger.putModel(m.key, unwireTotals(m.totals));
     for (state.ledger.per_project) |p| try ledger.putProject(p.key, unwireTotals(p.totals));
 
@@ -773,6 +793,11 @@ test "statefile round-trip: identical totals, no re-reads, dedup survives restar
     try expectTotalsEqual(h1.ledger.forAgent(.opencode), h2.ledger.forAgent(.opencode));
     try testing.expectEqual(@as(u32, 1), h2.opencode_poller.seen.count());
     try testing.expectEqual(h1.ledger.per_day.count(), h2.ledger.per_day.count());
+    // covered_per_day (v4) round-trips bit-exactly.
+    try testing.expectEqual(h1.ledger.covered_per_day.count(), h2.ledger.covered_per_day.count());
+    for (h1.ledger.covered_per_day.keys(), h1.ledger.covered_per_day.values()) |day, cost| {
+        try testing.expectEqual(cost, h2.ledger.covered_per_day.get(day).?);
+    }
     for (h1.ledger.per_day.keys(), h1.ledger.per_day.values()) |day, totals| {
         try expectTotalsEqual(totals, h2.ledger.per_day.get(day).?);
     }
@@ -914,12 +939,14 @@ test "restore outcomes: absent, corrupted, and version mismatch leave state pris
     try testing.expectEqual(@as(usize, 0), h.ledger.per_day.count());
 }
 
-test "a version-2 state file restores with fleet sections default-empty" {
+test "a pre-v4 state file re-derives (invalid -> full catch-up), leaving state pristine" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A minimal pre-fleet save: legacy sections only.
+    // A minimal pre-fleet save: legacy sections only. Older than v4, so
+    // it cannot carry covered_per_day — restore must decline it and let
+    // the boot path re-parse history once (the next save is v4).
     try tmp.dir.writeFile(io, .{
         .sub_path = "v2.json",
         .data = "{\"version\":2,\"claude_files\":[{\"path\":\"/x/s1.jsonl\",\"offset\":57}]," ++
@@ -938,21 +965,12 @@ test "a version-2 state file restores with fleet sections default-empty" {
     defer fl.deinit();
 
     try testing.expectEqual(
-        RestoreOutcome.restored,
+        RestoreOutcome.invalid,
         try restore(testing.allocator, io, path, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &fl, &h.ledger),
     );
-    // Legacy sections hydrated as always…
-    try testing.expectEqual(@as(u32, 1), h.claude_tailer.files.count());
-    try testing.expectEqual(@as(u32, 1), h.claude_tailer.seen.count());
-    try testing.expectEqual(@as(i32, -300), h.ledger.tz_offset_min);
-    try testing.expectEqual(@as(u64, 1), h.ledger.all.events);
-    // …while the fleet stays pristine (cold catch-up for those sources).
-    for (fleet_mod.jsonl_agents) |agent| {
-        var it = fl.tailerConst(agent).?.files();
-        try testing.expect(it.next() == null);
-    }
-    try testing.expectEqual(@as(?i64, 0), fl.highWater(.goose));
-    try testing.expectEqual(@as(?i64, 0), fl.highWater(.kilo));
+    // Nothing hydrated — the caller re-inits and does a full catch-up.
+    try testing.expectEqual(@as(u32, 0), h.claude_tailer.files.count());
+    try testing.expectEqual(@as(u64, 0), h.ledger.all.events);
 }
 
 test "save writes atomically and creates parent directories" {
@@ -974,7 +992,7 @@ test "save writes atomically and creates parent directories" {
     // The final file exists; the tmp staging file does not.
     const data = try std.Io.Dir.cwd().readFileAlloc(io, state_path, testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(data);
-    try testing.expect(std.mem.indexOf(u8, data, "\"version\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "\"version\":4") != null);
     const state_stat = try std.Io.Dir.cwd().statFile(io, state_path, .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), state_stat.permissions.toMode() & 0o777);
     const state_dir = std.fs.path.dirname(state_path).?;

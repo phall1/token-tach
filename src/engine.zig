@@ -8,6 +8,9 @@
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
+const c = @cImport({
+    @cInclude("time.h");
+});
 
 const types = @import("core/types.zig");
 const config = @import("core/config.zig");
@@ -364,7 +367,13 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
         break :blk null;
     };
     model.prices = try pricing.Db.init(allocator);
-    model.ledger = ledger_mod.Ledger.init(allocator, 0);
+    // Resolve the local UTC offset SYNCHRONOUSLY, before the ledger and
+    // its day buckets exist. The async `date +%z` gate below only
+    // confirms it — but catch-up starts on boot, and a ledger created at
+    // tz=0 would bucket months of history under UTC until the subprocess
+    // returns, splitting days for every non-UTC user on a cold start.
+    model.tz_offset_min = localTzOffsetMin();
+    model.ledger = ledger_mod.Ledger.init(allocator, model.tz_offset_min);
 
     // Warm launch: restore tailer offsets + ledger rollups so history is
     // never re-parsed. Any doubt about the file -> pristine full catch-up.
@@ -391,7 +400,7 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
                 model.claude_tailer = claude.Tailer.init(allocator);
                 model.codex_tailer = codex.Tailer.init(allocator);
                 model.opencode_poller = opencode.Poller.init(allocator);
-                model.ledger = ledger_mod.Ledger.init(allocator, 0);
+                model.ledger = ledger_mod.Ledger.init(allocator, model.tz_offset_min);
                 if (model.fleet) |*fl| fl.deinit();
                 model.fleet = fleet.Fleet.init(allocator, fleetEnv(env)) catch null;
                 std.log.warn("state file invalid — falling back to full catch-up", .{});
@@ -735,8 +744,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 refreshDisplay(model);
             }
             applyLaunchAtLogin(model, fx);
-            // While catch-up owns the tailers, the steady sweep stands
-            // down (offsets make overlap safe, but it's wasted work).
+            // Live system telemetry every tick, even mid-catch-up — it
+            // does not touch the usage tailers and must not wait on them.
+            sampleSystem(model);
+            // While catch-up owns the tailers, the steady usage sweep
+            // stands down (offsets make overlap safe, but it's wasted
+            // work); refreshDisplay still runs so the new system sample
+            // reaches the strip.
             if (!model.catchup_active) {
                 const sweep_start_ns = native_sdk.monotonicNanoseconds();
                 sweepOnce(model);
@@ -744,6 +758,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 std.log.debug("sweep: {d} us", .{sweep_us});
                 dispatchAlerts(model, fx);
                 maybeSaveState(model);
+            } else {
+                refreshDisplay(model);
             }
             // First OAuth poll shouldn't wait for the 30 s gate.
             if (!model.first_sweep_done) maybeOauthPoll(model, fx);
@@ -768,10 +784,17 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             refreshDisplay(model);
         },
         .tz_done => |exit| {
+            // The offset is already resolved synchronously in setup; this
+            // is a confirmation. Re-key the ledger ONLY if it is still
+            // empty (the offset genuinely changed before any bucket was
+            // written) — never silently re-key populated day buckets,
+            // which would split a day's spend across two keys.
             if (exit.code == 0) {
                 if (parseTzOffsetMin(exit.output)) |offset| {
                     model.tz_offset_min = offset;
-                    model.ledger.tz_offset_min = offset;
+                    if (model.ledger.per_day.count() == 0) {
+                        model.ledger.tz_offset_min = offset;
+                    }
                 }
             }
         },
@@ -810,6 +833,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
     }
+}
+
+/// The machine's current UTC offset in minutes east, from libc — a
+/// synchronous read (no subprocess) so `setup` can key the ledger before
+/// any history is bucketed. Falls back to UTC if localtime is unavailable.
+pub fn localTzOffsetMin() i32 {
+    var t: c.time_t = c.time(null);
+    var tmv: c.struct_tm = undefined;
+    if (c.localtime_r(&t, &tmv) == null) return 0;
+    return @intCast(@divTrunc(tmv.tm_gmtoff, 60));
 }
 
 /// "+0530" / "-0700" (optionally newline-terminated) -> minutes east.
@@ -892,16 +925,20 @@ fn sweepOnce(model: *Model) void {
         for (changes.items) |change| ingestChange(model, change.previous, change.current);
     }
 
-    // System telemetry rides the same sweep: microseconds of syscalls,
-    // no subprocesses. A config with the strip off skips the calls and
-    // clears the snapshot so the view (and tray tokens) go quiet.
+    refreshDisplay(model);
+}
+
+/// System telemetry: microseconds of syscalls, no subprocesses. Sampled
+/// on EVERY tick — independent of usage catch-up — so the live strip is
+/// present from the first frame even while months of history parse in
+/// the background. Off in config clears the snapshot so the view (and
+/// tray tokens) go quiet.
+fn sampleSystem(model: *Model) void {
     if (model.cfg.system_stats.any()) {
         model.system_snap = model.system_sampler.sample(systemEnabled(model.cfg.system_stats));
     } else {
         model.system_snap = .{};
     }
-
-    refreshDisplay(model);
 }
 
 /// config.SystemStats → system.Enabled, field by field (the two structs
@@ -1252,6 +1289,9 @@ pub const MonthRollup = struct {
     /// Calendar length of the month in days.
     day_count: u8,
     totals: ledger_mod.Totals,
+    /// Subscription-covered (claude/codex) API-equivalent cost this
+    /// month — the honest numerator for the subscription-value multiple.
+    covered_cost_usd: f64,
     /// Local days this month with at least one event.
     active_days: u32,
 };
@@ -1267,6 +1307,7 @@ pub fn monthRollup(ledger: *const ledger_mod.Ledger, now_ms: i64) MonthRollup {
         .first_day_key = first,
         .day_count = day_count,
         .totals = .{},
+        .covered_cost_usd = ledger.coveredCostInRange(first, day_count),
         .active_days = 0,
     };
     for (ledger.per_day.keys(), ledger.per_day.values()) |key, totals| {
@@ -1537,6 +1578,33 @@ test "month rollup respects the ledger tz offset at a month boundary" {
     const rollup = monthRollup(&ledger, now_ms);
     try testing.expectEqual(@as(u8, 7), rollup.month);
     try testing.expectApproxEqAbs(@as(f64, 1.5), rollup.totals.cost_usd, 1e-9);
+}
+
+test "month rollup covered cost excludes API-billed agents" {
+    // The subscription-value multiple's numerator: only claude/codex
+    // count. A fleet/opencode spend that dwarfs them must not inflate it.
+    var ledger = ledger_mod.Ledger.init(testing.allocator, 0);
+    defer ledger.deinit();
+    const now_ms: i64 = (20_643 * 86_400_000) + 12 * 3_600_000;
+    try ledger.add(.{ .agent = .claude, .timestamp_ms = now_ms, .model = "m", .output_tokens = 1 }, 100.0);
+    try ledger.add(.{ .agent = .codex, .timestamp_ms = now_ms, .model = "m", .output_tokens = 1 }, 20.0);
+    try ledger.add(.{ .agent = .opencode, .timestamp_ms = now_ms, .model = "m", .output_tokens = 1 }, 2_000.0);
+    try ledger.add(.{ .agent = .goose, .timestamp_ms = now_ms, .model = "m", .output_tokens = 1 }, 900.0);
+
+    const rollup = monthRollup(&ledger, now_ms);
+    // Blended total has everyone; covered has only claude+codex.
+    try testing.expectApproxEqAbs(@as(f64, 3_020.0), rollup.totals.cost_usd, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 120.0), rollup.covered_cost_usd, 1e-9);
+
+    // The honest multiple against a $220 plan band is 0.5×, not 13.7×.
+    var model = Model{ .allocator = testing.allocator };
+    @memcpy(model.claude_plan_buf[0..3], "max");
+    model.claude_plan = model.claude_plan_buf[0..3];
+    const cw = [_]types.LimitWindow{.{ .kind = .five_hour, .used_percent = 1 }};
+    model.codex_limits = .{ .agent = .codex, .read_at_ms = 0, .plan = "plus", .windows = &cw };
+    model.ledger = ledger;
+    const value = subscriptionValue(&model);
+    try testing.expectApproxEqAbs(@as(f64, 120.0 / 220.0), value.multipleLowerBound(rollup.covered_cost_usd).?, 1e-9);
 }
 
 test "trailing daily cost fills oldest-first with zeros for silent days" {
