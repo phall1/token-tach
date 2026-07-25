@@ -322,6 +322,7 @@ pub fn agentName(agent: types.Agent) []const u8 {
         .claude => "Claude",
         .codex => "Codex",
         .opencode => "OpenCode",
+        else => agent.displayLabel(),
     };
 }
 

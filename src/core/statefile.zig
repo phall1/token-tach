@@ -8,7 +8,7 @@
 //! file, and re-hydrates freshly-initialized tailers/ledger from it so
 //! catch-up only touches bytes appended since the last save.
 //!
-//! Format: a single JSON object, `{"version": 2, ...}`, written atomically
+//! Format: a single JSON object, `{"version": 3, ...}`, written atomically
 //! (tmp file + rename) at a caller-provided path (`defaultPath` yields
 //! `$XDG_STATE_HOME/token-tach/tailers.json`, falling back to
 //! `~/.local/state/...`) with mode 0600 inside a mode-0700 app state directory.
@@ -42,9 +42,10 @@ const types = @import("types.zig");
 const claude = @import("claude.zig");
 const codex = @import("codex.zig");
 const opencode = @import("opencode.zig");
+const harness = @import("harness.zig");
 const ledger_mod = @import("ledger.zig");
 
-pub const format_version: u32 = 2;
+pub const format_version: u32 = 3;
 
 /// Hard ceiling on a plausible state file; anything bigger is corrupt.
 const max_state_bytes = 64 * 1024 * 1024;
@@ -119,6 +120,25 @@ const WireOpenCodeRow = struct {
     cwd: []const u8 = "",
 };
 
+const WireHarnessRow = struct {
+    key: []const u8,
+    agent: []const u8,
+    timestamp_ms: i64,
+    model: []const u8,
+    input: u64 = 0,
+    output: u64 = 0,
+    cache_creation: u64 = 0,
+    cache_read: u64 = 0,
+    session_id: []const u8 = "",
+    cwd: []const u8 = "",
+};
+
+const WireHarnessFile = struct {
+    path: []const u8,
+    size: u64,
+    mtime_ns: i128,
+};
+
 const WireLimits = struct {
     read_at_ms: i64 = 0,
     plan: []const u8 = "",
@@ -127,13 +147,12 @@ const WireLimits = struct {
 
 const WireDay = struct { day: i64, totals: WireTotals };
 const WireKeyed = struct { key: []const u8, totals: WireTotals };
+const WireAgent = struct { agent: []const u8, totals: WireTotals };
 
 const WireLedger = struct {
     tz_offset_min: i32 = 0,
     all: WireTotals = .{},
-    claude: WireTotals = .{},
-    codex: WireTotals = .{},
-    opencode: WireTotals = .{},
+    per_agent: []const WireAgent = &.{},
     per_day: []const WireDay = &.{},
     per_model: []const WireKeyed = &.{},
     per_project: []const WireKeyed = &.{},
@@ -146,6 +165,8 @@ const WireState = struct {
     codex_files: []const WireCodexFile = &.{},
     codex_limits: ?WireLimits = null,
     opencode_rows: []const WireOpenCodeRow = &.{},
+    harness_rows: []const WireHarnessRow = &.{},
+    harness_files: []const WireHarnessFile = &.{},
     ledger: WireLedger = .{},
 };
 
@@ -185,13 +206,14 @@ pub fn save(
     claude_tailer: *const claude.Tailer,
     codex_tailer: *const codex.Tailer,
     opencode_poller: *const opencode.Poller,
+    harness_poller: *const harness.Poller,
     ledger: *const ledger_mod.Ledger,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const state = try toWire(arena, claude_tailer, codex_tailer, opencode_poller, ledger);
+    const state = try toWire(arena, claude_tailer, codex_tailer, opencode_poller, harness_poller, ledger);
     const json = try std.json.Stringify.valueAlloc(arena, state, .{});
 
     var cwd = std.Io.Dir.cwd();
@@ -218,6 +240,7 @@ fn toWire(
     claude_tailer: *const claude.Tailer,
     codex_tailer: *const codex.Tailer,
     opencode_poller: *const opencode.Poller,
+    harness_poller: *const harness.Poller,
     ledger: *const ledger_mod.Ledger,
 ) !WireState {
     var state = WireState{ .version = format_version };
@@ -239,6 +262,41 @@ fn toWire(
         var kit = claude_tailer.seen.keyIterator();
         while (kit.next()) |key| try seen.append(arena, key.*);
         state.claude_seen = try seen.toOwnedSlice(arena);
+    }
+
+    // Additional harnesses: stable source-native records and their latest
+    // normalized snapshot. Replaying an unchanged local ledger after restart
+    // therefore cannot double-count persisted rollups.
+    {
+        var rows: std.ArrayList(WireHarnessRow) = .empty;
+        var it = @constCast(harness_poller).iterator();
+        while (it.next()) |entry| {
+            const ev = entry.value_ptr.event;
+            try rows.append(arena, .{
+                .key = entry.key_ptr.*,
+                .agent = ev.agent.label(),
+                .timestamp_ms = ev.timestamp_ms,
+                .model = ev.model,
+                .input = ev.input_tokens,
+                .output = ev.output_tokens,
+                .cache_creation = ev.cache_creation_tokens,
+                .cache_read = ev.cache_read_tokens,
+                .session_id = ev.session_id,
+                .cwd = ev.cwd,
+            });
+        }
+        state.harness_rows = try rows.toOwnedSlice(arena);
+
+        var files: std.ArrayList(WireHarnessFile) = .empty;
+        var fit = @constCast(harness_poller).signatureIterator();
+        while (fit.next()) |entry| {
+            try files.append(arena, .{
+                .path = entry.key_ptr.*,
+                .size = entry.value_ptr.size,
+                .mtime_ns = entry.value_ptr.mtime_ns,
+            });
+        }
+        state.harness_files = try files.toOwnedSlice(arena);
     }
 
     // OpenCode: stable row identities plus their latest safe usage snapshot.
@@ -312,12 +370,14 @@ fn toWire(
         while (pit.next()) |entry| {
             try projects.append(arena, .{ .key = entry.key_ptr.*, .totals = wireTotals(entry.value_ptr.*) });
         }
+        var agents: std.ArrayList(WireAgent) = .empty;
+        inline for (std.meta.tags(types.Agent)) |agent| {
+            try agents.append(arena, .{ .agent = agent.label(), .totals = wireTotals(ledger.per_agent.get(agent)) });
+        }
         state.ledger = .{
             .tz_offset_min = ledger.tz_offset_min,
             .all = wireTotals(ledger.all),
-            .claude = wireTotals(ledger.per_agent.get(.claude)),
-            .codex = wireTotals(ledger.per_agent.get(.codex)),
-            .opencode = wireTotals(ledger.per_agent.get(.opencode)),
+            .per_agent = try agents.toOwnedSlice(arena),
             .per_day = try days.toOwnedSlice(arena),
             .per_model = try models.toOwnedSlice(arena),
             .per_project = try projects.toOwnedSlice(arena),
@@ -343,6 +403,7 @@ pub fn restore(
     claude_tailer: *claude.Tailer,
     codex_tailer: *codex.Tailer,
     opencode_poller: *opencode.Poller,
+    harness_poller: *harness.Poller,
     ledger: *ledger_mod.Ledger,
 ) error{OutOfMemory}!RestoreOutcome {
     var cwd = std.Io.Dir.cwd();
@@ -394,12 +455,30 @@ pub fn restore(
             .cwd = row.cwd,
         });
     }
+    for (state.harness_rows) |row| {
+        const agent = types.Agent.parse(row.agent) orelse continue;
+        try harness_poller.restore(row.key, .{
+            .agent = agent,
+            .timestamp_ms = row.timestamp_ms,
+            .model = row.model,
+            .input_tokens = row.input,
+            .output_tokens = row.output,
+            .cache_creation_tokens = row.cache_creation,
+            .cache_read_tokens = row.cache_read,
+            .session_id = row.session_id,
+            .cwd = row.cwd,
+        });
+    }
+    for (state.harness_files) |file| {
+        const mtime_ns = std.math.cast(i96, file.mtime_ns) orelse continue;
+        try harness_poller.restoreFileSignature(file.path, .{ .size = file.size, .mtime_ns = mtime_ns });
+    }
 
     ledger.tz_offset_min = state.ledger.tz_offset_min;
     ledger.all = unwireTotals(state.ledger.all);
-    ledger.per_agent.set(.claude, unwireTotals(state.ledger.claude));
-    ledger.per_agent.set(.codex, unwireTotals(state.ledger.codex));
-    ledger.per_agent.set(.opencode, unwireTotals(state.ledger.opencode));
+    for (state.ledger.per_agent) |entry| {
+        if (types.Agent.parse(entry.agent)) |agent| ledger.per_agent.set(agent, unwireTotals(entry.totals));
+    }
     for (state.ledger.per_day) |d| try ledger.putDay(d.day, unwireTotals(d.totals));
     for (state.ledger.per_model) |m| try ledger.putModel(m.key, unwireTotals(m.totals));
     for (state.ledger.per_project) |p| try ledger.putProject(p.key, unwireTotals(p.totals));
@@ -426,6 +505,7 @@ const Harness = struct {
     claude_tailer: claude.Tailer,
     codex_tailer: codex.Tailer,
     opencode_poller: opencode.Poller,
+    harness_poller: harness.Poller,
     ledger: ledger_mod.Ledger,
 
     fn init(tz_offset_min: i32) Harness {
@@ -433,6 +513,7 @@ const Harness = struct {
             .claude_tailer = claude.Tailer.init(testing.allocator),
             .codex_tailer = codex.Tailer.init(testing.allocator),
             .opencode_poller = opencode.Poller.init(testing.allocator),
+            .harness_poller = harness.Poller.init(testing.allocator),
             .ledger = ledger_mod.Ledger.init(testing.allocator, tz_offset_min),
         };
     }
@@ -441,6 +522,7 @@ const Harness = struct {
         self.claude_tailer.deinit();
         self.codex_tailer.deinit();
         self.opencode_poller.deinit();
+        self.harness_poller.deinit();
         self.ledger.deinit();
     }
 
@@ -524,14 +606,14 @@ test "statefile round-trip: identical totals, no re-reads, dedup survives restar
     };
     try h1.opencode_poller.restore("msg_state", 1_783_483_000_100, opencode_event);
     try h1.ledger.add(opencode_event, 0.0042);
-    try save(testing.allocator, io, state_path, &h1.claude_tailer, &h1.codex_tailer, &h1.opencode_poller, &h1.ledger);
+    try save(testing.allocator, io, state_path, &h1.claude_tailer, &h1.codex_tailer, &h1.opencode_poller, &h1.harness_poller, &h1.ledger);
 
     // Fresh everything; restore.
     var h2 = Harness.init(0);
     defer h2.deinit();
     try testing.expectEqual(
         RestoreOutcome.restored,
-        try restore(testing.allocator, io, state_path, &h2.claude_tailer, &h2.codex_tailer, &h2.opencode_poller, &h2.ledger),
+        try restore(testing.allocator, io, state_path, &h2.claude_tailer, &h2.codex_tailer, &h2.opencode_poller, &h2.harness_poller, &h2.ledger),
     );
 
     // Ledger rollups come back bit-identical (including the tz offset the
@@ -643,7 +725,7 @@ test "restore outcomes: absent, corrupted, and version mismatch leave state pris
     const missing = try std.fmt.allocPrint(arena, "{s}/nope.json", .{base});
     try testing.expectEqual(
         RestoreOutcome.absent,
-        try restore(testing.allocator, io, missing, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.ledger),
+        try restore(testing.allocator, io, missing, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.harness_poller, &h.ledger),
     );
 
     // Corrupted JSON.
@@ -651,7 +733,7 @@ test "restore outcomes: absent, corrupted, and version mismatch leave state pris
     const corrupt = try std.fmt.allocPrint(arena, "{s}/corrupt.json", .{base});
     try testing.expectEqual(
         RestoreOutcome.invalid,
-        try restore(testing.allocator, io, corrupt, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.ledger),
+        try restore(testing.allocator, io, corrupt, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.harness_poller, &h.ledger),
     );
 
     // Valid JSON, wrong version (with fields v1 has never heard of).
@@ -662,7 +744,7 @@ test "restore outcomes: absent, corrupted, and version mismatch leave state pris
     const future = try std.fmt.allocPrint(arena, "{s}/future.json", .{base});
     try testing.expectEqual(
         RestoreOutcome.invalid,
-        try restore(testing.allocator, io, future, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.ledger),
+        try restore(testing.allocator, io, future, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.harness_poller, &h.ledger),
     );
 
     // Nothing leaked into the state on any failed path.
@@ -671,6 +753,39 @@ test "restore outcomes: absent, corrupted, and version mismatch leave state pris
     try testing.expectEqual(@as(u32, 0), h.codex_tailer.files.count());
     try testing.expectEqual(@as(u64, 0), h.ledger.all.events);
     try testing.expectEqual(@as(usize, 0), h.ledger.per_day.count());
+}
+
+test "additional harness snapshots and per-agent rollups survive restart" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(testing.io, &base_buf)];
+    const path = try std.fs.path.join(testing.allocator, &.{ base, "state", "tailers.json" });
+    defer testing.allocator.free(path);
+
+    const event = types.UsageEvent{
+        .agent = .gemini,
+        .timestamp_ms = 1_784_899_200_000,
+        .model = "gemini-2.5-pro",
+        .input_tokens = 10,
+        .output_tokens = 20,
+        .cache_read_tokens = 30,
+        .session_id = "gemini-session",
+        .cwd = "/work/gemini",
+    };
+    var before = Harness.init(0);
+    defer before.deinit();
+    try before.harness_poller.restore("gemini:native-record", event);
+    try before.harness_poller.restoreFileSignature("/tmp/gemini.jsonl", .{ .size = 123, .mtime_ns = 456 });
+    try before.ledger.add(event, 0.25);
+    try save(testing.allocator, testing.io, path, &before.claude_tailer, &before.codex_tailer, &before.opencode_poller, &before.harness_poller, &before.ledger);
+
+    var after = Harness.init(0);
+    defer after.deinit();
+    try testing.expectEqual(.restored, try restore(testing.allocator, testing.io, path, &after.claude_tailer, &after.codex_tailer, &after.opencode_poller, &after.harness_poller, &after.ledger));
+    try testing.expectEqual(@as(u32, 1), after.harness_poller.seen.count());
+    try testing.expectEqual(@as(u32, 1), after.harness_poller.file_signatures.count());
+    try expectTotalsEqual(before.ledger.forAgent(.gemini), after.ledger.forAgent(.gemini));
 }
 
 test "save writes atomically and creates parent directories" {
@@ -687,12 +802,12 @@ test "save writes atomically and creates parent directories" {
 
     var h = Harness.init(0);
     defer h.deinit();
-    try save(testing.allocator, io, state_path, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.ledger);
+    try save(testing.allocator, io, state_path, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &h.harness_poller, &h.ledger);
 
     // The final file exists; the tmp staging file does not.
     const data = try std.Io.Dir.cwd().readFileAlloc(io, state_path, testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(data);
-    try testing.expect(std.mem.indexOf(u8, data, "\"version\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "\"version\":3") != null);
     const state_stat = try std.Io.Dir.cwd().statFile(io, state_path, .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), state_stat.permissions.toMode() & 0o777);
     const state_dir = std.fs.path.dirname(state_path).?;

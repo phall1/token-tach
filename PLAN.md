@@ -100,10 +100,16 @@ token-tach/
   `{used_percent, window_minutes, resets_at (epoch sec)}` + `plan_type`.
   Current limits = last token_count line of newest rollout file.
 
-### Later sources (plugin seam)
-- opencode (`~/.local/share/opencode/storage/`, JSON, has per-message tokens/cost),
-  Gemini CLI (requires user-enabled local OTEL telemetry), others behind the
-  `Source` interface. Cursor/Copilot are server-side only — out of scope.
+### Local harness coverage (implemented on main)
+- Automatic collectors now cover Claude Code, Codex CLI, OpenCode, Gemini CLI,
+  Qwen Code, Pi, Kimi CLI, Grok Build, Copilot CLI, Cline, Roo Code, Continue
+  CLI, Kilo Code, Goose, and Factory Droid.
+- Stable source-native records reconcile through add/replace or cumulative
+  growth-delta semantics. File signatures and normalized snapshots persist for
+  warm restart dedup; foreign SQLite databases use read-only usage projections.
+- `--json.coverage` reports exact/limited/setup-required/unsupported fidelity.
+  Cursor, Windsurf, Aider, Amp, Zed, Amazon Q, and Crush remain explicit gaps
+  until they expose durable exact counters or an opt-in telemetry adapter lands.
 
 ## Prediction (the differentiator)
 
@@ -134,8 +140,9 @@ token-tach/
 - **v1.2**: notifications — threshold crossings (70/90 %), predicted wall
   within N min, window-reset all-clear. Quiet hours.
 - **v1.3**: `token-tach --json` CLI / statusline output from the same core.
-- **v2**: plugin sources (opencode, Gemini), themes, maybe WidgetKit companion
-  (requires a small Swift extension — separate decision).
+- **v2**: provider/gateway reconciliation adapters, isolated subprocess source
+  plugins, themes, and maybe a WidgetKit companion (requires a small Swift
+  extension — separate decision).
 
 ## Distribution / trust story
 

@@ -1,0 +1,5 @@
+{"type":"session","id":"session-pi","cwd":"/work/pi"}
+{"type":"message","id":"entry-1","timestamp":"2026-07-20T10:02:00Z","message":{"role":"assistant","model":"anthropic/claude-sonnet","responseId":"response-1","usage":{"input":11,"output":12,"cacheRead":13,"cacheWrite":14,"reasoning":4}}}
+{"type":"compaction","id":"entry-2","timestamp":"2026-07-20T10:03:00Z","usage":{"input":2,"output":3,"cacheRead":4,"cacheWrite":5}}
+{"type":"message","id":"entry-3","timestamp":"2026-07-20T10:04:00Z","message":{"role":"toolResult","usage":{"input":6,"output":7,"cacheRead":8,"cacheWrite":9}}}
+{"type":"message","id":"ignored","message":{"role":"user"}}

@@ -32,11 +32,63 @@ pub const Sources = packed struct {
     claude: bool = true,
     codex: bool = true,
     opencode: bool = true,
+    gemini: bool = true,
+    qwen: bool = true,
+    pi: bool = true,
+    kimi: bool = true,
+    grok: bool = true,
+    copilot: bool = true,
+    cline: bool = true,
+    roo: bool = true,
+    continue_cli: bool = true,
+    kilo: bool = true,
+    goose: bool = true,
+    droid: bool = true,
 
-    pub const none: Sources = .{ .claude = false, .codex = false, .opencode = false };
+    pub const none: Sources = @bitCast(@as(u15, 0));
 
     pub fn any(self: Sources) bool {
-        return self.claude or self.codex or self.opencode;
+        return @as(u15, @bitCast(self)) != 0;
+    }
+
+    pub fn enabled(self: Sources, agent: @import("types.zig").Agent) bool {
+        return switch (agent) {
+            .claude => self.claude,
+            .codex => self.codex,
+            .opencode => self.opencode,
+            .gemini => self.gemini,
+            .qwen => self.qwen,
+            .pi => self.pi,
+            .kimi => self.kimi,
+            .grok => self.grok,
+            .copilot => self.copilot,
+            .cline => self.cline,
+            .roo => self.roo,
+            .continue_cli => self.continue_cli,
+            .kilo => self.kilo,
+            .goose => self.goose,
+            .droid => self.droid,
+        };
+    }
+
+    pub fn set(self: *Sources, agent: @import("types.zig").Agent, value: bool) void {
+        switch (agent) {
+            .claude => self.claude = value,
+            .codex => self.codex = value,
+            .opencode => self.opencode = value,
+            .gemini => self.gemini = value,
+            .qwen => self.qwen = value,
+            .pi => self.pi = value,
+            .kimi => self.kimi = value,
+            .grok => self.grok = value,
+            .copilot => self.copilot = value,
+            .cline => self.cline = value,
+            .roo => self.roo = value,
+            .continue_cli => self.continue_cli = value,
+            .kilo => self.kilo = value,
+            .goose => self.goose = value,
+            .droid => self.droid = value,
+        }
     }
 };
 
@@ -183,21 +235,19 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) error{OutOfMemory}!
                 thresholds_touched = true;
             }
         } else if (std.mem.eql(u8, key, "source")) {
+            if (value.len == 0) {
+                sources_touched = true;
+                continue;
+            }
             var items = std.mem.splitScalar(u8, value, ',');
             while (items.next()) |item_raw| {
                 const item = std.mem.trim(u8, item_raw, " \t");
                 if (item.len == 0) continue;
-                if (std.ascii.eqlIgnoreCase(item, "claude")) {
-                    sources.claude = true;
-                    sources_touched = true;
-                } else if (std.ascii.eqlIgnoreCase(item, "codex")) {
-                    sources.codex = true;
-                    sources_touched = true;
-                } else if (std.ascii.eqlIgnoreCase(item, "opencode")) {
-                    sources.opencode = true;
+                if (@import("types.zig").Agent.parse(item)) |agent| {
+                    sources.set(agent, true);
                     sources_touched = true;
                 } else {
-                    try warn(allocator, &warnings, line_no, "source: unknown source \"{s}\" (want claude, codex, opencode); skipped", .{item});
+                    try warn(allocator, &warnings, line_no, "source: unknown source \"{s}\"; skipped", .{item});
                 }
             }
         } else if (std.mem.eql(u8, key, "system-stats")) {
@@ -531,6 +581,17 @@ test "list keys append across repeated occurrences" {
     try testing.expect(result.config.sources.codex);
 }
 
+test "source list accepts every automatic harness and aliases" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const result = try parse(arena_state.allocator(), "source = claude-code, codex-cli, opencode, gemini-cli, qwen-code, pi\n" ++
+        "source = kimi-cli, grok-build, github-copilot, cline, roo-code\n" ++
+        "source = continue-cli, kilo-code, goose, factory-droid\n");
+    try testing.expectEqual(@as(usize, 0), result.warnings.len);
+    try testing.expectEqual(@as(u15, std.math.maxInt(u15)), @as(u15, @bitCast(result.config.sources)));
+}
+
 test "empty list value clears to empty" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -539,6 +600,9 @@ test "empty list value clears to empty" {
     const result = try parse(arena, "alert-threshold =");
     try testing.expectEqual(@as(usize, 0), result.warnings.len);
     try testing.expectEqual(@as(usize, 0), result.config.alert_thresholds.len);
+
+    const no_sources = try parse(arena, "source =");
+    try testing.expect(!no_sources.config.sources.any());
 }
 
 test "repeated scalar keys: last wins" {

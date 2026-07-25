@@ -26,6 +26,7 @@ pub const window_height: f32 = 640;
 
 const pad: f32 = 24;
 const gap: f32 = 14;
+const AgentShareRow = struct { agent: types.Agent, totals: ledger_mod.Totals };
 
 pub fn rootView(ui: *Ui, model: *const Model) Ui.Node {
     var nodes: std.ArrayList(Ui.Node) = .empty;
@@ -166,14 +167,30 @@ fn agentSplit(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void
     push(ui, nodes, ui.text(.{
         .frame = rect(frame.x + 16, frame.y + 14, 160, 16),
         .style_tokens = .{ .foreground = .text_muted },
-    }, "AGENT / SHARE"));
+    }, "SOURCE / SHARE"));
 
-    const claude_total = model.ledger.forAgent(.claude);
-    const codex_total = model.ledger.forAgent(.codex);
-    const opencode_total = model.ledger.forAgent(.opencode);
-    agentRow(ui, nodes, "CLAUDE", claude_total, model.ledger.all.cost_usd, frame.y + 42);
-    agentRow(ui, nodes, "CODEX", codex_total, model.ledger.all.cost_usd, frame.y + 88);
-    agentRow(ui, nodes, "OPENCODE", opencode_total, model.ledger.all.cost_usd, frame.y + 134);
+    const agents = std.meta.tags(types.Agent);
+    var rows: [agents.len]AgentShareRow = undefined;
+    inline for (agents, 0..) |agent, i| rows[i] = .{ .agent = agent, .totals = model.ledger.forAgent(agent) };
+    std.mem.sort(AgentShareRow, &rows, {}, struct {
+        fn lt(_: void, a: AgentShareRow, b: AgentShareRow) bool {
+            if (a.totals.cost_usd != b.totals.cost_usd) return a.totals.cost_usd > b.totals.cost_usd;
+            if (a.totals.totalTokens() != b.totals.totalTokens()) return a.totals.totalTokens() > b.totals.totalTokens();
+            return @intFromEnum(a.agent) < @intFromEnum(b.agent);
+        }
+    }.lt);
+    for (rows[0..3], 0..) |row, i| {
+        agentRow(ui, nodes, agentShareLabel(row.agent), row.totals, model.ledger.all.cost_usd, frame.y + 42 + @as(f32, @floatFromInt(i)) * 46);
+    }
+}
+
+fn agentShareLabel(agent: types.Agent) []const u8 {
+    return switch (agent) {
+        .claude => "CLAUDE",
+        .codex => "CODEX",
+        .opencode => "OPENCODE",
+        else => agent.label(),
+    };
 }
 
 fn agentRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), name: []const u8, totals: ledger_mod.Totals, all_cost: f64, y: f32) void {

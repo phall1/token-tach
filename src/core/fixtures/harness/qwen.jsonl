@@ -1,0 +1,2 @@
+{"schemaVersion":1,"id":"qwen-1","timestamp":"2026-07-20T10:01:00Z","model":"qwen3-coder","sessionId":"session-q","usage":{"inputTokens":90,"cachedTokens":10,"outputTokens":20,"thoughtsTokens":3}}
+{"schemaVersion":2,"id":"future-version","usage":{"inputTokens":999}}

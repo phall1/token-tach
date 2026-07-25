@@ -1,8 +1,9 @@
 # token-tach
 
 A macOS menu-bar tachometer for AI coding-agent token usage and subscription
-limits. It reads the session ledgers your agents already write — no proxy,
-no accounts, no telemetry — and turns them into an instrument.
+limits. It automatically discovers the local session ledgers your agents
+already write — no proxy, no Token Tach account, no telemetry — and turns
+them into an instrument.
 
 ```
 ⚡ 50.7k/m → wall 3:40p          ← the menu bar, all day
@@ -58,8 +59,9 @@ pixel through Metal.
 - **Warm launch**: tailer offsets and ledger rollups persist to an atomic
   state file, so the next launch restores in **~2 ms** and re-reads only
   what grew.
-- **Steady state**: the 2-second sweep costs **~0.1 ms** when nothing
-  changed (dir-mtime + hot-file detection; full re-walk only every 30 s).
+- **Steady state**: hot Claude/Codex tails stay on the 2-second fast path;
+  broader harness discovery runs every 30 seconds and skips unchanged files
+  by persisted size/mtime signatures.
 
 ## How it's built (the fun parts)
 
@@ -77,7 +79,7 @@ pixel through Metal.
   from the same OAuth endpoint Claude Code's `/usage` uses. Codex is even
   better: it writes its `rate_limits` straight into its rollout files —
   zero network for OpenAI numbers.
-- **Everything is fixture-tested.** ~100 tests over the UI-free core
+- **Everything is fixture-tested.** 180+ tests over the UI-free core
   (tailers, pricing, prediction, ledger, config, state), and `scripts/verify`
   launches the real app headlessly, toggles the actual popover, walks the
   accessibility tree, and screenshots it — locally and in CI.
@@ -91,7 +93,16 @@ pixel through Metal.
 | Claude Code | tokens per message | tails `~/.claude/projects/**/*.jsonl` (and `$CLAUDE_CONFIG_DIR`), dedupes on `message.id:requestId` |
 | Codex CLI | tokens **and** 5h/weekly limit % | tails `~/.codex/sessions/**` — limits are embedded in the logs |
 | OpenCode | tokens per assistant message | opens one `opencode.db` read-only, selecting only usage/model/time IDs plus the joined session directory; prompt/content/tool/auth data is never queried |
+| Gemini CLI, Qwen Code, Pi, Kimi CLI, Grok Build | exact local model-call usage | auto-discovers their JSON/JSONL session ledgers and normalizes cache/reasoning semantics |
+| GitHub Copilot CLI, Goose | exact local model-call usage | opens their dedicated usage SQLite tables read-only with narrow, content-free projections |
+| Cline, Roo Code, Continue CLI, Kilo Code, Factory Droid | exact or provider-reported cumulative usage | reconciles mutable local session snapshots by stable session IDs and records only growth deltas |
 | Pricing | $/token rates | bundled snapshot of LiteLLM's `model_prices_and_context_window.json` |
+
+Token Tach also reports known gaps in `--json.coverage`. Cursor, Windsurf,
+Aider, Amp, Zed, Amazon Q, and Crush do not currently expose an automatic,
+durable, exact-token history that can be read without prior setup or violating
+the app's no-prompt-content boundary. Token Tach marks those surfaces honestly
+instead of estimating usage. See [the coverage matrix](docs/COVERAGE.md).
 
 **Opt-in (`claude-oauth = true`):** Claude's server-truth utilization via
 `GET https://api.anthropic.com/api/oauth/usage` with your existing Claude
@@ -142,7 +153,9 @@ tray-format = {burn} → {eta}
 claude-oauth = true        # opt in to server-truth Claude limits
 poll-interval = 180s
 alert-threshold = 70, 90
-source = claude, codex, opencode # enable/disable agents
+# All supported sources are auto-discovered by default. If set, this list
+# replaces the default. `source =` disables all collection.
+source = claude, codex, opencode, gemini, qwen, pi, kimi, grok, copilot, cline, roo, continue, kilo, goose, droid
 system-stats = true        # or a list: cpu, gpu, mem, disk, net, battery
 # claude-config-dir = ~/some/other/claude-root
 # codex-home = ~/.codex
@@ -172,6 +185,8 @@ src/main.zig    shell: scene, status item, popover, runtime entry
 
 v0.5: system telemetry (CPU/GPU/mem/disk/net/battery) joins the cluster,
 on Native SDK v0.5.
+main: automatic local usage coverage across 15 coding harnesses, with
+machine-readable source health and explicit unsupported/setup-required gaps.
 v0.3: history dashboard, notifications, and local-only CLI/statusline mode.
 Follow-up work is tracked in [beads](https://github.com/steveyegge/beads)
 (`bd list`).

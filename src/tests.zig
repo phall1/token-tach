@@ -19,6 +19,7 @@ test {
     _ = @import("core/claude.zig");
     _ = @import("core/codex.zig");
     _ = @import("core/opencode.zig");
+    _ = @import("core/harness.zig");
     _ = @import("core/pricing.zig");
     _ = @import("core/oauth.zig");
     _ = @import("core/keychain.zig");
@@ -126,7 +127,7 @@ test "the instrument cluster binds the engine's structured state" {
     // Both agent groups render with their limit windows.
     try testing.expect(containsText(tree.root, "CLAUDE"));
     try testing.expect(containsText(tree.root, "CODEX"));
-    try testing.expect(containsText(tree.root, "OPENCODE"));
+    try testing.expect(containsText(tree.root, "LOCAL SOURCES"));
     try testing.expect(containsText(tree.root, "67%"));
     try testing.expect(containsText(tree.root, "9%"));
     try testing.expect(containsText(tree.root, "5h"));
@@ -224,6 +225,24 @@ test "a disabled source says so instead of showing dead bars" {
     try testing.expect(!containsText(tree.root, "67%"));
     // …while the still-enabled codex group renders normally.
     try testing.expect(containsText(tree.root, "9%"));
+}
+
+test "local source summary excludes disabled harness history" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = instrumentedModel();
+    defer model.ledger.deinit();
+    model.cfg.sources.gemini = false;
+    try model.ledger.add(.{
+        .agent = .gemini,
+        .timestamp_ms = 1,
+        .model = "gemini-test",
+        .output_tokens = 999,
+    }, 12.34);
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(containsText(tree.root, "LOCAL SOURCES"));
+    try testing.expect(containsText(tree.root, "no messages found"));
 }
 
 test "an agent with no history and no limits says no sessions found" {

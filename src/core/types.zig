@@ -8,13 +8,76 @@ pub const Agent = enum {
     claude,
     codex,
     opencode,
+    gemini,
+    qwen,
+    pi,
+    kimi,
+    grok,
+    copilot,
+    cline,
+    roo,
+    continue_cli,
+    kilo,
+    goose,
+    droid,
 
     pub fn label(self: Agent) []const u8 {
         return switch (self) {
             .claude => "claude",
             .codex => "codex",
             .opencode => "opencode",
+            .gemini => "gemini",
+            .qwen => "qwen",
+            .pi => "pi",
+            .kimi => "kimi",
+            .grok => "grok",
+            .copilot => "copilot",
+            .cline => "cline",
+            .roo => "roo",
+            .continue_cli => "continue",
+            .kilo => "kilo",
+            .goose => "goose",
+            .droid => "droid",
         };
+    }
+
+    pub fn displayLabel(self: Agent) []const u8 {
+        return switch (self) {
+            .claude => "Claude Code",
+            .codex => "Codex CLI",
+            .opencode => "OpenCode",
+            .gemini => "Gemini CLI",
+            .qwen => "Qwen Code",
+            .pi => "Pi",
+            .kimi => "Kimi CLI",
+            .grok => "Grok Build",
+            .copilot => "Copilot CLI",
+            .cline => "Cline",
+            .roo => "Roo Code",
+            .continue_cli => "Continue CLI",
+            .kilo => "Kilo Code",
+            .goose => "Goose",
+            .droid => "Factory Droid",
+        };
+    }
+
+    pub fn parse(value: []const u8) ?Agent {
+        inline for (std.meta.tags(Agent)) |agent| {
+            if (std.ascii.eqlIgnoreCase(value, @tagName(agent))) return agent;
+            if (std.ascii.eqlIgnoreCase(value, agent.label())) return agent;
+        }
+        if (std.ascii.eqlIgnoreCase(value, "claude-code")) return .claude;
+        if (std.ascii.eqlIgnoreCase(value, "codex-cli")) return .codex;
+        if (std.ascii.eqlIgnoreCase(value, "gemini-cli")) return .gemini;
+        if (std.ascii.eqlIgnoreCase(value, "qwen-code")) return .qwen;
+        if (std.ascii.eqlIgnoreCase(value, "kimi-cli")) return .kimi;
+        if (std.ascii.eqlIgnoreCase(value, "grok-build")) return .grok;
+        if (std.ascii.eqlIgnoreCase(value, "github-copilot")) return .copilot;
+        if (std.ascii.eqlIgnoreCase(value, "roo-code")) return .roo;
+        if (std.ascii.eqlIgnoreCase(value, "continue-cli")) return .continue_cli;
+        if (std.ascii.eqlIgnoreCase(value, "kilo-code")) return .kilo;
+        if (std.ascii.eqlIgnoreCase(value, "factory") or std.ascii.eqlIgnoreCase(value, "factory-droid")) return .droid;
+        return null;
     }
 };
 

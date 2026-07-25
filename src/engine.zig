@@ -14,6 +14,7 @@ const config = @import("core/config.zig");
 const claude = @import("core/claude.zig");
 const codex = @import("core/codex.zig");
 const opencode = @import("core/opencode.zig");
+const harness = @import("core/harness.zig");
 const pricing = @import("core/pricing.zig");
 const ledger_mod = @import("core/ledger.zig");
 const statefile = @import("core/statefile.zig");
@@ -93,6 +94,9 @@ pub const Model = struct {
     claude_tailer: claude.Tailer = undefined,
     codex_tailer: codex.Tailer = undefined,
     opencode_poller: opencode.Poller = undefined,
+    harness_poller: harness.Poller = undefined,
+    harness_env: harness.Env = .{ .home = "" },
+    harness_sweep_countdown: u8 = 0,
     claude_roots: []const []const u8 = &.{},
     codex_roots: []const []const u8 = &.{},
     opencode_db: []const u8 = "",
@@ -251,11 +255,36 @@ pub fn oauthStaleMin(model: *const Model) ?u64 {
 
 /// Is this agent's source enabled in config?
 pub fn sourceEnabled(sources: config.Sources, agent: types.Agent) bool {
-    return switch (agent) {
-        .claude => sources.claude,
-        .codex => sources.codex,
-        .opencode => sources.opencode,
-    };
+    return sources.enabled(agent);
+}
+
+fn configureHarnessSources(poller: *harness.Poller, sources: config.Sources) void {
+    inline for (std.meta.tags(harness.Source)) |source| {
+        const agent = types.Agent.parse(@tagName(source)).?;
+        poller.setActive(source, sources.enabled(agent));
+    }
+}
+
+fn hasExtendedSource(sources: config.Sources) bool {
+    inline for (std.meta.tags(types.Agent)) |agent| {
+        if (agent != .claude and agent != .codex and agent != .opencode and sources.enabled(agent)) return true;
+    }
+    return false;
+}
+
+pub fn localHarnessTotals(model: *const Model) ledger_mod.Totals {
+    var totals: ledger_mod.Totals = .{};
+    for (std.meta.tags(types.Agent)) |agent| {
+        if (agent != .claude and agent != .codex and model.cfg.sources.enabled(agent)) accumulateTotals(&totals, model.ledger.forAgent(agent));
+    }
+    return totals;
+}
+
+pub fn localHarnessesEnabled(model: *const Model) bool {
+    for (std.meta.tags(types.Agent)) |agent| {
+        if (agent != .claude and agent != .codex and model.cfg.sources.enabled(agent)) return true;
+    }
+    return false;
 }
 
 /// True when an agent has nothing to report: source enabled but zero
@@ -266,7 +295,7 @@ pub fn agentIsEmpty(model: *const Model, agent: types.Agent) bool {
     const limits = switch (agent) {
         .claude => model.claude_limits,
         .codex => model.codex_limits,
-        .opencode => null,
+        else => null,
     };
     return limits == null;
 }
@@ -280,6 +309,20 @@ pub const Env = struct {
     opencode_db: ?[]const u8 = null,
     xdg_data_home: ?[]const u8 = null,
     xdg_state_home: ?[]const u8 = null,
+    gemini_cli_home: ?[]const u8 = null,
+    qwen_home: ?[]const u8 = null,
+    qwen_runtime_dir: ?[]const u8 = null,
+    pi_agent_dir: ?[]const u8 = null,
+    pi_session_dir: ?[]const u8 = null,
+    kimi_share_dir: ?[]const u8 = null,
+    grok_home: ?[]const u8 = null,
+    copilot_home: ?[]const u8 = null,
+    cline_dir: ?[]const u8 = null,
+    cline_data_dir: ?[]const u8 = null,
+    continue_global_dir: ?[]const u8 = null,
+    kilo_db: ?[]const u8 = null,
+    goose_path_root: ?[]const u8 = null,
+    factory_home: ?[]const u8 = null,
 };
 
 /// Persist tailer+ledger state every N sweep ticks (N × 2 s ≈ 60 s).
@@ -317,6 +360,26 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
     model.claude_tailer = claude.Tailer.init(allocator);
     model.codex_tailer = codex.Tailer.init(allocator);
     model.opencode_poller = opencode.Poller.init(allocator);
+    model.harness_poller = harness.Poller.init(allocator);
+    model.harness_env = .{
+        .home = env.home,
+        .xdg_data_home = env.xdg_data_home,
+        .gemini_cli_home = env.gemini_cli_home,
+        .qwen_home = env.qwen_home,
+        .qwen_runtime_dir = env.qwen_runtime_dir,
+        .pi_agent_dir = env.pi_agent_dir,
+        .pi_session_dir = env.pi_session_dir,
+        .kimi_share_dir = env.kimi_share_dir,
+        .grok_home = env.grok_home,
+        .copilot_home = env.copilot_home,
+        .cline_dir = env.cline_dir,
+        .cline_data_dir = env.cline_data_dir,
+        .continue_global_dir = env.continue_global_dir,
+        .kilo_db = env.kilo_db,
+        .goose_path_root = env.goose_path_root,
+        .factory_home = env.factory_home,
+    };
+    configureHarnessSources(&model.harness_poller, model.cfg.sources);
     model.prices = try pricing.Db.init(allocator);
     model.ledger = ledger_mod.Ledger.init(allocator, 0);
 
@@ -331,6 +394,7 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
             &model.claude_tailer,
             &model.codex_tailer,
             &model.opencode_poller,
+            &model.harness_poller,
             &model.ledger,
         ) catch .invalid; // OOM: hydration may be partial — reset below.
         switch (outcome) {
@@ -340,10 +404,13 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
                 model.claude_tailer.deinit();
                 model.codex_tailer.deinit();
                 model.opencode_poller.deinit();
+                model.harness_poller.deinit();
                 model.ledger.deinit();
                 model.claude_tailer = claude.Tailer.init(allocator);
                 model.codex_tailer = codex.Tailer.init(allocator);
                 model.opencode_poller = opencode.Poller.init(allocator);
+                model.harness_poller = harness.Poller.init(allocator);
+                configureHarnessSources(&model.harness_poller, model.cfg.sources);
                 model.ledger = ledger_mod.Ledger.init(allocator, 0);
                 std.log.warn("state file invalid — falling back to full catch-up", .{});
             },
@@ -415,11 +482,13 @@ pub fn maybeReloadConfig(model: *Model) ?config.Sources {
         model.oauth_backoff = .{};
         model.oauth_next_ms = model.now_ms;
     }
-    return .{
-        .claude = model.cfg.sources.claude and !old_sources.claude,
-        .codex = model.cfg.sources.codex and !old_sources.codex,
-        .opencode = model.cfg.sources.opencode and !old_sources.opencode,
-    };
+    var newly_enabled = config.Sources.none;
+    inline for (std.meta.tags(types.Agent)) |agent| {
+        newly_enabled.set(agent, model.cfg.sources.enabled(agent) and !old_sources.enabled(agent));
+    }
+    configureHarnessSources(&model.harness_poller, model.cfg.sources);
+    if (hasExtendedSource(newly_enabled)) model.harness_sweep_countdown = 0;
+    return newly_enabled;
 }
 
 pub fn boot(model: *Model, fx: *Effects) void {
@@ -523,7 +592,7 @@ fn enumerateHistory(model: *Model, only: config.Sources) !void {
                 const known: ?u64 = switch (group.agent) {
                     .claude => model.claude_tailer.offsetFor(path),
                     .codex => model.codex_tailer.offsetFor(path),
-                    .opencode => unreachable,
+                    else => unreachable,
                 };
                 if (known != null and known.? == stat.size) {
                     model.allocator.free(path);
@@ -571,7 +640,7 @@ fn processCatchupChunk(model: *Model, fx: *Effects) void {
                 model.codex_tailer.poll(io, arena, file.path, &events) catch {};
                 for (events.items) |ev| ingest(model, ev);
             },
-            .opencode => unreachable,
+            else => unreachable,
         }
         model.catchup_next += 1;
         if (file.size >= budget) break;
@@ -617,7 +686,9 @@ const config_template =
     \\#poll-interval = 180s
     \\
     \\#alert-threshold = 70, 90
-    \\#source = claude, codex, opencode
+    \\# All supported local harnesses are auto-discovered by default. Setting
+    \\# source replaces that default; use an empty value to disable all.
+    \\#source = claude, codex, opencode, gemini, qwen, pi, kimi, grok, copilot, cline, roo, continue, kilo, goose, droid
     \\#claude-config-dir = ~/some/other/claude-root
     \\#codex-home = ~/.codex
     \\#opencode-db = ~/.local/share/opencode/opencode.db
@@ -663,7 +734,7 @@ fn saveStateNow(model: *Model) void {
     if (model.state_path.len == 0) return;
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
-    statefile.save(model.allocator, io, model.state_path, &model.claude_tailer, &model.codex_tailer, &model.opencode_poller, &model.ledger) catch |err| {
+    statefile.save(model.allocator, io, model.state_path, &model.claude_tailer, &model.codex_tailer, &model.opencode_poller, &model.harness_poller, &model.ledger) catch |err| {
         std.log.warn("state save failed: {s}", .{@errorName(err)});
         return;
     };
@@ -825,6 +896,26 @@ fn sweepOnce(model: *Model) void {
         for (changes.items) |change| ingestOpenCodeChange(model, change);
     }
 
+    // The broad harness sweep is cached by file signature and runs at a
+    // slower cadence than hot Claude/Codex tails. SQLite snapshots are still
+    // reconciled on every broad pass, while unchanged JSON ledgers are not
+    // re-opened.
+    if (model.harness_sweep_countdown == 0) {
+        var changes: harness.Changes = .empty;
+        defer {
+            harness.freeChanges(arena, changes.items);
+            changes.deinit(arena);
+        }
+        model.harness_poller.poll(arena, io, model.harness_env, &changes) catch |err| {
+            std.log.warn("harness sweep failed: {s}", .{@errorName(err)});
+        };
+        for (changes.items) |change| ingestHarnessChange(model, change);
+        if (model.harness_poller.takeDirty()) model.state_dirty = true;
+        model.harness_sweep_countdown = 15;
+    } else {
+        model.harness_sweep_countdown -= 1;
+    }
+
     // System telemetry rides the same sweep: microseconds of syscalls,
     // no subprocesses. A config with the strip off skips the calls and
     // clears the snapshot so the view (and tray tokens) go quiet.
@@ -855,6 +946,33 @@ fn ingestOpenCodeChange(model: *Model, change: opencode.Change) void {
         model.ledger.replace(old, model.prices.costOf(old), change.current, new_cost) catch return;
         const delta = types.UsageEvent{
             .agent = .opencode,
+            .timestamp_ms = change.current.timestamp_ms,
+            .model = change.current.model,
+            .input_tokens = change.current.input_tokens -| old.input_tokens,
+            .output_tokens = change.current.output_tokens -| old.output_tokens,
+            .cache_creation_tokens = change.current.cache_creation_tokens -| old.cache_creation_tokens,
+            .cache_read_tokens = change.current.cache_read_tokens -| old.cache_read_tokens,
+        };
+        model.burn.addTokens(delta.timestamp_ms, predict.limitWeightedTokens(delta));
+    } else {
+        model.ledger.add(change.current, new_cost) catch return;
+        model.burn.addTokens(change.current.timestamp_ms, predict.limitWeightedTokens(change.current));
+    }
+    model.state_dirty = true;
+}
+
+fn ingestHarnessChange(model: *Model, change: harness.Change) void {
+    if (change.remove) {
+        const old = change.previous orelse return;
+        model.ledger.remove(old, model.prices.costOf(old));
+        model.state_dirty = true;
+        return;
+    }
+    const new_cost = model.prices.costOf(change.current);
+    if (change.previous) |old| {
+        model.ledger.replace(old, model.prices.costOf(old), change.current, new_cost) catch return;
+        const delta = types.UsageEvent{
+            .agent = change.current.agent,
             .timestamp_ms = change.current.timestamp_ms,
             .model = change.current.model,
             .input_tokens = change.current.input_tokens -| old.input_tokens,
@@ -1061,7 +1179,7 @@ fn refreshDisplay(model: *Model) void {
     model.glance_text = trayfmt.render(&model.glance_buf, model.cfg.tray_format, glanceState(model));
     model.claude_text = agentLine(&model.claude_buf, model, .claude, model.claude_limits);
     model.codex_text = agentLine(&model.codex_buf, model, .codex, model.codex_limits);
-    model.opencode_text = agentLine(&model.opencode_buf, model, .opencode, null);
+    model.opencode_text = localHarnessLine(&model.opencode_buf, model);
 
     const today = model.ledger.today(model.now_ms);
     {
@@ -1121,6 +1239,28 @@ fn agentLine(buf: []u8, model: *const Model, agent: types.Agent, limits: ?types.
         if (snap.plan.len > 0) {
             w.writeAll(" · ") catch {};
             w.writeAll(snap.plan) catch {};
+        }
+    }
+    return w.buffered();
+}
+
+fn localHarnessLine(buf: []u8, model: *const Model) []const u8 {
+    const totals = localHarnessTotals(model);
+    var w = std.Io.Writer.fixed(buf);
+    w.writeAll("local  ") catch {};
+    if (!localHarnessesEnabled(model)) {
+        w.writeAll("disabled") catch {};
+    } else if (totals.events == 0) {
+        w.writeAll(if (model.catchup_active) "scanning…" else "no sessions found") catch {};
+    } else {
+        trayfmt.writeHumanTokens(&w, totals.totalTokens()) catch {};
+        w.writeAll(" tok · ") catch {};
+        trayfmt.writeCost(&w, totals.cost_usd) catch {};
+        const detected = if (model.ready) model.harness_poller.activeDetectedCount() else 0;
+        if (detected > 0) {
+            w.writeAll(" · ") catch {};
+            w.printInt(detected + @intFromBool(model.cfg.sources.opencode and model.ledger.forAgent(.opencode).events > 0), 10, .lower, .{}) catch {};
+            w.writeAll(" sources") catch {};
         }
     }
     return w.buffered();
@@ -1220,7 +1360,7 @@ pub fn planPrice(agent: types.Agent, plan: []const u8) ?PlanPrice {
             if (eq(plan, "pro")) return .{ .lo = 200, .hi = 200 };
             if (eq(plan, "free")) return .{ .lo = 0, .hi = 0 };
         },
-        .opencode => return null,
+        else => return null,
     }
     return null;
 }

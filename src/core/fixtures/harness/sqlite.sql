@@ -1,0 +1,10 @@
+CREATE TABLE assistant_usage_events(id TEXT,session_id TEXT,model TEXT,created_at INTEGER,input_tokens INTEGER,output_tokens INTEGER,reasoning_tokens INTEGER,cache_read_tokens INTEGER,cache_write_tokens INTEGER);
+INSERT INTO assistant_usage_events VALUES('copilot-1','session-c','gpt-5',1784542200000,100,20,4,30,10);
+CREATE TABLE sessions(session_id TEXT,provider TEXT,model TEXT,started_at TEXT,ended_at TEXT,updated_at TEXT,workspace_root TEXT,cwd TEXT,is_subagent INTEGER,metadata_json TEXT);
+INSERT INTO sessions VALUES('cline-1','anthropic','cline-model','2026-07-20T10:10:00Z','2026-07-20T10:11:00Z','2026-07-20T10:11:00Z','/work/cline',NULL,0,'{"aggregateUsage":{"inputTokens":50,"outputTokens":20,"reasoningTokens":4,"cacheReadTokens":10,"cacheWriteTokens":3}}');
+INSERT INTO sessions VALUES('cline-child-1','anthropic','cline-model','2026-07-20T10:10:00Z','2026-07-20T10:11:00Z','2026-07-20T10:11:00Z','/work/cline',NULL,1,'{"aggregateUsage":{"inputTokens":500,"outputTokens":200}}');
+INSERT INTO sessions VALUES('cline-child-2','anthropic','cline-model','2026-07-20T10:10:00Z','2026-07-20T10:11:00Z','2026-07-20T10:11:00Z','/work/cline',NULL,0,'{"parentTaskId":"cline-1","aggregateUsage":{"inputTokens":500,"outputTokens":200}}');
+CREATE TABLE session(id TEXT,model TEXT,time_updated INTEGER,tokens_input INTEGER,tokens_output INTEGER,tokens_reasoning INTEGER,tokens_cache_read INTEGER,tokens_cache_write INTEGER,directory TEXT);
+INSERT INTO session VALUES('kilo-1','{"id":"kilo-model","providerID":"anthropic"}',1784542320000,7,8,9,3,2,'/work/kilo');
+CREATE TABLE usage_ledger(id TEXT,session_id TEXT,model TEXT,created_timestamp INTEGER,input_tokens INTEGER,output_tokens INTEGER,cache_read_tokens INTEGER,cache_write_tokens INTEGER);
+INSERT INTO usage_ledger VALUES('goose-1','session-goose','goose-model',1784542380000,30,11,5,2);

@@ -533,7 +533,7 @@ fn agentGroup(
     const name: []const u8 = switch (agent) {
         .claude => "CLAUDE",
         .codex => "CODEX",
-        .opencode => "OPENCODE",
+        else => agent.displayLabel(),
     };
 
     var name_spans: [3]canvas.TextSpan = .{
@@ -600,7 +600,7 @@ fn agentGroup(
         }, switch (agent) {
             .claude => "set claude-oauth = true in config",
             .codex => "none embedded in recent rollouts",
-            .opencode => "API-equivalent usage only",
+            else => "API-equivalent usage only",
         }));
         y += row_h + 14;
     }
@@ -609,13 +609,13 @@ fn agentGroup(
 
 fn compactOpenCodeRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
     const y = panel_y + 194;
-    const enabled = model.cfg.sources.opencode;
-    const totals = model.ledger.forAgent(.opencode);
-    const empty = enabled and engine.agentIsEmpty(model, .opencode);
+    const enabled = engine.localHarnessesEnabled(model);
+    const totals = engine.localHarnessTotals(model);
+    const empty = enabled and totals.events == 0;
     push(ui, nodes, ui.paragraph(.{
-        .frame = rect(bars_x, y, 100, 16),
-        .semantics = .{ .label = "OpenCode API-equivalent usage" },
-    }, &.{.{ .text = "OPENCODE", .weight = .bold, .monospace = true }}));
+        .frame = rect(bars_x, y, 120, 16),
+        .semantics = .{ .label = "Local harness API-equivalent usage" },
+    }, &.{.{ .text = "LOCAL SOURCES", .weight = .bold, .monospace = true }}));
     const value: []const u8 = if (!enabled)
         "disabled"
     else if (empty)

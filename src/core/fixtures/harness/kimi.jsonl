@@ -1,0 +1,2 @@
+{"timestamp":1784541780,"message":{"type":"StatusUpdate","payload":{"model":"kimi-k2","message_id":"kimi-1","token_usage":{"input_other":15,"input_cache_read":16,"input_cache_creation":17,"output":18}}}}
+{"timestamp":1784541840,"message":{"type":"SubagentEvent","payload":{"event":{"type":"StatusUpdate","payload":{"message_id":"kimi-sub-1","token_usage":{"input_other":1,"input_cache_read":2,"input_cache_creation":3,"output":4}}}}}}

@@ -86,7 +86,7 @@ pub const Ledger = struct {
         try self.add(new, new_cost);
     }
 
-    fn remove(self: *Ledger, ev: types.UsageEvent, cost: ?f64) void {
+    pub fn remove(self: *Ledger, ev: types.UsageEvent, cost: ?f64) void {
         self.all.remove(ev, cost);
         self.per_agent.getPtr(ev.agent).remove(ev, cost);
         if (self.per_day.getPtr(dayKey(ev.timestamp_ms, self.tz_offset_min))) |totals| totals.remove(ev, cost);

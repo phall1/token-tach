@@ -3,10 +3,10 @@
 `token-tach --json` and `token-tach --statusline` read the same local state
 as the menu-bar app, print once, and exit without launching the GUI.
 
-The CLI is local-only: it reads config, the persisted state file, and any
-newly appended Claude/Codex JSONL bytes, and one OpenCode SQLite database via
-a read-only connection. It does not poll the network, write state, or touch
-the Keychain. OpenCode prompt/content/tool/auth fields are never queried.
+The CLI is local-only: it reads config, the persisted state file, and every
+enabled local harness ledger. Foreign SQLite databases are opened read-only
+with narrow usage-only projections. It does not poll the network, write state,
+or touch the Keychain.
 
 ```sh
 token-tach --json
@@ -36,7 +36,8 @@ Example output:
 
 ## JSON Schema
 
-The top-level schema is stable for v0.3.x. New fields may be added.
+The top-level schema is additive and stable across current releases. New
+fields and new `by_agent` source keys may be added.
 
 ```json
 {
@@ -61,7 +62,19 @@ The top-level schema is stable for v0.3.x. New fields may be added.
     "by_agent": {
       "claude": {},
       "codex": {},
-      "opencode": {}
+      "opencode": {},
+      "gemini": {},
+      "qwen": {},
+      "pi": {},
+      "kimi": {},
+      "grok": {},
+      "copilot": {},
+      "cline": {},
+      "roo": {},
+      "continue_cli": {},
+      "kilo": {},
+      "goose": {},
+      "droid": {}
     }
   },
   "burn_tokens_per_min": null,
@@ -78,6 +91,24 @@ The top-level schema is stable for v0.3.x. New fields may be added.
   },
   "models": [],
   "projects": [],
+  "coverage": [
+    {
+      "id": "qwen",
+      "label": "Qwen Code",
+      "fidelity": "exact",
+      "enabled": true,
+      "detected": true,
+      "reason": "Dedicated schema-versioned token usage ledger."
+    },
+    {
+      "id": "cursor",
+      "label": "Cursor",
+      "fidelity": "unsupported",
+      "enabled": false,
+      "detected": true,
+      "reason": "No durable local exact-token ledger is exposed."
+    }
+  ],
   "system": {
     "cpu": { "utilization": 0.43, "cores": 14, "load_avg_1m": 3.25 },
     "gpu": { "utilization": 0.12 },
@@ -100,6 +131,11 @@ sampling.
 `burn_tokens_per_min` is always `null` in v0.3 CLI mode. The persisted
 ledger stores rollups, not enough recent per-event history for an honest
 one-shot burn rate.
+
+`coverage` is the source-health contract. `fidelity` is one of `exact`,
+`limited`, `needs_setup`, or `unsupported`; `detected` means Token Tach found
+the product's known local storage, while `enabled` reflects the `source`
+configuration. See `docs/COVERAGE.md` for the full matrix and hard limits.
 
 OpenCode database resolution uses the first non-empty value only:
 `opencode-db` in config, `OPENCODE_DB`,

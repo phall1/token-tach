@@ -41,6 +41,7 @@ const config = @import("core/config.zig");
 const claude = @import("core/claude.zig");
 const codex = @import("core/codex.zig");
 const opencode = @import("core/opencode.zig");
+const harness = @import("core/harness.zig");
 const pricing = @import("core/pricing.zig");
 const ledger_mod = @import("core/ledger.zig");
 const statefile = @import("core/statefile.zig");
@@ -84,6 +85,20 @@ pub fn maybeRunCli(init: std.process.Init) !bool {
                 .opencode_db = init.environ_map.get("OPENCODE_DB"),
                 .xdg_data_home = init.environ_map.get("XDG_DATA_HOME"),
                 .xdg_state_home = init.environ_map.get("XDG_STATE_HOME"),
+                .gemini_cli_home = init.environ_map.get("GEMINI_CLI_HOME"),
+                .qwen_home = init.environ_map.get("QWEN_HOME"),
+                .qwen_runtime_dir = init.environ_map.get("QWEN_RUNTIME_DIR"),
+                .pi_agent_dir = init.environ_map.get("PI_CODING_AGENT_DIR"),
+                .pi_session_dir = init.environ_map.get("PI_CODING_AGENT_SESSION_DIR"),
+                .kimi_share_dir = init.environ_map.get("KIMI_SHARE_DIR"),
+                .grok_home = init.environ_map.get("GROK_HOME"),
+                .copilot_home = init.environ_map.get("COPILOT_HOME"),
+                .cline_dir = init.environ_map.get("CLINE_DIR"),
+                .cline_data_dir = init.environ_map.get("CLINE_DATA_DIR"),
+                .continue_global_dir = init.environ_map.get("CONTINUE_GLOBAL_DIR"),
+                .kilo_db = init.environ_map.get("KILO_DB"),
+                .goose_path_root = init.environ_map.get("GOOSE_PATH_ROOT"),
+                .factory_home = init.environ_map.get("FACTORY_HOME"),
             };
             // Never crash: any collection failure (OOM, pathological fs)
             // degrades to the empty snapshot + note.
@@ -142,8 +157,8 @@ const help_text =
     \\  token-tach --version      print the version, exit
     \\  token-tach --help         show this help
     \\
-    \\The CLI reads the same local data as the app (Claude Code/Codex
-    \\JSONL and OpenCode SQLite plus saved state) and never writes, polls,
+    \\The CLI reads the same local ledgers as the app across supported coding
+    \\harnesses plus saved state and never writes, polls the network,
     \\or touches the keychain. See docs/CLI.md for the JSON schema and a
     \\Claude Code statusline recipe.
     \\
@@ -162,6 +177,20 @@ pub const Env = struct {
     opencode_db: ?[]const u8 = null,
     xdg_data_home: ?[]const u8 = null,
     xdg_state_home: ?[]const u8 = null,
+    gemini_cli_home: ?[]const u8 = null,
+    qwen_home: ?[]const u8 = null,
+    qwen_runtime_dir: ?[]const u8 = null,
+    pi_agent_dir: ?[]const u8 = null,
+    pi_session_dir: ?[]const u8 = null,
+    kimi_share_dir: ?[]const u8 = null,
+    grok_home: ?[]const u8 = null,
+    copilot_home: ?[]const u8 = null,
+    cline_dir: ?[]const u8 = null,
+    cline_data_dir: ?[]const u8 = null,
+    continue_global_dir: ?[]const u8 = null,
+    kilo_db: ?[]const u8 = null,
+    goose_path_root: ?[]const u8 = null,
+    factory_home: ?[]const u8 = null,
 };
 
 /// One (model|project, totals) rollup row.
@@ -184,6 +213,9 @@ pub const Snapshot = struct {
     claude_total: ledger_mod.Totals = .{},
     codex_total: ledger_mod.Totals = .{},
     opencode_total: ledger_mod.Totals = .{},
+    per_agent: std.EnumArray(types.Agent, ledger_mod.Totals) = .initFill(.{}),
+    harness_statuses: ?[harness.coverage_registry.len]harness.SourceStatus = null,
+    unavailable_detected: [harness.unavailable_registry.len]bool = @splat(false),
     codex_limits: ?types.LimitSnapshot = null,
     models: []const Entry = &.{},
     projects: []const Entry = &.{},
@@ -221,19 +253,29 @@ pub fn collect(arena: std.mem.Allocator, io: std.Io, env: Env, now_ms: i64) !Sna
     var claude_tailer = claude.Tailer.init(arena);
     var codex_tailer = codex.Tailer.init(arena);
     var opencode_poller = opencode.Poller.init(arena);
+    var harness_poller = harness.Poller.init(arena);
+    inline for (std.meta.tags(harness.Source)) |source| {
+        const agent = types.Agent.parse(@tagName(source)).?;
+        harness_poller.setActive(source, cfg.sources.enabled(agent));
+    }
     var ledger = ledger_mod.Ledger.init(arena, 0);
 
     // Warm path: restore offsets + rollups so the sweep below only reads
     // appended bytes. READ-ONLY — this module never calls statefile.save,
     // so it cannot corrupt the app's state or race a running instance.
     if (statefile.defaultPath(arena, env.xdg_state_home, env.home) catch null) |state_path| {
-        snap.state = try statefile.restore(arena, io, state_path, &claude_tailer, &codex_tailer, &opencode_poller, &ledger);
+        snap.state = try statefile.restore(arena, io, state_path, &claude_tailer, &codex_tailer, &opencode_poller, &harness_poller, &ledger);
         if (snap.state == .invalid) {
             // Restore guarantees pristine args on .invalid, but stay in
             // lockstep with engine.setup's belt-and-suspenders reinit.
             claude_tailer = claude.Tailer.init(arena);
             codex_tailer = codex.Tailer.init(arena);
             opencode_poller = opencode.Poller.init(arena);
+            harness_poller = harness.Poller.init(arena);
+            inline for (std.meta.tags(harness.Source)) |source| {
+                const agent = types.Agent.parse(@tagName(source)).?;
+                harness_poller.setActive(source, cfg.sources.enabled(agent));
+            }
             ledger = ledger_mod.Ledger.init(arena, 0);
         }
     }
@@ -271,6 +313,44 @@ pub fn collect(arena: std.mem.Allocator, io: std.Io, env: Env, now_ms: i64) !Sna
             } else ledger.add(change.current, new_cost) catch {};
         }
     }
+    {
+        var changes: harness.Changes = .empty;
+        harness_poller.poll(arena, io, .{
+            .home = env.home,
+            .xdg_data_home = env.xdg_data_home,
+            .gemini_cli_home = env.gemini_cli_home,
+            .qwen_home = env.qwen_home,
+            .qwen_runtime_dir = env.qwen_runtime_dir,
+            .pi_agent_dir = env.pi_agent_dir,
+            .pi_session_dir = env.pi_session_dir,
+            .kimi_share_dir = env.kimi_share_dir,
+            .grok_home = env.grok_home,
+            .copilot_home = env.copilot_home,
+            .cline_dir = env.cline_dir,
+            .cline_data_dir = env.cline_data_dir,
+            .continue_global_dir = env.continue_global_dir,
+            .kilo_db = env.kilo_db,
+            .goose_path_root = env.goose_path_root,
+            .factory_home = env.factory_home,
+        }, &changes) catch {};
+        for (changes.items) |change| {
+            if (change.remove) {
+                if (change.previous) |old| ledger.remove(old, if (prices) |*db| db.costOf(old) else null);
+                continue;
+            }
+            const new_cost = if (prices) |*db| db.costOf(change.current) else null;
+            if (change.previous) |old| {
+                ledger.replace(old, if (prices) |*db| db.costOf(old) else null, change.current, new_cost) catch {};
+            } else ledger.add(change.current, new_cost) catch {};
+        }
+        snap.harness_statuses = harness_poller.sources;
+        inline for (harness.unavailable_registry, 0..) |entry, i| {
+            snap.unavailable_detected[i] = harness.unavailableDetected(arena, io, .{
+                .home = env.home,
+                .xdg_data_home = env.xdg_data_home,
+            }, entry.id);
+        }
+    }
 
     snap.tz_offset_min = ledger.tz_offset_min;
     snap.today = ledger.today(now_ms);
@@ -279,6 +359,7 @@ pub fn collect(arena: std.mem.Allocator, io: std.Io, env: Env, now_ms: i64) !Sna
     snap.claude_total = ledger.forAgent(.claude);
     snap.codex_total = ledger.forAgent(.codex);
     snap.opencode_total = ledger.forAgent(.opencode);
+    snap.per_agent = ledger.per_agent;
     snap.models = try topEntries(arena, ledger.per_model.keys(), ledger.per_model.values());
     snap.projects = try topEntries(arena, ledger.per_project.keys(), ledger.per_project.values());
     return snap;
@@ -381,6 +462,33 @@ const JsonKeyed = struct {
     events: u64,
 };
 
+const JsonCoverage = struct {
+    id: []const u8,
+    label: []const u8,
+    fidelity: []const u8,
+    enabled: bool,
+    detected: bool,
+    reason: []const u8,
+};
+
+const JsonByAgent = struct {
+    claude: JsonTotals,
+    codex: JsonTotals,
+    opencode: JsonTotals,
+    gemini: JsonTotals,
+    qwen: JsonTotals,
+    pi: JsonTotals,
+    kimi: JsonTotals,
+    grok: JsonTotals,
+    copilot: JsonTotals,
+    cline: JsonTotals,
+    roo: JsonTotals,
+    continue_cli: JsonTotals,
+    kilo: JsonTotals,
+    goose: JsonTotals,
+    droid: JsonTotals,
+};
+
 /// The stable `--json` schema. Field additions are non-breaking; renames
 /// and removals are breaking and require a docs/CLI.md version note.
 const JsonOut = struct {
@@ -394,7 +502,7 @@ const JsonOut = struct {
         cost_usd: f64,
         tokens: u64,
         events: u64,
-        by_agent: struct { claude: JsonTotals, codex: JsonTotals, opencode: JsonTotals },
+        by_agent: JsonByAgent,
     },
     /// Always null in v1 — see the module doc for why.
     burn_tokens_per_min: ?f64,
@@ -406,6 +514,7 @@ const JsonOut = struct {
     },
     models: []const JsonKeyed,
     projects: []const JsonKeyed,
+    coverage: []const JsonCoverage,
     system: JsonSystem,
 };
 
@@ -524,6 +633,7 @@ pub fn writeJson(w: *std.Io.Writer, snap: Snapshot) !void {
 
     var model_buf: [top_n]JsonKeyed = undefined;
     var project_buf: [top_n]JsonKeyed = undefined;
+    var coverage_buf: [harness.coverage_registry.len + harness.unavailable_registry.len]JsonCoverage = undefined;
     const models = fillKeyed(&model_buf, snap.models);
     const projects = fillKeyed(&project_buf, snap.projects);
 
@@ -542,6 +652,18 @@ pub fn writeJson(w: *std.Io.Writer, snap: Snapshot) !void {
                 .claude = jsonTotals(snap.claude_total),
                 .codex = jsonTotals(snap.codex_total),
                 .opencode = jsonTotals(snap.opencode_total),
+                .gemini = jsonTotals(snap.per_agent.get(.gemini)),
+                .qwen = jsonTotals(snap.per_agent.get(.qwen)),
+                .pi = jsonTotals(snap.per_agent.get(.pi)),
+                .kimi = jsonTotals(snap.per_agent.get(.kimi)),
+                .grok = jsonTotals(snap.per_agent.get(.grok)),
+                .copilot = jsonTotals(snap.per_agent.get(.copilot)),
+                .cline = jsonTotals(snap.per_agent.get(.cline)),
+                .roo = jsonTotals(snap.per_agent.get(.roo)),
+                .continue_cli = jsonTotals(snap.per_agent.get(.continue_cli)),
+                .kilo = jsonTotals(snap.per_agent.get(.kilo)),
+                .goose = jsonTotals(snap.per_agent.get(.goose)),
+                .droid = jsonTotals(snap.per_agent.get(.droid)),
             },
         },
         .burn_tokens_per_min = null,
@@ -552,10 +674,43 @@ pub fn writeJson(w: *std.Io.Writer, snap: Snapshot) !void {
         },
         .models = models,
         .projects = projects,
+        .coverage = fillCoverage(&coverage_buf, snap),
         .system = jsonSystem(snap.system),
     };
     try std.json.Stringify.value(out, .{ .whitespace = .indent_2 }, w);
     try w.writeByte('\n');
+}
+
+fn fillCoverage(buf: []JsonCoverage, snap: Snapshot) []const JsonCoverage {
+    var at: usize = 0;
+    inline for (harness.coverage_registry, 0..) |entry, i| {
+        const status = if (snap.harness_statuses) |statuses| statuses[i] else harness.SourceStatus{
+            .source = @enumFromInt(i),
+            .id = entry.id,
+            .active = true,
+        };
+        buf[at] = .{
+            .id = entry.id,
+            .label = entry.label,
+            .fidelity = @tagName(entry.fidelity),
+            .enabled = status.active,
+            .detected = status.detected,
+            .reason = entry.reason,
+        };
+        at += 1;
+    }
+    inline for (harness.unavailable_registry, 0..) |entry, i| {
+        buf[at] = .{
+            .id = entry.id,
+            .label = entry.label,
+            .fidelity = @tagName(entry.fidelity),
+            .enabled = false,
+            .detected = snap.unavailable_detected[i],
+            .reason = entry.reason,
+        };
+        at += 1;
+    }
+    return buf[0..at];
 }
 
 fn fillKeyed(buf: []JsonKeyed, entries: []const Entry) []const JsonKeyed {
@@ -745,6 +900,29 @@ test "collect: cold scan aggregates fixtures, splits today/month, captures codex
     }
 }
 
+test "collect auto-discovers an additional harness and reports coverage" {
+    var tree = try TmpTree.init(testing.io);
+    defer tree.deinit();
+    try tree.tmp.dir.createDirPath(testing.io, "qwen-runtime/usage");
+    try tree.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "qwen-runtime/usage/token-usage-2026-07.jsonl",
+        .data = @embedFile("core/fixtures/harness/qwen.jsonl"),
+    });
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var env = try tree.env(arena, testing.io);
+    const base = try tree.base(testing.io);
+    env.qwen_runtime_dir = try std.fmt.allocPrint(arena, "{s}/qwen-runtime", .{base});
+
+    const snap = try collect(arena, testing.io, env, fixture_now_ms);
+    try testing.expectEqual(@as(u64, 12), snap.all.events);
+    try testing.expectEqual(@as(u64, 1), snap.per_agent.get(.qwen).events);
+    try testing.expectEqual(@as(u64, 113), snap.per_agent.get(.qwen).totalTokens());
+    try testing.expect(snap.harness_statuses.?[@intFromEnum(harness.Source.qwen)].detected);
+}
+
 test "collect: warm restore does not double-count and keeps the saved tz" {
     const io = testing.io;
     var tree = try TmpTree.init(io);
@@ -761,6 +939,7 @@ test "collect: warm restore does not double-count and keeps the saved tz" {
         var claude_tailer = claude.Tailer.init(arena);
         var codex_tailer = codex.Tailer.init(arena);
         var opencode_poller = opencode.Poller.init(arena);
+        var harness_poller = harness.Poller.init(arena);
         var ledger = ledger_mod.Ledger.init(arena, -300);
 
         var sink = claude.ListSink.init(arena);
@@ -774,7 +953,7 @@ test "collect: warm restore does not double-count and keeps the saved tz" {
         for (events.items) |ev| try ledger.add(ev, 0.25);
 
         const state_path = try statefile.defaultPath(arena, env.xdg_state_home, env.home);
-        try statefile.save(arena, io, state_path, &claude_tailer, &codex_tailer, &opencode_poller, &ledger);
+        try statefile.save(arena, io, state_path, &claude_tailer, &codex_tailer, &opencode_poller, &harness_poller, &ledger);
     }
 
     const snap = try collect(arena, io, env, fixture_now_ms);
@@ -837,6 +1016,8 @@ test "writeJson: schema fields, note semantics, and claude-limits hint" {
     try testing.expectEqual(@as(i64, @intCast(claude_fixture_tokens)), root.get("today").?.object.get("tokens").?.integer);
     try testing.expectEqual(@as(i64, 11), root.get("all_time").?.object.get("events").?.integer);
     try testing.expect(root.get("all_time").?.object.get("by_agent").?.object.get("claude").? == .object);
+    try testing.expect(root.get("all_time").?.object.get("by_agent").?.object.get("qwen").? == .object);
+    try testing.expectEqual(harness.coverage_registry.len + harness.unavailable_registry.len, root.get("coverage").?.array.items.len);
     // Burn is honestly absent in v1.
     try testing.expect(root.get("burn_tokens_per_min").? == .null);
     const limits = root.get("limits").?.object;
