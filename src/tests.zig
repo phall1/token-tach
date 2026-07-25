@@ -169,6 +169,32 @@ test "system strip renders enabled readings and hides absent modules" {
     try testing.expect(!containsText(tree.root, "BAT"));
 }
 
+test "battery cell renders charge, charging label, and low-charge ink" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Charging on AC: the label carries the + and the value the charge.
+    var model = instrumentedModel();
+    model.system_snap = .{
+        .battery = .{ .charge = 0.87, .charging = true, .on_ac = true, .minutes_to_full = 42 },
+    };
+    const tree = try buildTree(arena, &model);
+    try testing.expect(containsText(tree.root, "BAT+"));
+    try testing.expect(containsText(tree.root, "87%"));
+
+    // Discharging at 12%: plain label, and the reading still renders
+    // (ink thresholds are style, not structure — presence is the test).
+    var low = instrumentedModel();
+    low.system_snap = .{
+        .battery = .{ .charge = 0.12, .charging = false, .on_ac = false, .minutes_to_empty = 95 },
+    };
+    const low_tree = try buildTree(arena, &low);
+    try testing.expect(containsText(low_tree.root, "BAT"));
+    try testing.expect(!containsText(low_tree.root, "BAT+"));
+    try testing.expect(containsText(low_tree.root, "12%"));
+}
+
 test "system strip disappears entirely when config disables it" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

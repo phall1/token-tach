@@ -765,6 +765,9 @@ const SysCell = struct {
     value: []const u8,
     meter_frac: f64,
     ink: Color,
+    /// Meter ink when it differs from the value ink (the DISK cell inks
+    /// its value by capacity but its meter by live I/O activity).
+    meter_ink: ?Color = null,
     /// Width weight: NET carries a two-direction reading and gets a
     /// wider cell so the value never wraps.
     weight: f32 = 1,
@@ -815,11 +818,16 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
         count += 1;
     }
     if (snap.disk) |s| {
+        // Value: free space, inked by how full the volume is. Meter:
+        // live read+write activity against the ratcheted peak — the
+        // capacity fraction barely moves for months, but I/O makes this
+        // a real instrument (tt-t7u).
         cells[count] = .{
             .label = "DISK",
             .value = fmtBytes(ui, s.free_bytes),
-            .meter_frac = s.used_fraction,
+            .meter_frac = snap.disk_io_meter_frac orelse 0,
             .ink = if (s.used_fraction >= 0.92) theme.red else if (s.used_fraction >= 0.8) theme.amber else theme.green,
+            .meter_ink = theme.green,
         };
         count += 1;
     }
@@ -889,14 +897,15 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
         }, .{}));
         const frac: f32 = @floatCast(std.math.clamp(cell.meter_frac, 0, 1));
         if (frac > 0) {
+            const meter_ink = cell.meter_ink orelse cell.ink;
             const fill_w = @max(track_w * frac, 2);
             push(ui, nodes, ui.panel(.{
                 .frame = rect(x, system_y + 26, fill_w, 5),
-                .style = .{ .background = cell.ink, .radius = 2, .stroke_width = 0 },
+                .style = .{ .background = meter_ink, .radius = 2, .stroke_width = 0 },
             }, .{}));
             push(ui, nodes, ui.panel(.{
                 .frame = rect(x + fill_w - 3, system_y + 24, 8, 8),
-                .style = .{ .background = withAlpha(cell.ink, 0.35), .radius = 4, .stroke_width = 0 },
+                .style = .{ .background = withAlpha(meter_ink, 0.35), .radius = 4, .stroke_width = 0 },
             }, .{}));
         }
     }
