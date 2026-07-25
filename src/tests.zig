@@ -180,6 +180,41 @@ test "system strip renders enabled readings and hides absent modules" {
     try testing.expect(!containsText(tree.root, "BAT"));
 }
 
+test "hovering a system cell reveals its full reading in the footer" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = instrumentedModel();
+    model.system_snap = .{
+        .cpu = .{ .total_frac = 0.43, .core_count = 14, .load_avg_1m = 3.25, .p_cluster_frac = 0.64, .e_cluster_frac = 1.0 },
+    };
+
+    // Not hovering: the footer shows the engine status line.
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findByText(tree.root, .status_bar, model.status_text) != null);
+    }
+
+    // Hovering CPU: the footer becomes the full CPU readout (cores, load,
+    // P/E cluster split) that the compact strip can't show at a glance.
+    model.hovered_system = .cpu;
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(containsText(tree.root, "14 cores"));
+        try testing.expect(containsText(tree.root, "load 3.25"));
+        try testing.expect(containsText(tree.root, "P 64% E 100%"));
+    }
+
+    // Hovering a cell whose reading has vanished falls back to the status
+    // line rather than rendering nothing.
+    model.hovered_system = .battery;
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findByText(tree.root, .status_bar, model.status_text) != null);
+    }
+}
+
 test "battery cell renders charge, charging label, and low-charge ink" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

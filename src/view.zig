@@ -265,9 +265,16 @@ pub fn rootView(ui: *Ui, model: *const Model) Ui.Node {
     limitsPanel(ui, &nodes, model);
     odometerStrip(ui, &nodes, model);
     systemStrip(ui, &nodes, model);
+    // Footer: normally the engine status line; while a system cell is
+    // hovered it reveals that cell's full-precision reading (SDK hover
+    // Msgs). The reveal wins because it is what the pointer is asking for.
+    const footer_text = if (model.hovered_system) |t|
+        (systemHoverDetail(ui, model, t) orelse model.status_text)
+    else
+        model.status_text;
     push(ui, &nodes, ui.statusBar(.{
         .frame = rect(0, footer_y, window_width, window_height - footer_y),
-    }, model.status_text));
+    }, footer_text));
     // Transparent root: the chrome prefix owns the window wash, so the
     // gradient bezels and dial face painted under the widgets show.
     return ui.panel(.{
@@ -795,6 +802,8 @@ const SysCell = struct {
     value: []const u8,
     meter_frac: f64,
     ink: Color,
+    /// The hover target this cell reports (drives the footer reveal).
+    target: engine.HoverTarget,
     /// Meter ink when it differs from the value ink (the DISK cell inks
     /// its value by capacity but its meter by live I/O activity).
     meter_ink: ?Color = null,
@@ -816,6 +825,7 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
     if (snap.cpu) |s| {
         cells[count] = .{
             .label = "CPU",
+            .target = .cpu,
             .value = ui.fmt("{d}%", .{pctInt(s.total_frac)}),
             .meter_frac = s.total_frac,
             .ink = sysColor(s.total_frac),
@@ -825,6 +835,7 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
     if (snap.gpu) |s| {
         cells[count] = .{
             .label = "GPU",
+            .target = .gpu,
             .value = ui.fmt("{d}%", .{pctInt(s.device_utilization)}),
             .meter_frac = s.device_utilization,
             .ink = sysColor(s.device_utilization),
@@ -841,6 +852,7 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
         };
         cells[count] = .{
             .label = "MEM",
+            .target = .mem,
             .value = ui.fmt("{d}%", .{pctInt(s.used_frac)}),
             .meter_frac = s.used_frac,
             .ink = ink,
@@ -854,6 +866,7 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
         // a real instrument (tt-t7u).
         cells[count] = .{
             .label = "DISK",
+            .target = .disk,
             .value = fmtBytes(ui, s.free_bytes),
             .meter_frac = snap.disk_io_meter_frac orelse 0,
             .ink = if (s.used_fraction >= 0.92) theme.red else if (s.used_fraction >= 0.8) theme.amber else theme.green,
@@ -866,6 +879,7 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
         // aggregator's ratcheted peak, and activity is never a warning.
         cells[count] = .{
             .label = "NET",
+            .target = .net,
             .value = ui.fmt("↓{s} ↑{s}", .{
                 fmtBytes(ui, @intFromFloat(@max(s.in_bytes_per_sec orelse 0, 0))),
                 fmtBytes(ui, @intFromFloat(@max(s.out_bytes_per_sec orelse 0, 0))),
@@ -879,6 +893,7 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
     if (snap.battery) |s| {
         cells[count] = .{
             .label = if (s.charging) "BAT+" else "BAT",
+            .target = .battery,
             .value = ui.fmt("{d}%", .{pctInt(s.charge)}),
             .meter_frac = s.charge,
             .ink = if (s.charge <= 0.15) theme.red else if (s.charge <= 0.35) theme.amber else theme.green,
@@ -938,7 +953,68 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
                 .style = .{ .background = withAlpha(meter_ink, 0.35), .radius = 4, .stroke_width = 0 },
             }, .{}));
         }
+
+        // A transparent hover-hit region over the whole cell, pushed
+        // last so it sits atop the readouts. Binding hover makes it
+        // hover-hittable without painting a wash (SDK on_hover_*); the
+        // enter/leave pair drives the footer reveal. When this cell is
+        // the hovered one, a faint underline confirms the target.
+        const hovered = model.hovered_system == cell.target;
+        push(ui, nodes, ui.panel(.{
+            .frame = rect(x - 8, system_y, cell_w + 8, system_h),
+            .style = .{ .background = theme.transparent, .radius = 0, .stroke_width = 0 },
+            .on_hover_enter = .{ .hover_system = cell.target },
+            .on_hover_leave = .hover_clear,
+            .semantics = .{ .label = ui.fmt("{s} telemetry", .{cell.label}) },
+        }, .{}));
+        if (hovered) {
+            push(ui, nodes, ui.panel(.{
+                .frame = rect(x, system_y + 34, track_w, 2),
+                .style = .{ .background = withAlpha(cell.ink, 0.7), .radius = 1, .stroke_width = 0 },
+            }, .{}));
+        }
     }
+}
+
+/// The footer reading for a hovered system cell — the full precision the
+/// compact strip cannot show at a glance. Null when the reading vanished
+/// between hover and rebuild (the paired leave is still coming).
+fn systemHoverDetail(ui: *Ui, model: *const Model, target: engine.HoverTarget) ?[]const u8 {
+    const snap = model.system_snap;
+    return switch (target) {
+        .cpu => if (snap.cpu) |s| blk: {
+            if (s.p_cluster_frac != null and s.e_cluster_frac != null) {
+                break :blk ui.fmt("CPU {d}% · {d} cores · load {d:.2} · P {d}% E {d}%", .{
+                    pctInt(s.total_frac),       s.core_count,               s.load_avg_1m,
+                    pctInt(s.p_cluster_frac.?), pctInt(s.e_cluster_frac.?),
+                });
+            }
+            break :blk ui.fmt("CPU {d}% · {d} cores · load {d:.2}", .{ pctInt(s.total_frac), s.core_count, s.load_avg_1m });
+        } else null,
+        .gpu => if (snap.gpu) |s| blk: {
+            if (s.in_use_memory_bytes) |mem| {
+                break :blk ui.fmt("GPU {d}% · {s} in use", .{ pctInt(s.device_utilization), fmtBytes(ui, mem) });
+            }
+            break :blk ui.fmt("GPU {d}% utilization", .{pctInt(s.device_utilization)});
+        } else null,
+        .mem => if (snap.mem) |s| ui.fmt("MEM {s} / {s} used ({d}%) · pressure {s}", .{
+            fmtBytes(ui, s.used_bytes), fmtBytes(ui, s.total_bytes), pctInt(s.used_frac), @tagName(s.pressure),
+        }) else null,
+        .disk => if (snap.disk) |s| ui.fmt("DISK {s} free of {s} ({d}% used) · ↓{s}/s ↑{s}/s", .{
+            fmtBytes(ui, s.free_bytes),                                          fmtBytes(ui, s.total_bytes),                                          pctInt(s.used_fraction),
+            fmtBytes(ui, @intFromFloat(@max(s.read_bytes_per_sec orelse 0, 0))), fmtBytes(ui, @intFromFloat(@max(s.write_bytes_per_sec orelse 0, 0))),
+        }) else null,
+        .net => if (snap.net) |s| ui.fmt("NET ↓{s}/s ↑{s}/s", .{
+            fmtBytes(ui, @intFromFloat(@max(s.in_bytes_per_sec orelse 0, 0))),
+            fmtBytes(ui, @intFromFloat(@max(s.out_bytes_per_sec orelse 0, 0))),
+        }) else null,
+        .battery => if (snap.battery) |s| blk: {
+            const state: []const u8 = if (s.charging) "charging" else if (s.on_ac) "on AC" else "on battery";
+            if (s.minutes_to_empty) |m| break :blk ui.fmt("BATTERY {d}% · {s} · ~{d}h{d:0>2}m left", .{ pctInt(s.charge), state, m / 60, m % 60 });
+            if (s.minutes_to_full) |m| break :blk ui.fmt("BATTERY {d}% · {s} · ~{d}h{d:0>2}m to full", .{ pctInt(s.charge), state, m / 60, m % 60 });
+            break :blk ui.fmt("BATTERY {d}% · {s}", .{ pctInt(s.charge), state });
+        } else null,
+    };
 }
 
 /// Utilization thresholds for system meters: quiet green until 70%,

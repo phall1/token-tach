@@ -72,7 +72,17 @@ pub const Msg = union(enum) {
     /// Tray "Settings": open ~/.config/token-tach/config in the default
     /// editor (creating a commented template first if absent).
     open_config,
+    /// Pointer entered a system-telemetry cell — the footer reveals its
+    /// full reading until the paired `hover_clear` (SDK on_hover_enter).
+    hover_system: HoverTarget,
+    /// Pointer left the hovered cell (SDK on_hover_leave) — footer
+    /// returns to the status line.
+    hover_clear,
 };
+
+/// A hover-revealable element of the instrument. Scalar payload so the
+/// SDK can capture the paired leave (a single-item pointer can't be).
+pub const HoverTarget = enum { cpu, gpu, mem, disk, net, battery };
 
 /// One queued history file awaiting its catch-up parse.
 pub const CatchupFile = struct {
@@ -122,6 +132,9 @@ pub const Model = struct {
     /// design — never persisted).
     system_sampler: system.Sampler = system.Sampler.init(),
     system_snap: system.Snapshot = .{},
+    /// Which system cell the pointer is over, if any (pure display —
+    /// drives the footer reveal). Null = footer shows the status line.
+    hovered_system: ?HoverTarget = null,
 
     /// The launch-at-login value last pushed to the OS (null = never
     /// pushed). Applying is idempotent-guarded on this so config
@@ -803,6 +816,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             startIgnition(model, fx);
         },
         .open_config => openConfig(model, fx),
+        // Hover reveal is pure display: set the target (or clear it) and
+        // let the rebuild re-render the footer. Cheap — hover Msgs fire
+        // on containment edges, never per pointer move.
+        .hover_system => |target| model.hovered_system = target,
+        .hover_clear => model.hovered_system = null,
         .quit => {
             // Accessory app: the tray Quit item is the only exit
             // affordance. Flush state, then leave — the runtime has no
