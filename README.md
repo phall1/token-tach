@@ -8,11 +8,7 @@ no accounts, no telemetry — and turns them into an instrument.
 ⚡ 50.7k/m → wall 3:40p          ← the menu bar, all day
 ```
 
-One click:
-
-![the tach cluster](docs/assets/cluster.png)
-
-And yes — the needle does the full ignition sweep every time you open it:
+One click -- and the needle does the full ignition sweep every time you open it:
 
 ![ignition sweep](docs/assets/ignition.gif)
 
