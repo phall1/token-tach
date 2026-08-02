@@ -1,0 +1,118 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    # workflow_dispatch can target any ref; only main may groom or publish.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maintain draft release PR
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Revalidate an updated ready release PR
+        if: steps.release.outputs.prs_created == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
+        run: |
+          set -euo pipefail
+          number="$(jq -r '.number' <<<"$RELEASE_PR")"
+          state="$(gh pr view "$number" --json isDraft,headRefName)"
+          if [[ "$(jq -r '.isDraft' <<<"$state")" == "true" ]]; then
+            echo "Release PR #$number is draft; CI remains off."
+            exit 0
+          fi
+          head="$(jq -r '.headRefName' <<<"$state")"
+          gh workflow run ci.yml --ref "$head" -f ref="$head"
+          echo "Dispatched CI for updated ready PR #$number at $head."
+
+      - name: Check out main release history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Tag and dispatch a merged release PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="$(scripts/version current)"
+          manifest_version="$(jq -r '."."' .release-please-manifest.json)"
+          [[ "$manifest_version" == "$version" ]]
+          tag="v$version"
+
+          # Existing published versions are normal on every non-release push.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already published; no release dispatch needed."
+            exit 0
+          fi
+
+          # Find the first-parent commit that introduced this manifest version.
+          # On recovery this remains the release-PR merge, even if main advanced.
+          release_sha="$(
+            git log --first-parent --format=%H -- .release-please-manifest.json |
+              while read -r candidate; do
+                candidate_version="$(git show "$candidate:.release-please-manifest.json" 2>/dev/null | jq -r '."."' 2>/dev/null || true)"
+                parent="$(git rev-parse "$candidate^1" 2>/dev/null || true)"
+                parent_version=""
+                if [[ -n "$parent" ]]; then
+                  parent_version="$(git show "$parent:.release-please-manifest.json" 2>/dev/null | jq -r '."."' 2>/dev/null || true)"
+                fi
+                if [[ "$candidate_version" == "$version" && "$parent_version" != "$version" ]]; then
+                  echo "$candidate"
+                  break
+                fi
+              done
+          )"
+          [[ -n "$release_sha" ]]
+          manifest_at_release="$(git show "$release_sha:.release-please-manifest.json" | jq -r '."."')"
+          version_file_at_release="$(git show "$release_sha:version.txt" | tr -d '[:space:]')"
+          app_at_release="$(git show "$release_sha:app.zon" | sed -nE 's/^[[:space:]]*\.version = \"([^\"]+)\".*/\1/p')"
+          build_at_release="$(git show "$release_sha:build.zig.zon" | sed -nE 's/^[[:space:]]*\.version = \"([^\"]+)\".*/\1/p')"
+          [[ "$manifest_at_release" == "$version" ]]
+          [[ "$version_file_at_release" == "$version" ]]
+          [[ "$app_at_release" == "$version" ]]
+          [[ "$build_at_release" == "$version" ]]
+
+          # release-please owns the version PR; this workflow owns the lightweight
+          # tag so the existing artifact publisher remains the sole Release owner.
+          tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null || true)"
+          if [[ -z "$tag_sha" ]]; then
+            gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f ref="refs/tags/$tag" \
+              -f sha="$release_sha" >/dev/null
+            echo "Created $tag at release commit $release_sha."
+          else
+            [[ "$tag_sha" == "$release_sha" ]]
+            echo "$tag already exists at the release commit; retrying dispatch."
+          fi
+
+          # GITHUB_TOKEN tag pushes do not recursively start workflows. A
+          # workflow_dispatch event is the documented exception, so dispatch the
+          # immutable tag publisher explicitly.
+          gh workflow run release.yml --ref main -f tag="$tag"

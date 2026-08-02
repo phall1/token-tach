@@ -11,6 +11,10 @@ No signing or Apple credentials are required for the active ad-hoc release
 workflow.
 - `HOMEBREW_TAP_TOKEN` (optional): a fine-grained token with Actions dispatch
   access to `phall1/homebrew-tap`; it triggers an immediate cask update.
+- Enable **Allow GitHub Actions to create and approve pull requests**. Release
+  Please uses the repository `GITHUB_TOKEN`; no long-lived release PAT is needed.
+- Keep the `main` ruleset's required GitHub Actions `verify` check active. This
+  binds merges to the current PR head; administrators retain emergency bypass.
 
 Enable GitHub artifact attestations for the repository. Provenance is generated
 for public repositories, where GitHub's Sigstore-backed attestation service is
@@ -26,12 +30,30 @@ an existing GitHub Release.
 
 ## Publishing
 
-1. Set `app.zon`'s version to the intended `MAJOR.MINOR.PATCH` and land it through
-   normal CI.
-2. Create and push the matching tag, for example `v0.3.2`, after required checks
-   pass on that commit. A tag push starts the workflow automatically.
-The workflow can also be run manually with an existing tag. It never builds an
-arbitrary branch or untagged SHA.
+Release Please maintains one **draft** release PR from Conventional Commits.
+Draft PRs do not run the macOS CI lane; mark the release PR ready when its notes
+and version are ready for review, then merge only after the resulting CI run is
+green. If Release Please later updates an already-ready release PR, it explicitly
+dispatches CI against the new head so an older green result cannot authorize it.
+
+Merging the release PR atomically updates `version.txt`, `app.zon`,
+`build.zig.zon`, `CHANGELOG.md`, and the Release Please manifest. The
+`Release Please` workflow then creates the matching lightweight `vX.Y.Z` tag
+and explicitly dispatches the existing `Release` workflow. The explicit
+dispatch is required because GitHub suppresses recursive tag workflows created
+with `GITHUB_TOKEN`.
+
+The `Release` workflow remains the sole owner of the GitHub Release and its
+artifacts: it verifies the exact tagged commit, builds and signs Universal 2,
+publishes the DMG/checksums/provenance, and updates the Homebrew tap. Do not
+manually edit release versions or create the normal release tag.
+
+For recovery, run the `Release` workflow manually with an existing tag. It never
+builds an arbitrary branch or untagged SHA. If tag creation or dispatch failed,
+rerun `Release Please` on `main`; it derives the tag target from the first-parent
+commit that introduced the unreleased manifest version, validates every version
+mirror at that commit, and redispatches the publisher. Duplicate publisher runs
+cheaply stop before allocating a macOS runner once the release exists.
 
 After publication, the workflow dispatches `phall1/homebrew-tap` with the
 released version and verified DMG checksum when the optional token is present.

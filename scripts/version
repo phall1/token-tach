@@ -13,6 +13,9 @@ VERSION=$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)".*/\1/p' app.zon)
   || fail "app.zon must contain exactly one .version string"
 [[ "$VERSION" =~ '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' ]] \
   || fail "app.zon version must be strict X.Y.Z SemVer (got: $VERSION)"
+RELEASE_PLEASE_VERSION=$(tr -d '[:space:]' < version.txt)
+[[ "$RELEASE_PLEASE_VERSION" == "$VERSION" ]] \
+  || fail "version.txt '$RELEASE_PLEASE_VERSION' must mirror app.zon $VERSION"
 BUILD_PACKAGE_VERSION=$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)".*/\1/p' build.zig.zon)
 [[ "$BUILD_PACKAGE_VERSION" == "$VERSION" ]] \
   || fail "build.zig.zon version '$BUILD_PACKAGE_VERSION' must mirror app.zon $VERSION"
