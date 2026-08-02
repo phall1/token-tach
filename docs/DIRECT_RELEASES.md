@@ -13,6 +13,8 @@ workflow.
   access to `phall1/homebrew-tap`; it triggers an immediate cask update.
 - Enable **Allow GitHub Actions to create and approve pull requests**. Release
   Please uses the repository `GITHUB_TOKEN`; no long-lived release PAT is needed.
+- Keep the `main` ruleset's required GitHub Actions `verify` check active. This
+  binds merges to the current PR head; administrators retain emergency bypass.
 
 Enable GitHub artifact attestations for the repository. Provenance is generated
 for public repositories, where GitHub's Sigstore-backed attestation service is
@@ -31,7 +33,8 @@ an existing GitHub Release.
 Release Please maintains one **draft** release PR from Conventional Commits.
 Draft PRs do not run the macOS CI lane; mark the release PR ready when its notes
 and version are ready for review, then merge only after the resulting CI run is
-green.
+green. If Release Please later updates an already-ready release PR, it explicitly
+dispatches CI against the new head so an older green result cannot authorize it.
 
 Merging the release PR atomically updates `version.txt`, `app.zon`,
 `build.zig.zon`, `CHANGELOG.md`, and the Release Please manifest. The
@@ -46,9 +49,11 @@ publishes the DMG/checksums/provenance, and updates the Homebrew tap. Do not
 manually edit release versions or create the normal release tag.
 
 For recovery, run the `Release` workflow manually with an existing tag. It never
-builds an arbitrary branch or untagged SHA. If Release Please created a tag but
-dispatch failed before publication, rerun `Release Please` manually; it will
-redispatch the unpublished existing tag.
+builds an arbitrary branch or untagged SHA. If tag creation or dispatch failed,
+rerun `Release Please` on `main`; it derives the tag target from the first-parent
+commit that introduced the unreleased manifest version, validates every version
+mirror at that commit, and redispatches the publisher. Duplicate publisher runs
+cheaply stop before allocating a macOS runner once the release exists.
 
 After publication, the workflow dispatches `phall1/homebrew-tap` with the
 released version and verified DMG checksum when the optional token is present.
