@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "7693edce09fe2bb42a5486e1df963b431989b8c0",
+  "release-type": "simple",
+  "version-file": "version.txt",
+  "draft-pull-request": true,
+  "skip-github-release": true,
+  "include-v-in-tag": true,
+  "include-component-in-tag": false,
+  "bump-minor-pre-major": true,
+  "extra-files": [
+    {
+      "type": "generic",
+      "path": "app.zon"
+    },
+    {
+      "type": "generic",
+      "path": "build.zig.zon"
+    }
+  ],
+  "packages": {
+    ".": {
+      "component": "token-tach",
+      "package-name": "token-tach"
+    }
+  }
+}
