@@ -31,6 +31,11 @@ const canvas_label = "main-canvas";
 const window_width: f32 = view.window_width;
 const window_height: f32 = view.window_height;
 
+// The engine retains tens of thousands of small paths, dedup keys, and
+// rollup entries. page_allocator maps each allocation separately on macOS;
+// the pooled SMP allocator keeps that long-lived state compact.
+const app_allocator = std.heap.smp_allocator;
+
 extern fn token_tach_updater_start() void;
 extern fn token_tach_updater_check() void;
 
@@ -140,7 +145,7 @@ pub fn initialModel() Model {
 pub fn main(init: std.process.Init) !void {
     if (try cli.maybeRunCli(init)) return;
 
-    const app_state = try TachApp.create(std.heap.page_allocator, .{
+    const app_state = try TachApp.create(app_allocator, .{
         .name = "token-tach",
         .scene = shell_scene,
         .canvas_label = canvas_label,
@@ -168,7 +173,7 @@ pub fn main(init: std.process.Init) !void {
     });
     defer app_state.destroy();
 
-    engine.setup(&app_state.model, std.heap.page_allocator, .{
+    engine.setup(&app_state.model, app_allocator, .{
         .home = init.environ_map.get("HOME") orelse "",
         .claude_config_dir = init.environ_map.get("CLAUDE_CONFIG_DIR"),
         .codex_home = init.environ_map.get("CODEX_HOME"),
