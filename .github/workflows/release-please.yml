@@ -78,7 +78,12 @@ jobs:
             git log --first-parent --format=%H -- .release-please-manifest.json |
               while read -r candidate; do
                 candidate_version="$(git show "$candidate:.release-please-manifest.json" 2>/dev/null | jq -r '."."' 2>/dev/null || true)"
-                if [[ "$candidate_version" == "$version" ]]; then
+                parent="$(git rev-parse "$candidate^1" 2>/dev/null || true)"
+                parent_version=""
+                if [[ -n "$parent" ]]; then
+                  parent_version="$(git show "$parent:.release-please-manifest.json" 2>/dev/null | jq -r '."."' 2>/dev/null || true)"
+                fi
+                if [[ "$candidate_version" == "$version" && "$parent_version" != "$version" ]]; then
                   echo "$candidate"
                   break
                 fi
