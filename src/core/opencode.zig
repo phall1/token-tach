@@ -13,6 +13,7 @@ const c = struct {
     pub const sqlite3_stmt = opaque {};
     pub const SQLITE_OK: c_int = 0;
     pub const SQLITE_ROW: c_int = 100;
+    pub const SQLITE_DONE: c_int = 101;
     pub const SQLITE_INTEGER: c_int = 1;
     pub const SQLITE_OPEN_READONLY: c_int = 0x00000001;
     pub const SQLITE_OPEN_READWRITE: c_int = 0x00000002;
@@ -46,10 +47,49 @@ pub const Stored = struct {
     event: types.UsageEvent,
 };
 
+const FileStamp = struct {
+    mtime_ns: i96,
+    size: u64,
+
+    fn eql(self: FileStamp, other: FileStamp) bool {
+        return self.mtime_ns == other.mtime_ns and self.size == other.size;
+    }
+};
+
+const DbFingerprint = struct {
+    main: FileStamp,
+    wal: ?FileStamp,
+
+    fn eql(self: DbFingerprint, other: DbFingerprint) bool {
+        if (!self.main.eql(other.main)) return false;
+        if (self.wal == null or other.wal == null) return self.wal == null and other.wal == null;
+        return self.wal.?.eql(other.wal.?);
+    }
+};
+
+fn databaseFingerprint(path: []const u8) ?DbFingerprint {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    var cwd = std.Io.Dir.cwd();
+    const main = cwd.statFile(io, path, .{}) catch return null;
+    var wal_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const wal_path = std.fmt.bufPrint(&wal_buf, "{s}-wal", .{path}) catch return null;
+    const wal = if (cwd.statFile(io, wal_path, .{})) |stat|
+        FileStamp{ .mtime_ns = stat.mtime.nanoseconds, .size = stat.size }
+    else |_|
+        null;
+    return .{
+        .main = .{ .mtime_ns = main.mtime.nanoseconds, .size = main.size },
+        .wal = wal,
+    };
+}
+
 pub const Poller = struct {
     allocator: Allocator,
     seen: std.StringHashMapUnmanaged(Stored) = .empty,
     cursor_updated_ms: i64 = 0,
+    last_fingerprint: ?DbFingerprint = null,
+    query_count: u64 = 0,
 
     pub fn init(allocator: Allocator) Poller {
         return .{ .allocator = allocator };
@@ -71,6 +111,13 @@ pub const Poller = struct {
 
     pub fn poll(self: *Poller, event_allocator: Allocator, path: []const u8, out: *std.ArrayList(Change)) !void {
         if (path.len == 0) return;
+        // OpenCode's usage projection is not indexed by time_updated on
+        // currently deployed schemas. Avoid paying that full scan + sort
+        // every 2 s when neither the database nor its WAL changed.
+        const fingerprint = databaseFingerprint(path) orelse return;
+        if (self.last_fingerprint) |last| {
+            if (fingerprint.eql(last)) return;
+        }
         const zpath = try self.allocator.dupeZ(u8, path);
         defer self.allocator.free(zpath);
 
@@ -90,8 +137,12 @@ pub const Poller = struct {
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int64(stmt, 1, self.cursor_updated_ms);
 
+        self.query_count += 1;
         var max_updated = self.cursor_updated_ms;
-        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        var step_result: c_int = undefined;
+        while (true) {
+            step_result = c.sqlite3_step(stmt);
+            if (step_result != c.SQLITE_ROW) break;
             const id = columnText(stmt, 0) orelse continue;
             const updated_ms = c.sqlite3_column_int64(stmt, 1);
             const model = columnText(stmt, 2) orelse continue;
@@ -136,9 +187,13 @@ pub const Poller = struct {
             try out.append(event_allocator, .{ .previous = previous, .current = current });
             try self.putStored(id, updated_ms, current);
         }
+        // Do not cache a partial/busy read: retry it next sweep even if the
+        // filesystem fingerprint remains unchanged.
+        if (step_result != c.SQLITE_DONE) return;
         // Query with >= so rows sharing the cursor timestamp are revisited and
         // suppressed by the persisted identity+snapshot map.
         self.cursor_updated_ms = max_updated;
+        self.last_fingerprint = fingerprint;
     }
 
     fn putStored(self: *Poller, id: []const u8, updated_ms: i64, event: types.UsageEvent) !void {
@@ -203,8 +258,10 @@ const v1_sql: [:0]const u8 =
     "coalesce(json_extract(m.data,'$.tokens.reasoning'),0),coalesce(json_extract(m.data,'$.tokens.cache.read'),0)," ++
     "coalesce(json_extract(m.data,'$.tokens.cache.write'),0),m.session_id,s.directory " ++
     "FROM message m JOIN session s ON s.id=m.session_id " ++
-    "WHERE CASE WHEN json_valid(m.data) THEN json_extract(m.data,'$.role') ELSE NULL END='assistant' " ++
-    "AND m.time_updated>=?1 ORDER BY m.time_updated,m.id";
+    // The deployed schema lacks a time_updated index. Put the cheap cursor
+    // rejection before JSON role extraction so old rows do not parse JSON
+    // on every incremental scan; result order is irrelevant to rollups.
+    "WHERE m.time_updated>=?1 AND CASE WHEN json_valid(m.data) THEN json_extract(m.data,'$.role') ELSE NULL END='assistant'";
 
 const next_sql: [:0]const u8 =
     "SELECT m.id,m.time_updated,coalesce(json_extract(m.data,'$.model.id'),json_extract(m.data,'$.modelID'))," ++
@@ -213,7 +270,7 @@ const next_sql: [:0]const u8 =
     "coalesce(json_extract(m.data,'$.tokens.reasoning'),0),coalesce(json_extract(m.data,'$.tokens.cache.read'),0)," ++
     "coalesce(json_extract(m.data,'$.tokens.cache.write'),0),m.session_id,s.directory " ++
     "FROM session_message m JOIN session s ON s.id=m.session_id " ++
-    "WHERE m.type='assistant' AND m.time_updated>=?1 ORDER BY m.time_updated,m.id";
+    "WHERE m.time_updated>=?1 AND m.type='assistant'";
 
 fn columnText(stmt: ?*c.sqlite3_stmt, column: c_int) ?[]const u8 {
     const ptr = c.sqlite3_column_text(stmt, column) orelse return null;
@@ -266,12 +323,16 @@ test "resolvePath precedence chooses exactly one database" {
     try testing.expectEqualStrings("/xdg/opencode/opencode-next.db", relative);
 }
 
-test "queries never select sensitive payload fields" {
+test "queries avoid sensitive fields and incremental sort work" {
     inline for (.{ v1_sql, next_sql }) |sql| {
         try testing.expect(std.mem.indexOf(u8, sql, "SELECT m.data") == null);
+        try testing.expect(std.mem.indexOf(u8, sql, "ORDER BY") == null);
         inline for (.{ "prompt", "content", "tool", "auth" }) |forbidden|
             try testing.expect(std.mem.indexOf(u8, sql, forbidden) == null);
     }
+    const cursor_pos = std.mem.indexOf(u8, v1_sql, "m.time_updated>=?1").?;
+    const json_pos = std.mem.indexOf(u8, v1_sql, "json_valid(m.data)").?;
+    try testing.expect(cursor_pos < json_pos);
 }
 
 test "V1 poll maps tokens, skips malformed rows, deduplicates, and replaces updates" {
@@ -297,6 +358,7 @@ test "V1 poll maps tokens, skips malformed rows, deduplicates, and replaces upda
         changes.deinit(testing.allocator);
     }
     try poller.poll(testing.allocator, path, &changes);
+    try testing.expectEqual(@as(u64, 1), poller.query_count);
     try testing.expectEqual(@as(usize, 1), changes.items.len);
     const ev = changes.items[0].current;
     try testing.expectEqual(types.Agent.opencode, ev.agent);
@@ -312,12 +374,14 @@ test "V1 poll maps tokens, skips malformed rows, deduplicates, and replaces upda
     changes.clearRetainingCapacity();
     try poller.poll(testing.allocator, path, &changes);
     try testing.expectEqual(@as(usize, 0), changes.items.len);
+    try testing.expectEqual(@as(u64, 1), poller.query_count);
 
     try testing.expectEqual(c.SQLITE_OK, c.sqlite3_open_v2(zpath.ptr, &db, c.SQLITE_OPEN_READWRITE, null));
     const update = "UPDATE message SET time_updated=3000,data='{\"role\":\"assistant\",\"modelID\":\"gpt-5.4\",\"time\":{\"created\":1100,\"completed\":2900},\"tokens\":{\"input\":12,\"output\":25,\"reasoning\":4,\"cache\":{\"read\":42,\"write\":6}}}' WHERE id='msg_valid'";
     try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(db, update, null, null, null));
     _ = c.sqlite3_close(db);
     try poller.poll(testing.allocator, path, &changes);
+    try testing.expectEqual(@as(u64, 2), poller.query_count);
     try testing.expectEqual(@as(usize, 1), changes.items.len);
     try testing.expect(changes.items[0].previous != null);
     try testing.expectEqual(@as(u64, 29), changes.items[0].current.output_tokens);
