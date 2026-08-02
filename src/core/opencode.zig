@@ -130,8 +130,8 @@ pub const Poller = struct {
         defer _ = c.sqlite3_close(db);
         _ = c.sqlite3_busy_timeout(db, 50);
 
-        const use_next = tableHasAssistant(db);
-        const sql = if (use_next) next_sql else v1_sql;
+        const schema = detectSchema(db) catch return;
+        const sql = if (schema == .next) next_sql else v1_sql;
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return;
         defer _ = c.sqlite3_finalize(stmt);
@@ -241,12 +241,28 @@ pub fn freeChanges(allocator: Allocator, changes: []const Change) void {
     }
 }
 
-fn tableHasAssistant(db: ?*c.sqlite3) bool {
-    const sql: [:0]const u8 = "SELECT 1 FROM session_message WHERE type='assistant' LIMIT 1";
+const Schema = enum { v1, next };
+
+/// Choose the authoritative OpenCode schema without conflating a transient
+/// SQLite error with "no next-schema assistant rows". A failed probe leaves
+/// the fingerprint uncached so the next sweep retries.
+fn detectSchema(db: ?*c.sqlite3) !Schema {
+    const has_next_table = try probeHasRow(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_message' LIMIT 1");
+    if (!has_next_table) return .v1;
+    const has_assistant = try probeHasRow(db, "SELECT 1 FROM session_message WHERE type='assistant' LIMIT 1");
+    return if (has_assistant) .next else .v1;
+}
+
+fn probeHasRow(db: ?*c.sqlite3, sql: [:0]const u8) !bool {
     var stmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return false;
+    if (c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK)
+        return error.SqliteSchemaProbeFailed;
     defer _ = c.sqlite3_finalize(stmt);
-    return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+    return switch (c.sqlite3_step(stmt)) {
+        c.SQLITE_ROW => true,
+        c.SQLITE_DONE => false,
+        else => error.SqliteSchemaProbeFailed,
+    };
 }
 
 // These projections are intentionally explicit. Do not replace them with
@@ -386,6 +402,91 @@ test "V1 poll maps tokens, skips malformed rows, deduplicates, and replaces upda
     try testing.expect(changes.items[0].previous != null);
     try testing.expectEqual(@as(u64, 29), changes.items[0].current.output_tokens);
     try testing.expectEqual(@as(i64, 2900), changes.items[0].current.timestamp_ms);
+}
+
+test "schema probe failure is not cached as a V1 decision" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    const path = try std.fs.path.join(testing.allocator, &.{ base, "opencode.db" });
+    defer testing.allocator.free(path);
+    const zpath = try testing.allocator.dupeZ(u8, path);
+    defer testing.allocator.free(zpath);
+
+    var writer: ?*c.sqlite3 = null;
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_open_v2(zpath.ptr, &writer, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, null));
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(writer, @embedFile("fixtures/opencode/v1.sql").ptr, null, null, null));
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(writer, "BEGIN EXCLUSIVE".ptr, null, null, null));
+
+    var poller = Poller.init(testing.allocator);
+    defer poller.deinit();
+    var changes: std.ArrayList(Change) = .empty;
+    defer {
+        freeChanges(testing.allocator, changes.items);
+        changes.deinit(testing.allocator);
+    }
+    try poller.poll(testing.allocator, path, &changes);
+    try testing.expectEqual(@as(?DbFingerprint, null), poller.last_fingerprint);
+    try testing.expectEqual(@as(u64, 0), poller.query_count);
+    try testing.expectEqual(@as(usize, 0), changes.items.len);
+
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(writer, "ROLLBACK".ptr, null, null, null));
+    _ = c.sqlite3_close(writer);
+    try poller.poll(testing.allocator, path, &changes);
+    try testing.expect(poller.last_fingerprint != null);
+    try testing.expectEqual(@as(u64, 1), poller.query_count);
+    try testing.expectEqual(@as(usize, 1), changes.items.len);
+}
+
+test "WAL changes invalidate fingerprints and unchanged WALs skip" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    const path = try std.fs.path.join(testing.allocator, &.{ base, "opencode.db" });
+    defer testing.allocator.free(path);
+    const zpath = try testing.allocator.dupeZ(u8, path);
+    defer testing.allocator.free(zpath);
+
+    var writer: ?*c.sqlite3 = null;
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_open_v2(zpath.ptr, &writer, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, null));
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(writer, "PRAGMA journal_mode=WAL".ptr, null, null, null));
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(writer, @embedFile("fixtures/opencode/v1.sql").ptr, null, null, null));
+    defer _ = c.sqlite3_close(writer);
+
+    var poller = Poller.init(testing.allocator);
+    defer poller.deinit();
+    var changes: std.ArrayList(Change) = .empty;
+    defer {
+        freeChanges(testing.allocator, changes.items);
+        changes.deinit(testing.allocator);
+    }
+    try poller.poll(testing.allocator, path, &changes);
+    try testing.expectEqual(@as(u64, 1), poller.query_count);
+    try testing.expectEqual(@as(usize, 1), changes.items.len);
+    freeChanges(testing.allocator, changes.items);
+    changes.clearRetainingCapacity();
+
+    const update = "UPDATE message SET time_updated=3000,data='{\"role\":\"assistant\",\"modelID\":\"gpt-5.4\",\"time\":{\"created\":1100,\"completed\":2900},\"tokens\":{\"input\":12,\"output\":25,\"reasoning\":4,\"cache\":{\"read\":42,\"write\":6}}}' WHERE id='msg_valid'";
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(writer, update.ptr, null, null, null));
+    try poller.poll(testing.allocator, path, &changes);
+    try testing.expectEqual(@as(u64, 2), poller.query_count);
+    try testing.expectEqual(@as(usize, 1), changes.items.len);
+    try testing.expect(changes.items[0].previous != null);
+    freeChanges(testing.allocator, changes.items);
+    changes.clearRetainingCapacity();
+
+    try poller.poll(testing.allocator, path, &changes);
+    try testing.expectEqual(@as(u64, 2), poller.query_count);
+    try testing.expectEqual(@as(usize, 0), changes.items.len);
+
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(writer, "PRAGMA wal_checkpoint(TRUNCATE)".ptr, null, null, null));
+    try poller.poll(testing.allocator, path, &changes);
+    const after_checkpoint = poller.query_count;
+    try testing.expectEqual(@as(usize, 0), changes.items.len);
+    try poller.poll(testing.allocator, path, &changes);
+    try testing.expectEqual(after_checkpoint, poller.query_count);
 }
 
 test "next session_message assistants take precedence over V1 rows" {
