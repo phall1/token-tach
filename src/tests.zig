@@ -10,6 +10,7 @@ const types = @import("core/types.zig");
 const ledger_mod = @import("core/ledger.zig");
 
 const canvas = native_sdk.canvas;
+const geometry = native_sdk.geometry;
 const testing = std.testing;
 
 // Pull in core-engine module tests (import-based discovery).
@@ -54,6 +55,18 @@ const AppUi = main.AppUi;
 const Model = main.Model;
 const Msg = main.Msg;
 
+/// Widget-node headroom for tests: `canvas_limits
+/// .max_canvas_widget_nodes_per_view`, restated because the limits
+/// module is runtime-internal and not reachable from the SDK's public
+/// canvas namespace. A fixed 512 here used to make a tree the RUNTIME
+/// would happily render overflow in-test, which is the wrong failure to
+/// teach.
+const max_nodes: usize = 1024;
+
+/// `canvas_limits.max_canvas_commands_per_view`, restated for the same
+/// reason.
+const max_commands: usize = 2048;
+
 fn buildTree(arena: std.mem.Allocator, model: *const Model) !AppUi.Tree {
     var ui = AppUi.init(arena);
     const node = view.rootView(&ui, model);
@@ -92,9 +105,63 @@ fn containsText(widget: canvas.Widget, needle: []const u8) bool {
     return false;
 }
 
+/// Charts carry their data in a generated semantics summary ("chart:
+/// burn 119 pts last 0.00"), which is how a test asserts on what a trace
+/// SAYS without reading pixels.
+fn containsSemantics(widget: canvas.Widget, needle: []const u8) bool {
+    if (std.mem.indexOf(u8, widget.semantics.label, needle) != null) return true;
+    for (widget.children) |child| {
+        if (containsSemantics(child, needle)) return true;
+    }
+    return false;
+}
+
+const Layout = struct {
+    tree: canvas.WidgetLayoutTree,
+
+    fn nodes(self: Layout) []const canvas.WidgetLayoutNode {
+        return self.tree.nodes;
+    }
+
+    /// Resolved frame of the first widget whose semantics label starts
+    /// with `prefix`. Semantics are the stable handle: they survive the
+    /// text-formatting churn that would break a literal string match.
+    fn frameOfSemanticsPrefix(self: Layout, prefix: []const u8) ?geometry.RectF {
+        for (self.nodes()) |node| {
+            if (std.mem.startsWith(u8, node.widget.semantics.label, prefix)) return node.frame;
+        }
+        return null;
+    }
+
+    fn frameOfText(self: Layout, text: []const u8) ?geometry.RectF {
+        for (self.nodes()) |node| {
+            if (std.mem.eql(u8, node.widget.text, text)) return node.frame;
+        }
+        return null;
+    }
+};
+
+fn layoutTree(nodes: []canvas.WidgetLayoutNode, tree: AppUi.Tree) !Layout {
+    const result = try canvas.layoutWidgetTree(
+        tree.root,
+        geometry.RectF.init(0, 0, view.window_width, view.window_height),
+        nodes,
+    );
+    return .{ .tree = result };
+}
+
 const test_claude_windows = [_]types.LimitWindow{
     .{ .kind = .five_hour, .used_percent = 67, .resets_at_ms = 90 * 60_000 },
     .{ .kind = .weekly, .used_percent = 34, .resets_at_ms = 3 * 24 * 3_600_000 },
+};
+/// The four-window Claude account: `oauth.zig` maps five_hour, weekly,
+/// weekly_opus and weekly_sonnet, and the shipped panel only ever looked
+/// clean because the day it was screenshotted the server reported two.
+const test_claude_windows_full = [_]types.LimitWindow{
+    .{ .kind = .five_hour, .used_percent = 67, .resets_at_ms = 90 * 60_000 },
+    .{ .kind = .weekly, .used_percent = 34, .resets_at_ms = 3 * 24 * 3_600_000 },
+    .{ .kind = .weekly_opus, .used_percent = 12, .resets_at_ms = 3 * 24 * 3_600_000 },
+    .{ .kind = .weekly_sonnet, .used_percent = 51, .resets_at_ms = 3 * 24 * 3_600_000 },
 };
 const test_codex_windows = [_]types.LimitWindow{
     .{ .kind = .five_hour, .used_percent = 9, .resets_at_ms = 60 * 60_000 },
@@ -150,9 +217,172 @@ test "the instrument cluster binds the engine's structured state" {
     try testing.expect(containsText(tree.root, "wk"));
     // Reset countdown for the 5h window (90 min from now_ms=10min).
     try testing.expect(containsText(tree.root, "1h20m"));
-    // Dial furniture: unit caption and the sparkline caption.
+    // Dial furniture: unit caption and the burn trace caption.
     try testing.expect(containsText(tree.root, "tok/min ×1000"));
-    try testing.expect(containsText(tree.root, "burn · last 15 min"));
+    try testing.expect(containsText(tree.root, "BURN · 20 MIN"));
+    // The trip meter shares the odometer strip with the all-time count.
+    try testing.expect(containsText(tree.root, "TRIP"));
+    // The MFD offers its three pages, and the default is the fleet.
+    try testing.expect(containsText(tree.root, "AGENTS"));
+    try testing.expect(containsText(tree.root, "SESSIONS"));
+    try testing.expect(containsText(tree.root, "SCOPE"));
+}
+
+test "the telltale row prints every lamp and lights only what applies" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = instrumentedModel();
+    const calm = try buildTree(arena, &model);
+    // Unlit lamps still render — the dark glyph is the design.
+    try testing.expect(containsText(calm.root, "RED"));
+    try testing.expect(containsText(calm.root, "WALL"));
+    try testing.expect(containsText(calm.root, "ALRT"));
+    try testing.expect(findBySemanticsLabel(calm.root, "redline telltale off") != null);
+    try testing.expect(findBySemanticsLabel(calm.root, "source error telltale off") != null);
+
+    // A failing source lights SRC; a stale OAuth reading lights STL.
+    model.status_error = true;
+    model.oauth_last_success_ms = model.now_ms - 7 * 60_000;
+    const lit = try buildTree(arena, &model);
+    try testing.expect(findBySemanticsLabel(lit.root, "source error telltale on") != null);
+    try testing.expect(findBySemanticsLabel(lit.root, "stale limit reading telltale on") != null);
+}
+
+test "the limits region cannot overlap at four claude windows" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = instrumentedModel();
+    model.claude_limits = .{
+        .agent = .claude,
+        .read_at_ms = 0,
+        .plan = "max",
+        .windows = &test_claude_windows_full,
+    };
+
+    // The two right-hand panels are derived, so they cannot collide and
+    // the fleet display always keeps usable height.
+    const layout = view.rightLayout(&model);
+    try testing.expect(layout.limits.y + layout.limits.height <= layout.mfd.y);
+    try testing.expect(layout.mfd.height >= 120);
+
+    const tree = try buildTree(arena, &model);
+    // All four windows render...
+    try testing.expect(containsText(tree.root, "opus"));
+    try testing.expect(containsText(tree.root, "son"));
+    try testing.expect(containsText(tree.root, "51%"));
+
+    var nodes: [max_nodes]canvas.WidgetLayoutNode = undefined;
+    const laid = try layoutTree(&nodes, tree);
+    // ...and the aggregate row sits strictly BELOW the last of them,
+    // which is the bug this replaces: a hardcoded y drew OTHERS through
+    // the fourth bar the moment a fourth window existed.
+    const others = laid.frameOfSemanticsPrefix("Other agents").?;
+    const sonnet = laid.frameOfText("son").?;
+    try testing.expect(others.y >= sonnet.y + sonnet.height);
+    // The fleet display starts below the aggregate row, never over it.
+    const fleet = laid.frameOfSemanticsPrefix("Fleet display").?;
+    try testing.expect(fleet.y >= others.y + others.height);
+}
+
+test "the burn trace reads empty after a long idle" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = instrumentedModel();
+    const burst_ms: i64 = 60 * 60_000;
+    model.agent_burn.addTokens(.claude, burst_ms, 50_000);
+
+    // Fifteen seconds later the burst is the newest complete bucket.
+    model.now_ms = burst_ms + 15_000;
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(!containsSemantics(tree.root, "burn 119 pts last 0.00"));
+    }
+
+    // Forty-five minutes later NOTHING has happened, and the trace must
+    // say so even though nobody advanced the ring: the view anchors the
+    // read on its own clock, so the last burst cannot stay pinned to the
+    // right edge under a "20 min" caption while the number reads zero.
+    model.now_ms = burst_ms + 45 * 60_000;
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(containsSemantics(tree.root, "burn 119 pts last 0.00"));
+    }
+}
+
+test "the fleet display lists running sessions before idle ones" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = instrumentedModel();
+    model.now_ms = 60 * 60_000;
+    model.ux.mfd_page = .sessions;
+    // "beta" landed a turn twenty minutes ago: alive, but idle.
+    model.roster.record(.{
+        .agent = .codex,
+        .timestamp_ms = model.now_ms - 20 * 60_000,
+        .model = "gpt-5.2-codex",
+        .session_id = "s-beta",
+        .cwd = "/w/beta",
+        .output_tokens = 100,
+    }, 0.10);
+    // "alpha" landed one thirty seconds ago: running.
+    model.roster.record(.{
+        .agent = .claude,
+        .timestamp_ms = model.now_ms - 30_000,
+        .model = "claude-fable-5",
+        .session_id = "s-alpha",
+        .cwd = "/w/alpha",
+        .output_tokens = 1_000,
+    }, 0.50);
+
+    const tree = try buildTree(arena, &model);
+    try testing.expect(containsText(tree.root, "alpha"));
+    try testing.expect(containsText(tree.root, "beta"));
+
+    var nodes: [max_nodes]canvas.WidgetLayoutNode = undefined;
+    const laid = try layoutTree(&nodes, tree);
+    const running = laid.frameOfSemanticsPrefix("CLAUDE · claude-fable-5").?;
+    const idle = laid.frameOfSemanticsPrefix("CODEX · gpt-5.2-codex").?;
+    try testing.expect(running.y < idle.y);
+
+    // The agents page rolls the same fleet up per agent.
+    model.ux.mfd_page = .burn;
+    const agents = try buildTree(arena, &model);
+    try testing.expect(containsText(agents.root, "CLAUDE"));
+    try testing.expect(containsText(agents.root, "CODEX"));
+}
+
+test "the dial readout cycles through rate, today, trip and eta" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = instrumentedModel();
+    model.trip_start_ms = model.now_ms - 9 * 60_000;
+    model.trip.cost_usd = 12.5;
+
+    // Rate: the burn number and the reset/wall line under it.
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findBySemanticsLabel(tree.root, "cycle readout: rate, today, trip, eta") != null);
+        try testing.expect(containsText(tree.root, "idle"));
+    }
+
+    // Trip: the since-launch spend and its hourly rate.
+    engine.applyUxMsg(&model, .readout_cycle); // → today
+    engine.applyUxMsg(&model, .readout_cycle); // → trip
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(containsText(tree.root, "$12.50"));
+        try testing.expect(containsText(tree.root, "/hr"));
+    }
 }
 
 test "system strip renders enabled readings and hides absent modules" {
@@ -183,7 +413,47 @@ test "system strip renders enabled readings and hides absent modules" {
     try testing.expect(containsText(tree.root, "186G"));
     try testing.expect(containsText(tree.root, "NET"));
     try testing.expect(containsText(tree.root, "↓1.2M ↑88k"));
-    try testing.expect(!containsText(tree.root, "BAT"));
+    // Nothing has been recorded yet, so the traces draw nothing rather
+    // than a flat line along zero under a live "43%".
+    try testing.expect(containsSemantics(tree.root, "CPU empty"));
+    // The absent battery cell exists nowhere (the BAT TELLTALE in
+    // the header is a different thing and always renders).
+    try testing.expect(findBySemanticsLabel(tree.root, "BAT telemetry") == null);
+    try testing.expect(findBySemanticsLabel(tree.root, "CPU telemetry") != null);
+}
+
+test "telemetry cells trace their own five-minute history" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = instrumentedModel();
+    model.now_ms = 30 * 60_000;
+    model.system_snap = .{
+        .cpu = .{ .total_frac = 0.43, .core_count = 14, .load_avg_1m = 3.2, .p_cluster_frac = null, .e_cluster_frac = null },
+    };
+    // Five minutes of samples on the wall clock the strip reads from.
+    var t: i64 = model.now_ms - 5 * 60_000;
+    while (t <= model.now_ms) : (t += engine.SystemHistory.period_ms) {
+        model.system_history.record(t, .{ .cpu = .{
+            .total_frac = 0.5,
+            .core_count = 14,
+            .load_avg_1m = 3.2,
+            .p_cluster_frac = null,
+            .e_cluster_frac = null,
+        } });
+    }
+
+    const tree = try buildTree(arena, &model);
+    try testing.expect(containsSemantics(tree.root, "CPU 60 pts"));
+    try testing.expect(!containsSemantics(tree.root, "CPU empty"));
+
+    // The same history, half an hour of silence later: the ring was
+    // never advanced, and the trace must still scroll to nothing instead
+    // of pinning the last sample under the reading.
+    model.now_ms += 40 * 60_000;
+    const stale = try buildTree(arena, &model);
+    try testing.expect(containsSemantics(stale.root, "CPU 60 pts last 0.00"));
 }
 
 test "hovering a system cell reveals its full reading in the footer" {
@@ -242,9 +512,10 @@ test "battery cell renders charge, charging label, and low-charge ink" {
         .battery = .{ .charge = 0.12, .charging = false, .on_ac = false, .minutes_to_empty = 95 },
     };
     const low_tree = try buildTree(arena, &low);
-    try testing.expect(containsText(low_tree.root, "BAT"));
     try testing.expect(!containsText(low_tree.root, "BAT+"));
     try testing.expect(containsText(low_tree.root, "12%"));
+    // A low battery on battery power also lights the header telltale.
+    try testing.expect(findBySemanticsLabel(low_tree.root, "battery low telltale on") != null);
 }
 
 test "system strip disappears entirely when config disables it" {
@@ -362,16 +633,69 @@ test "stale oauth tags the claude group and mutes its bars" {
     try testing.expect(containsText(tree.root, "67%"));
 }
 
-test "the view lays out through the canvas engine" {
+test "the view lays out inside the runtime's widget-node budget" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    const model = instrumentedModel();
-    const tree = try buildTree(arena_state.allocator(), &model);
+    // The worst frame the popover can build: mid-ignition (every LED
+    // drawn lit OVER its unlit base), four limit windows per agent, and
+    // a full telemetry strip.
+    var model = instrumentedModel();
+    model.ignition_phase = .up;
+    model.ignition_t0_ms = 5_000;
+    model.claude_limits = .{
+        .agent = .claude,
+        .read_at_ms = 0,
+        .plan = "max",
+        .windows = &test_claude_windows_full,
+    };
+    model.codex_limits = .{
+        .agent = .codex,
+        .read_at_ms = 0,
+        .plan = "plus",
+        .windows = &test_claude_windows_full,
+    };
+    model.system_snap = .{
+        .cpu = .{ .total_frac = 0.43, .core_count = 14, .load_avg_1m = 3.2, .p_cluster_frac = null, .e_cluster_frac = null },
+        .gpu = .{ .device_utilization = 0.12 },
+        .mem = .{ .used_bytes = 40_000_000_000, .total_bytes = 51_500_000_000, .used_frac = 0.777, .pressure = .warn },
+        .disk = .{ .total_bytes = 994_000_000_000, .free_bytes = 186_000_000_000, .used_fraction = 0.81 },
+        .net = .{ .total_bytes_in = 0, .total_bytes_out = 0, .in_bytes_per_sec = 1_230_000, .out_bytes_per_sec = 88_000 },
+        .battery = .{ .charge = 0.87, .charging = true, .on_ac = true },
+    };
 
-    var nodes: [512]canvas.WidgetLayoutNode = undefined;
-    const layout = try canvas.layoutWidgetTree(tree.root, native_sdk.geometry.RectF.init(0, 0, view.window_width, view.window_height), &nodes);
-    try testing.expect(layout.nodes.len > 0);
+    // ...with a busy fleet behind whichever MFD page is showing.
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        model.roster.record(.{
+            .agent = if (i % 2 == 0) .claude else .codex,
+            .timestamp_ms = model.now_ms - @as(i64, @intCast(i)) * 1_000,
+            .model = "claude-fable-5",
+            .session_id = &[_]u8{ 's', @intCast('a' + i) },
+            .cwd = "/w/project",
+            .output_tokens = 1_000,
+        }, 0.5);
+        model.agent_burn.addTokens(if (i % 2 == 0) .claude else .codex, model.now_ms - 30_000, 10_000);
+    }
+
+    for ([_]engine.MfdPage{ .burn, .sessions, .telemetry }) |page| {
+        model.ux.mfd_page = page;
+        const tree = try buildTree(arena, &model);
+        var nodes: [max_nodes]canvas.WidgetLayoutNode = undefined;
+        const laid = try layoutTree(&nodes, tree);
+        try testing.expect(laid.nodes().len > 0);
+        // Exceeding either cap fails the frame at RUNTIME, not at
+        // compile time, so the budget is a test or it is nothing.
+        try testing.expect(laid.nodes().len <= max_nodes);
+
+        // The same frame's DRAW commands, chrome included.
+        var commands: [max_commands]canvas.CanvasCommand = undefined;
+        var builder = canvas.Builder.init(&commands);
+        try view.buildChrome(&model, &builder, .{ .width = view.window_width, .height = view.window_height }, theme.tokens());
+        try canvas.emitWidgetLayout(&builder, laid.tree, theme.tokens());
+        try testing.expect(builder.displayList().commandCount() <= max_commands);
+    }
 }
 
 test "gauge scale ladder and needle pose" {
@@ -387,6 +711,25 @@ test "gauge scale ladder and needle pose" {
     try testing.expectEqual(@as(f32, 0), engine.needleDeg(5_000, 10_000));
 }
 
+/// Rotation animations are the needle; opacity animations are lamps.
+/// Counting them by channel keeps these tests honest about STRUCTURE
+/// while leaving the view free to add lamps.
+fn countRotations(out: []const canvas.CanvasRenderAnimation) usize {
+    var n: usize = 0;
+    for (out) |anim| {
+        if (anim.from_rotation != null) n += 1;
+    }
+    return n;
+}
+
+fn countOpacity(out: []const canvas.CanvasRenderAnimation) usize {
+    var n: usize = 0;
+    for (out) |anim| {
+        if (anim.from_opacity != null) n += 1;
+    }
+    return n;
+}
+
 test "the needle sweep animation replays the pose delta" {
     var model = instrumentedModel();
     model.needle_from_deg = -120;
@@ -399,7 +742,7 @@ test "the needle sweep animation replays the pose delta" {
     var out: [512]canvas.CanvasRenderAnimation = undefined;
     const count = view.animations(&model, &tree, 1_000, &out);
     // The three chrome needle commands (blade, edge, tip glow) sweep;
-    // no redline pulse at these utilizations.
+    // no redline pulse and no live pips at these (idle) readings.
     try testing.expectEqual(view.needle_command_ids.len, count);
     try testing.expectEqual(view.needle_blade_id, out[0].id);
     try testing.expectEqual(@as(f32, -100), out[0].from_rotation.?);
@@ -426,7 +769,8 @@ test "the ignition sweep anchors both phases on the journaled key-on time" {
     var count = view.animations(&model, &tree, 999_999, &out);
     // Needle (3 chrome commands) + every LED's dot+glow shadow/fill
     // opacity pops (56 x 4).
-    try testing.expectEqual(@as(usize, 3 + 56 * 4), count);
+    try testing.expectEqual(@as(usize, 3), countRotations(out[0..count]));
+    try testing.expect(countOpacity(out[0..count]) >= 56 * 4);
     const t0_ns: u64 = 5_000 * std.time.ns_per_ms;
     // Phase up: 0-mark → full scale, anchored at key-on (NOT at the
     // frame timestamp passed in — idempotent re-declaration).

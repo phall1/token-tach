@@ -12,13 +12,21 @@
 //! `window_width` x `window_height` and the cluster is top-left
 //! anchored, so resizing never invalidates the pivot.
 //!
+//! Absolute does NOT mean hand-picked: every region whose height depends
+//! on the data derives that height from one pure function of the model
+//! (`rightLayout`), which both the chrome pass and the widget pass call.
+//! The limits region used to flow while the rows under it sat on baked
+//! constants, so a Claude account reporting four limit windows drew its
+//! weekly bar straight through the aggregate row. Constants that encode
+//! content height are the bug; deriving them is the fix.
+//!
 //! Layer order (automotive): chrome PREFIX paints the cabin — window
 //! wash, gradient bezels, the shaded dial face with rim vignette and
 //! bezel ring. Widgets paint the furniture — LED ticks, graduations,
-//! numerals, readouts, bars, odometer. Chrome SUFFIX paints the metal
-//! and the glass — the machined needle blade (a real tapered path
-//! polygon at its TRUE angle), counterweight, hub, and a faint glass
-//! glare arc over everything.
+//! numerals, readouts, bars, odometer, telltales, the MFD. Chrome
+//! SUFFIX paints the metal and the glass — the machined needle blade (a
+//! real tapered path polygon at its TRUE angle), counterweight, hub, and
+//! a faint glass glare arc over everything.
 //!
 //! Rest pose is truth: the blade is rebuilt at `needle_to_deg` on every
 //! model rebuild; render animations only replay rotation deltas back to
@@ -27,6 +35,14 @@
 //! chained tweens on the journaled wall-clock `ignition_t0_ms`, so
 //! mid-sweep rebuilds re-declare the same animation instead of
 //! restarting it.
+//!
+//! Every trace on this panel is anchored on `now_ms`, never on a ring's
+//! head. A head-anchored read draws the last burst hard against the
+//! right edge forever, so after half an hour of silence the chart said
+//! "flat out" while the number beside it correctly said zero — and the
+//! chart is the liar people believe. `nowAligned*` re-anchors each ring
+//! read on the view's own clock, which makes that bug inexpressible even
+//! if some future caller forgets to advance the ring.
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
@@ -34,6 +50,8 @@ const native_sdk = @import("native_sdk");
 const engine = @import("engine.zig");
 const theme = @import("theme.zig");
 const types = @import("core/types.zig");
+const sessions = @import("core/sessions.zig");
+const predict = @import("core/predict.zig");
 const trayfmt = @import("core/trayfmt.zig");
 
 const canvas = native_sdk.canvas;
@@ -47,22 +65,24 @@ pub const Ui = canvas.Ui(Msg);
 
 // ------------------------------------------------------ window geometry
 
-pub const window_width: f32 = 560;
-pub const window_height: f32 = 472;
+pub const window_width: f32 = 640;
+pub const window_height: f32 = 500;
 
 const header_y: f32 = 12;
 const panel_y: f32 = 46;
 const panel_h: f32 = 304;
+const panel_bottom: f32 = panel_y + panel_h;
 const strip_y: f32 = 358;
 const strip_h: f32 = 42;
 const system_y: f32 = 406;
-const system_h: f32 = 40;
-const footer_y: f32 = 452;
+const system_h: f32 = 62;
+const footer_y: f32 = 474;
 
 const gauge_panel = geometry.RectF.init(14, panel_y, 272, panel_h);
-const limits_panel_rect = geometry.RectF.init(298, panel_y, 246, panel_h);
-const strip_rect = geometry.RectF.init(16, strip_y, 528, strip_h);
-const system_rect = geometry.RectF.init(16, system_y, 528, system_h);
+const right_x: f32 = 298;
+const right_w: f32 = 328;
+const strip_rect = geometry.RectF.init(14, strip_y, 612, strip_h);
+const system_rect = geometry.RectF.init(14, system_y, 612, system_h);
 
 // -------------------------------------------------------- dial geometry
 
@@ -90,13 +110,23 @@ const tail_hw: f32 = 4.6;
 const hub_r: f32 = 13;
 
 const green_end: f32 = 0.60;
-const red_start_calm: f32 = 0.85;
-const red_start_danger: f32 = 0.70;
 
-// Global keys for animated widget parts (LED ignition, redline pulse).
+/// The redline is PRINTED, not computed. It used to slide between 0.85
+/// and 0.70 with `dangerState`, re-inking eight LEDs and two numerals as
+/// the danger flag flipped — a dial whose scale markings move is the one
+/// automotive lie the design cannot afford, because it makes the same
+/// needle angle mean two different things a second apart. Danger now
+/// speaks through the halo pulse and the RED telltale, which is how a
+/// real cluster says it.
+const red_start: f32 = 0.85;
+
+// Global keys for animated widget parts (LED ignition, redline pulse,
+// the live lamp, per-agent activity pips).
 const led_key_base: u64 = 0xD1A1_1000;
 const led_glow_key_base: u64 = 0xD1A1_2000;
 const redline_halo_key: u64 = 0xD1A1_0004;
+const live_lamp_key: u64 = 0xD1A1_0005;
+const activity_key_base: u64 = 0xD1A1_3000;
 
 // ------------------------------------------------------ chrome commands
 // Raw display-list command ids — a namespace far away from small widget
@@ -108,7 +138,7 @@ pub const needle_edge_id: canvas.ObjectId = chrome_id_base + 17;
 pub const needle_glow_id: canvas.ObjectId = chrome_id_base + 18;
 
 /// Commands painted UNDER the widget tree (cabin + dial face).
-pub const chrome_prefix_commands: usize = 10;
+pub const chrome_prefix_commands: usize = 11;
 /// Commands painted OVER the widget tree (needle metal + glass).
 pub const chrome_suffix_commands: usize = 7;
 
@@ -141,7 +171,9 @@ const hub_stops = [_]canvas.GradientStop{
 
 /// The chrome display list: exactly `chrome_prefix_commands` commands,
 /// then exactly `chrome_suffix_commands` — the runtime slices them
-/// around the widget span by count.
+/// around the widget span by count. The two right-hand washes take their
+/// frames from `rightLayout`, the same pure function the widget pass
+/// uses, so a data-driven panel height can never leave a wash behind.
 pub fn buildChrome(
     model: *const Model,
     builder: *canvas.Builder,
@@ -150,6 +182,7 @@ pub fn buildChrome(
 ) anyerror!void {
     _ = tokens;
     const center = PointF.init(gauge_cx, gauge_cy);
+    const layout = rightLayout(model);
 
     // ---- prefix: cabin + dial face (under every widget) ----
     try builder.fillRect(.{
@@ -158,7 +191,8 @@ pub fn buildChrome(
         .fill = .{ .color = theme.bg },
     });
     try bezelWash(builder, chrome_id_base + 2, gauge_panel, 10);
-    try bezelWash(builder, chrome_id_base + 3, limits_panel_rect, 10);
+    try bezelWash(builder, chrome_id_base + 3, layout.limits, 10);
+    try bezelWash(builder, chrome_id_base + 11, layout.mfd, 10);
     try bezelWash(builder, chrome_id_base + 4, strip_rect, 7);
     try bezelWash(builder, chrome_id_base + 10, system_rect, 7);
     try builder.fillPath(.{
@@ -256,13 +290,75 @@ fn bezelWash(builder: *canvas.Builder, id: canvas.ObjectId, frame: geometry.Rect
     });
 }
 
+// --------------------------------------------------- right-column layout
+
+const right_pad: f32 = 12;
+const bars_x: f32 = right_x + 14; // panel content left edge
+const bars_right: f32 = right_x + right_w - 14; // panel content right edge
+const col_gap: f32 = 16;
+const col_w: f32 = (bars_right - bars_x - col_gap) / 2;
+const col1_x: f32 = bars_x + col_w + col_gap;
+
+const name_block_h: f32 = 32;
+const win_row_h: f32 = 20;
+const hint_h: f32 = 30;
+const others_h: f32 = 18;
+const region_gap: f32 = 10;
+
+/// The two right-hand panels' frames, derived from the limits content.
+pub const RightLayout = struct {
+    /// Limit windows: claude and codex side by side, then the aggregate.
+    limits: geometry.RectF,
+    /// The multi-function display takes whatever the limits leave.
+    mfd: geometry.RectF,
+};
+
+/// Where the right column's two panels start and stop, as a pure
+/// function of the model.
+///
+/// This is the fix for the overlap that shipped: the limits rows flowed
+/// while the aggregate row and the trace caption underneath sat on baked
+/// y constants, so the moment `oauth.zig` reported four Claude windows
+/// instead of two, the fourth bar and the OTHERS line drew on top of
+/// each other. Both call sites (chrome wash, widget tree) read the same
+/// derivation here, and the height is BOUNDED by construction: at most
+/// four window rows per agent, so `limits` never exceeds
+/// `right_pad*2 + name_block_h + 4*win_row_h + region_gap + others_h`
+/// (164), leaving the MFD at least 130 points.
+pub fn rightLayout(model: *const Model) RightLayout {
+    const claude_h = agentColumnHeight(model, .claude, model.claude_limits);
+    const codex_h = agentColumnHeight(model, .codex, model.codex_limits);
+    const content = @max(claude_h, codex_h) + region_gap + others_h;
+    const limits_h = right_pad * 2 + content;
+    const mfd_y = panel_y + limits_h + region_gap;
+    return .{
+        .limits = geometry.RectF.init(right_x, panel_y, right_w, limits_h),
+        .mfd = geometry.RectF.init(right_x, mfd_y, right_w, panel_bottom - mfd_y),
+    };
+}
+
+/// Height one agent column needs: the name block, plus its limit rows,
+/// its two-line "no limit data" remedy, or nothing at all when the
+/// source is off or empty.
+fn agentColumnHeight(model: *const Model, agent: types.Agent, limits: ?types.LimitSnapshot) f32 {
+    if (!engine.sourceEnabled(model.cfg.sources, agent)) return name_block_h;
+    if (engine.agentIsEmpty(model, agent)) return name_block_h;
+    if (limits) |snap| {
+        const shown: f32 = @floatFromInt(@min(snap.windows.len, 4));
+        return name_block_h + shown * win_row_h;
+    }
+    return name_block_h + hint_h;
+}
+
 // ------------------------------------------------------------- the view
 
 pub fn rootView(ui: *Ui, model: *const Model) Ui.Node {
     var nodes: std.ArrayList(Ui.Node) = .empty;
+    const layout = rightLayout(model);
     header(ui, &nodes, model);
     gaugeCluster(ui, &nodes, model);
-    limitsPanel(ui, &nodes, model);
+    limitsPanel(ui, &nodes, model, layout.limits);
+    mfdPanel(ui, &nodes, model, layout.mfd);
     odometerStrip(ui, &nodes, model);
     systemStrip(ui, &nodes, model);
     // Footer: normally the engine status line; while a system cell is
@@ -290,39 +386,134 @@ fn header(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
     const danger = engine.dangerState(model);
 
     push(ui, nodes, ui.paragraph(.{
-        .frame = rect(18, header_y, 240, 22),
+        .frame = rect(18, header_y, 150, 22),
         .semantics = .{ .label = "Token Tach" },
     }, &.{
         .{ .text = "TOKEN", .weight = .bold, .monospace = true, .scale = 1.2, .color = .text },
         .{ .text = " TACH", .weight = .bold, .monospace = true, .scale = 1.2, .color = .accent },
     }));
 
-    push(ui, nodes, ui.button(.{
-        .frame = rect(354, header_y + 1, 66, 22),
-        .size = .sm,
-        .on_press = .open_dashboard,
-        .semantics = .{ .label = "Open dashboard" },
-    }, "DASH"));
+    telltales(ui, nodes, model, glance, danger);
 
-    // Live LED: green while burning, red in danger, unlit when idle.
+    // Live LED: green while burning, red in danger, unlit when idle. The
+    // glow is keyed so `animations` can breathe it while work is running
+    // — the one always-visible proof the panel is live and not a frozen
+    // screenshot.
     const led: Color = if (danger) theme.red else if (glance.idle) theme.track else theme.green;
     const led_word: []const u8 = if (danger) "REDLINE" else if (glance.idle) "IDLE" else "LIVE";
     if (!glance.idle or danger) {
         const glow = if (danger) theme.red_halo else theme.green_glow;
         push(ui, nodes, ui.panel(.{
-            .frame = rect(438, header_y + 4, 16, 16),
+            .global_key = canvas.uiKey(live_lamp_key),
+            .frame = rect(432, header_y + 4, 16, 16),
             .style = .{ .background = glow, .radius = 8, .stroke_width = 0 },
         }, .{}));
     }
     push(ui, nodes, ui.panel(.{
-        .frame = rect(442, header_y + 8, 8, 8),
+        .frame = rect(436, header_y + 8, 8, 8),
         .style = .{ .background = led, .radius = 4, .stroke_width = 0 },
     }, .{}));
     push(ui, nodes, ui.text(.{
-        .frame = rect(458, header_y + 4, 86, 16),
+        .frame = rect(452, header_y + 4, 96, 16),
         .size = .sm,
         .style = .{ .foreground = if (danger) theme.red else theme.cluster_colors.text_muted },
     }, led_word));
+
+    push(ui, nodes, ui.button(.{
+        .frame = rect(560, header_y + 1, 66, 22),
+        .size = .sm,
+        .on_press = .open_dashboard,
+        .semantics = .{ .label = "Open dashboard" },
+    }, "DASH"));
+}
+
+// ------------------------------------------------------------ telltales
+
+/// One warning lamp. A cluster prints every lamp it owns and lights only
+/// what applies, so the dark glyph is design rather than absence — and
+/// the row reads the same way every time, which is what makes a lit lamp
+/// noticeable at a glance.
+const Telltale = struct {
+    code: []const u8,
+    label: []const u8,
+    lit: bool,
+    ink: Color,
+    /// Lamps that are also controls (ALRT acknowledges).
+    press: ?Msg = null,
+};
+
+const telltale_x: f32 = 172;
+const telltale_pitch: f32 = 36;
+const telltale_w: f32 = 32;
+
+fn telltales(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, glance: trayfmt.GlanceState, danger: bool) void {
+    const alert_pending = alertPending(model);
+    const lamps = [_]Telltale{
+        .{ .code = "RED", .label = "redline", .lit = danger, .ink = theme.red },
+        .{ .code = "WALL", .label = "limit wall projected", .lit = glance.wall_at_ms != null, .ink = theme.amber },
+        .{ .code = "STL", .label = "stale limit reading", .lit = engine.oauthStaleMin(model) != null, .ink = theme.amber },
+        .{
+            .code = "ALRT",
+            .label = "unacknowledged alert",
+            .lit = alert_pending,
+            .ink = theme.amber,
+            .press = if (alert_pending) Msg.alert_ack else null,
+        },
+        .{ .code = "SRC", .label = "source error", .lit = model.status_error, .ink = theme.red },
+        .{ .code = "LOAD", .label = "machine load", .lit = loadWarn(model), .ink = theme.amber },
+        .{ .code = "BAT", .label = "battery low", .lit = batteryWarn(model), .ink = theme.red },
+    };
+
+    for (lamps, 0..) |lamp, i| {
+        const x = telltale_x + telltale_pitch * @as(f32, @floatFromInt(i));
+        push(ui, nodes, ui.panel(.{
+            .frame = rect(x, header_y + 3, telltale_w, 18),
+            .style = .{
+                .background = if (lamp.lit) withAlpha(lamp.ink, 0.16) else theme.telltale_plate,
+                .radius = 3,
+                .stroke_width = 0,
+            },
+            .on_press = lamp.press,
+            .semantics = .{ .label = ui.fmt("{s} telltale {s}", .{ lamp.label, if (lamp.lit) "on" else "off" }) },
+        }, .{}));
+        push(ui, nodes, ui.paragraph(.{
+            .frame = rect(x, header_y + 6, telltale_w, 13),
+            .text_alignment = .center,
+            .style = .{ .foreground = if (lamp.lit) lamp.ink else theme.telltale_off },
+        }, &.{.{ .text = lamp.code, .weight = .bold, .monospace = true, .scale = 0.72 }}));
+    }
+}
+
+/// Has an alert fired since the user last acknowledged? The alert engine
+/// keeps a fire stamp per (agent, kind); the newest of those IS the
+/// alert state, and `ux.alerts_acked_ms` is the line the user drew under
+/// it by pressing the lamp.
+fn alertPending(model: *const Model) bool {
+    var newest: i64 = 0;
+    for (model.alerts.last_fired_ms) |per_kind| {
+        for (per_kind) |maybe| {
+            if (maybe) |ms| newest = @max(newest, ms);
+        }
+    }
+    return newest > 0 and newest > model.ux.alerts_acked_ms;
+}
+
+/// The LOAD lamp: the machine itself is the constraint right now. Kernel
+/// memory pressure outranks any percentage — "critical" is the kernel
+/// saying it, not us inferring it.
+fn loadWarn(model: *const Model) bool {
+    if (model.system_snap.mem) |m| {
+        if (m.pressure == .critical) return true;
+    }
+    if (model.system_snap.cpu) |c| {
+        if (c.total_frac >= 0.9) return true;
+    }
+    return false;
+}
+
+fn batteryWarn(model: *const Model) bool {
+    const b = model.system_snap.battery orelse return false;
+    return !b.charging and b.charge <= 0.15;
 }
 
 // ---------------------------------------------------------- tach gauge
@@ -332,7 +523,6 @@ fn gaugeCluster(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) vo
     const danger = engine.dangerState(model);
     const scale = engine.gaugeScaleTpm(model.gauge_peak_tpm);
     const needle_frac = (model.needle_to_deg + engine.half_sweep_deg) / (2 * engine.half_sweep_deg);
-    const red_start: f32 = if (danger) red_start_danger else red_start_calm;
     const igniting = model.ignition_phase != .off;
 
     // Gauge bezel border (fill is chrome; the widget carries the edge).
@@ -342,6 +532,8 @@ fn gaugeCluster(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) vo
     }, .{}));
 
     // Redline halo: a pulsing glow behind the red zone while danger holds.
+    // With the redline printed at a fixed angle, this pulse and the RED
+    // telltale carry the whole danger signal.
     if (danger) {
         const mid_deg = -engine.half_sweep_deg + 2 * engine.half_sweep_deg * (red_start + 1) / 2;
         const p = dialPoint(mid_deg, 88);
@@ -369,11 +561,11 @@ fn gaugeCluster(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) vo
             // ignition-animated LED, so opacity 0 isn't a hole).
             push(ui, nodes, ui.panel(.{
                 .frame = rect(p.x - 2.5, p.y - 2.5, 5, 5),
-                .style = .{ .background = zoneColor(frac, red_start, false), .radius = 2.5, .stroke_width = 0 },
+                .style = .{ .background = zoneColor(frac, false), .radius = 2.5, .stroke_width = 0 },
             }, .{}));
         }
         if (lit) {
-            const ink = zoneColor(frac, red_start, true);
+            const ink = zoneColor(frac, true);
             push(ui, nodes, ui.panel(.{
                 .global_key = canvas.uiKey(led_glow_key_base + @as(u64, @intCast(i))),
                 .frame = rect(p.x - 5.5, p.y - 5.5, 11, 11),
@@ -419,36 +611,202 @@ fn gaugeCluster(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) vo
         .style_tokens = .{ .foreground = .text_muted },
     }, "tok/min ×1000"));
 
-    // In-dial readout: the burn number, then the wall/reset line. While
-    // history catch-up is chewing, the numbers aren't truth yet — dim
-    // the readout and say "scanning" instead of asserting a confident 0.
-    const scanning = model.catchup_active;
-    const burn_text = if (glance.idle and !scanning)
-        "0"
-    else
-        fmtTokens(ui, @intFromFloat(@max(glance.burn_tokens_per_min, 0)));
-    const burn_ink: Color = if (scanning or glance.idle)
-        theme.cluster_colors.text_muted
-    else if (danger)
-        theme.red
-    else
-        theme.green;
-    push(ui, nodes, ui.paragraph(.{
-        .frame = rect(gauge_cx - 60, gauge_cy + 24, 120, 36),
-        .text_alignment = .center,
-        .style = .{ .foreground = burn_ink },
-        .semantics = .{ .label = ui.fmt("burn {s} tokens per minute", .{burn_text}) },
-    }, &.{.{ .text = burn_text, .weight = .bold, .monospace = true, .scale = 2.2 }}));
+    dialReadout(ui, nodes, model, glance, danger);
+    burnTrace(ui, nodes, model);
+}
 
-    const eta = if (scanning)
-        EtaLine{ .text = "scanning…", .ink = theme.cluster_colors.text_muted }
-    else
-        etaLine(ui, glance, danger);
+/// The in-dial readout well: one big number, one supporting line, and
+/// the hottest agent.
+///
+/// The number CYCLES (press it — `readout_cycle`): rate, today, trip,
+/// eta. A tach that can only show instantaneous rate makes you open the
+/// dashboard to answer "what has this cost me", which is the question
+/// people actually have at 4pm.
+fn dialReadout(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, glance: trayfmt.GlanceState, danger: bool) void {
+    const r = readout(ui, model, glance, danger);
+
     push(ui, nodes, ui.paragraph(.{
-        .frame = rect(gauge_cx - 80, gauge_cy + 64, 160, 16),
+        .frame = rect(gauge_cx - 70, gauge_cy + 18, 140, 36),
         .text_alignment = .center,
-        .style = .{ .foreground = eta.ink },
-    }, &.{.{ .text = eta.text, .monospace = true, .scale = 0.9 }}));
+        .style = .{ .foreground = r.ink },
+        .semantics = .{ .label = r.semantics },
+    }, &.{.{ .text = r.value, .weight = .bold, .monospace = true, .scale = 2.2 }}));
+
+    push(ui, nodes, ui.paragraph(.{
+        .frame = rect(gauge_cx - 80, gauge_cy + 54, 160, 16),
+        .text_alignment = .center,
+        .style = .{ .foreground = r.caption_ink },
+    }, &.{.{ .text = r.caption, .monospace = true, .scale = 0.9 }}));
+
+    hotAgentChip(ui, nodes, model);
+
+    // The press target sits above the type so the whole well is the
+    // control, not just the glyphs. Transparent: the readout IS the
+    // affordance, and a wash over the dial would fight the vignette.
+    push(ui, nodes, ui.panel(.{
+        .frame = rect(gauge_cx - 70, gauge_cy + 16, 140, 56),
+        .style = .{ .background = theme.transparent, .radius = 6, .stroke_width = 0 },
+        .on_press = .readout_cycle,
+        .semantics = .{ .label = "cycle readout: rate, today, trip, eta" },
+    }, .{}));
+}
+
+const Readout = struct {
+    value: []const u8,
+    ink: Color,
+    caption: []const u8,
+    caption_ink: Color,
+    semantics: []const u8,
+};
+
+fn readout(ui: *Ui, model: *const Model, glance: trayfmt.GlanceState, danger: bool) Readout {
+    // While history catch-up is chewing, the numbers aren't truth yet —
+    // dim the readout and say "scanning" instead of asserting a
+    // confident 0.
+    if (model.catchup_active) {
+        return .{
+            .value = "—",
+            .ink = theme.cluster_colors.text_muted,
+            .caption = "scanning…",
+            .caption_ink = theme.cluster_colors.text_muted,
+            .semantics = "readout scanning history",
+        };
+    }
+    switch (model.ux.readout) {
+        .rate => {
+            const burn_text = if (glance.idle)
+                "0"
+            else
+                fmtTokens(ui, @intFromFloat(@max(glance.burn_tokens_per_min, 0)));
+            const eta = etaLine(ui, glance, danger);
+            return .{
+                .value = burn_text,
+                .ink = if (glance.idle) theme.cluster_colors.text_muted else if (danger) theme.red else theme.green,
+                .caption = eta.text,
+                .caption_ink = eta.ink,
+                .semantics = ui.fmt("burn {s} tokens per minute", .{burn_text}),
+            };
+        },
+        .today => return .{
+            .value = fmtCost(ui, glance.today_cost_usd),
+            .ink = theme.green,
+            .caption = ui.fmt("today · {s} tok", .{fmtTokens(ui, glance.today_tokens)}),
+            .caption_ink = theme.cluster_colors.text_muted,
+            .semantics = ui.fmt("today {s}", .{fmtCost(ui, glance.today_cost_usd)}),
+        },
+        .trip => {
+            const rate = engine.tripCostPerHour(model);
+            const caption = if (rate) |per_hour|
+                ui.fmt("trip · {s}/hr", .{fmtCost(ui, per_hour)})
+            else
+                "trip · since launch";
+            return .{
+                .value = fmtCost(ui, model.trip.cost_usd),
+                .ink = theme.trip,
+                .caption = caption,
+                .caption_ink = theme.trip_dim,
+                .semantics = ui.fmt("trip {s}", .{fmtCost(ui, model.trip.cost_usd)}),
+            };
+        },
+        .eta => {
+            if (glance.wall_at_ms) |wall| {
+                return .{
+                    .value = fmtClock(ui, wall, glance.tz_offset_min),
+                    .ink = if (danger) theme.red else theme.amber,
+                    .caption = "projected wall",
+                    .caption_ink = theme.cluster_colors.text_muted,
+                    .semantics = "projected limit wall",
+                };
+            }
+            if (glance.next_reset_ms) |reset| {
+                if (reset > glance.now_ms) {
+                    return .{
+                        .value = fmtCountdown(ui, reset - glance.now_ms),
+                        .ink = theme.cluster_colors.text,
+                        .caption = "to window reset",
+                        .caption_ink = theme.cluster_colors.text_muted,
+                        .semantics = "time to window reset",
+                    };
+                }
+            }
+            return .{
+                .value = "—",
+                .ink = theme.cluster_colors.text_muted,
+                .caption = "no wall in sight",
+                .caption_ink = theme.cluster_colors.text_muted,
+                .semantics = "no projected wall",
+            };
+        },
+    }
+}
+
+/// "Which agent is burning right now", printed on the dial itself. The
+/// blended needle cannot answer it — that is the whole reason
+/// `AgentBurn` exists — and it is the first thing anyone asks when the
+/// needle is high.
+fn hotAgentChip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
+    const hot = model.agent_burn.hottest(model.now_ms) orelse {
+        push(ui, nodes, ui.text(.{
+            .frame = rect(gauge_cx - 60, gauge_cy + 72, 120, 14),
+            .size = .sm,
+            .text_alignment = .center,
+            .style = .{ .foreground = theme.text_faint },
+        }, "fleet idle"));
+        return;
+    };
+    const ink = agentInk(hot.agent);
+    push(ui, nodes, ui.panel(.{
+        .frame = rect(gauge_cx - 58, gauge_cy + 77, 5, 5),
+        .style = .{ .background = ink, .radius = 2.5, .stroke_width = 0 },
+    }, .{}));
+    push(ui, nodes, ui.paragraph(.{
+        .frame = rect(gauge_cx - 48, gauge_cy + 72, 110, 14),
+        .style = .{ .foreground = ink },
+    }, &.{
+        .{ .text = agentUpper(ui, hot.agent), .weight = .bold, .monospace = true, .scale = 0.8 },
+        .{ .text = ui.fmt("  {s}/m", .{fmtTokens(ui, @intFromFloat(@max(hot.tokens_per_min, 0)))}), .monospace = true, .scale = 0.8, .color = .text_muted },
+    }));
+}
+
+// ------------------------------------------------------- the burn trace
+
+/// Fleet burn at 10-second resolution across the last 20 minutes, at the
+/// foot of the gauge panel where a tach's own history belongs.
+///
+/// Anchored on `now_ms` (see `nowAlignedAccumulator`): the trace this
+/// replaced indexed raw ring slots, so after thirty idle minutes it
+/// still drew the last burst hard against the right edge while the big
+/// number beside it correctly read zero.
+fn burnTrace(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
+    push(ui, nodes, ui.text(.{
+        .frame = rect(24, 318, 120, 12),
+        .size = .sm,
+        .style = .{ .foreground = theme.text_faint },
+    }, "BURN · 20 MIN"));
+    push(ui, nodes, ui.text(.{
+        .frame = rect(166, 318, 110, 12),
+        .size = .sm,
+        .text_alignment = .end,
+        .style = .{ .foreground = theme.text_faint },
+    }, ui.fmt("peak {s}/m", .{fmtTokens(ui, @intFromFloat(@max(model.gauge_peak_tpm, 0)))})));
+
+    push(ui, nodes, ui.stack(.{
+        .frame = rect(24, 330, 252, 18),
+    }, .{
+        ui.chart(.{
+            .width = 252,
+            .height = 18,
+            .y_min = 0,
+            .stroke_width = 1.5,
+            .hover_details = true,
+        }, &.{.{
+            .kind = .line,
+            .values = burnSpark(ui, model),
+            .color = .accent,
+            .fill = true,
+            .label = "burn",
+        }}),
+    }));
 }
 
 const EtaLine = struct { text: []const u8, ink: Color };
@@ -478,58 +836,39 @@ fn etaLine(ui: *Ui, glance: trayfmt.GlanceState, danger: bool) EtaLine {
 
 // --------------------------------------------------------- window bars
 
-const bars_x: f32 = 312; // panel content left edge
-const bars_right: f32 = 530; // panel content right edge
-const row_h: f32 = 24;
-
-fn limitsPanel(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
+fn limitsPanel(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, frame: geometry.RectF) void {
     push(ui, nodes, ui.panel(.{
-        .frame = limits_panel_rect,
+        .frame = frame,
         .style = .{ .background = theme.transparent, .border = theme.bezel_edge, .stroke_width = 1, .radius = 10 },
+        .semantics = .{ .label = "Limit windows" },
     }, .{}));
 
-    var y: f32 = panel_y + 16;
-    y = agentGroup(ui, nodes, model, .claude, model.claude_limits, y);
+    // Side by side, not stacked: two independently flowed columns cost
+    // the height of the TALLER one instead of the sum, which is what
+    // makes room for the fleet display underneath at four windows each.
+    const y0 = frame.y + right_pad;
+    const claude_end = agentColumn(ui, nodes, model, .claude, model.claude_limits, bars_x, y0);
+    const codex_end = agentColumn(ui, nodes, model, .codex, model.codex_limits, col1_x, y0);
+    const columns_end = @max(claude_end, codex_end);
+
     push(ui, nodes, ui.panel(.{
-        .frame = rect(bars_x, y, bars_right - bars_x, 1),
+        .frame = rect(col1_x - col_gap / 2, y0 + 2, 1, columns_end - y0 - 4),
         .style = .{ .background = theme.hairline, .radius = 0, .stroke_width = 0 },
     }, .{}));
-    _ = agentGroup(ui, nodes, model, .codex, model.codex_limits, y + 10);
-    compactOthersRow(ui, nodes, model);
-
-    // Burn history trace pinned to the panel foot: an area-filled scope
-    // line on a square-root scale, so one spike no longer flattens the
-    // whole 15 minutes (the peak caption keeps the raw number honest).
-    push(ui, nodes, ui.text(.{
-        .frame = rect(bars_x, panel_y + 222, 140, 14),
-        .size = .sm,
-        .style_tokens = .{ .foreground = .text_muted },
-    }, "burn · last 15 min"));
-    push(ui, nodes, ui.text(.{
-        .frame = rect(bars_right - 110, panel_y + 222, 110, 14),
-        .size = .sm,
-        .text_alignment = .end,
-        .style_tokens = .{ .foreground = .text_muted },
-    }, ui.fmt("peak {s}/m", .{fmtTokens(ui, @intFromFloat(@max(model.gauge_peak_tpm, 0)))})));
-    push(ui, nodes, ui.stack(.{
-        .frame = rect(bars_x, panel_y + 240, bars_right - bars_x, 48),
-    }, .{
-        ui.chart(.{
-            .width = bars_right - bars_x,
-            .height = 48,
-            .y_min = 0,
-            .stroke_width = 1.5,
-            .semantics = .{ .label = "Burn history" },
-        }, &.{.{ .kind = .line, .values = burnSpark(ui, model), .color = .accent, .fill = true, .label = "burn" }}),
-    }));
+    push(ui, nodes, ui.panel(.{
+        .frame = rect(bars_x, columns_end + region_gap / 2, bars_right - bars_x, 1),
+        .style = .{ .background = theme.hairline, .radius = 0, .stroke_width = 0 },
+    }, .{}));
+    compactOthersRow(ui, nodes, model, columns_end + region_gap);
 }
 
-fn agentGroup(
+fn agentColumn(
     ui: *Ui,
     nodes: *std.ArrayList(Ui.Node),
     model: *const Model,
     agent: types.Agent,
     limits: ?types.LimitSnapshot,
+    x: f32,
     y0: f32,
 ) f32 {
     var y = y0;
@@ -537,8 +876,6 @@ fn agentGroup(
     const enabled = engine.sourceEnabled(model.cfg.sources, agent);
     const empty = enabled and engine.agentIsEmpty(model, agent);
     const stale_min: ?u64 = if (agent == .claude) engine.oauthStaleMin(model) else null;
-    // Only the limits-panel agents reach this fn (rootView calls it for
-    // claude/codex; everything else takes the aggregate treatment).
     const name: []const u8 = switch (agent) {
         .claude => "CLAUDE",
         .codex => "CODEX",
@@ -547,8 +884,8 @@ fn agentGroup(
 
     var name_spans: [3]canvas.TextSpan = .{
         .{ .text = name, .weight = .bold, .monospace = true },
-        .{ .text = "", .color = .text_muted, .monospace = true },
-        .{ .text = "", .color = .warning, .monospace = true },
+        .{ .text = "", .color = .text_muted, .monospace = true, .scale = 0.85 },
+        .{ .text = "", .color = .warning, .monospace = true, .scale = 0.85 },
     };
     if (enabled and !empty) {
         if (stale_min) |mins| {
@@ -560,11 +897,11 @@ fn agentGroup(
         }
     }
     push(ui, nodes, ui.paragraph(.{
-        .frame = rect(bars_x, y, 170, 16),
+        .frame = rect(x, y, col_w, 16),
         .semantics = .{ .label = ui.fmt("{s} usage", .{name}) },
     }, &name_spans));
 
-    // Right column of the name row: totals when there is anything to
+    // Second line of the name block: totals when there is anything to
     // total, otherwise the honest one-liner ("disabled" for a source
     // switched off in config, "no sessions found" for an agent with no
     // history and no limits, "scanning…" while catch-up may yet find some).
@@ -577,52 +914,51 @@ fn agentGroup(
     else
         ui.fmt("{s} · {s}", .{ fmtTokens(ui, totals.totalTokens()), fmtCost(ui, totals.cost_usd) });
     push(ui, nodes, ui.text(.{
-        .frame = rect(bars_right - 140, y + 1, 140, 14),
+        .frame = rect(x, y + 17, col_w, 13),
         .size = .sm,
-        .text_alignment = .end,
         .style_tokens = .{ .foreground = .text_muted },
     }, right_text));
-    y += row_h;
+    y += name_block_h;
 
     // Disabled and empty agents get no bars and no limit-data hint —
     // empty tracks under a "0 tok" line would just be lies in green.
-    if (!enabled or empty) return y + 4;
+    if (!enabled or empty) return y;
 
     if (limits) |snap| {
         const shown = @min(snap.windows.len, 4);
         for (snap.windows[0..shown]) |window| {
-            windowRow(ui, nodes, window, model.now_ms, y, stale_min != null);
-            y += row_h;
+            windowRow(ui, nodes, window, model.now_ms, x, y, stale_min != null);
+            y += win_row_h;
         }
     } else {
         // Two short lines instead of one clipped one: the fact, then
         // the remedy.
         push(ui, nodes, ui.text(.{
-            .frame = rect(bars_x, y, bars_right - bars_x, 14),
+            .frame = rect(x, y, col_w, 14),
             .size = .sm,
             .style_tokens = .{ .foreground = .text_muted },
         }, "no limit data"));
         push(ui, nodes, ui.text(.{
-            .frame = rect(bars_x, y + 15, bars_right - bars_x, 14),
+            .frame = rect(x, y + 15, col_w, 14),
+            .wrap = true,
             .size = .sm,
             .style = .{ .foreground = theme.text_faint },
         }, switch (agent) {
-            .claude => "set claude-oauth = true in config",
-            .codex => "none embedded in recent rollouts",
-            else => "API-equivalent usage only",
+            .claude => "enable claude-oauth",
+            .codex => "none in rollouts",
+            else => "API-equivalent only",
         }));
-        y += row_h + 14;
+        y += hint_h;
     }
-    return y + 4;
+    return y;
 }
 
 /// The aggregate row for every agent beyond the claude/codex limit
 /// groups (tt-hr8): opencode plus whatever collectors found usage.
-/// One quiet line — the label names up to three contributors, the right
-/// side sums their API-equivalent value. The dashboard itemizes.
-fn compactOthersRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
-    const y = panel_y + 194;
-
+/// One quiet line — the label counts the contributors, the right side
+/// sums their API-equivalent value. The MFD's AGENTS page itemizes them
+/// live; this row is the all-time total.
+fn compactOthersRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, y: f32) void {
     var combined: u64 = 0;
     var combined_cost: f64 = 0;
     var active_count: usize = 0;
@@ -640,16 +976,13 @@ fn compactOthersRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model
         }
     }
 
-    // Just the aggregate: which agents feed it is the dashboard's job
-    // (AGENT/SHARE card); a name lineup here wraps into the sparkline
-    // caption at the sizes this row affords.
     var name_spans: [2]canvas.TextSpan = .{
         .{ .text = "OTHERS", .weight = .bold, .monospace = true },
         .{ .text = "", .color = .text_muted, .monospace = true, .scale = 0.85 },
     };
     if (active_count > 1) name_spans[1].text = ui.fmt(" ×{d}", .{active_count});
     push(ui, nodes, ui.paragraph(.{
-        .frame = rect(bars_x, y, 100, 16),
+        .frame = rect(bars_x, y, 120, 16),
         .semantics = .{ .label = "Other agents API-equivalent usage" },
     }, &name_spans));
 
@@ -660,23 +993,23 @@ fn compactOthersRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model
     else
         ui.fmt("{s} · {s}", .{ fmtTokens(ui, combined), fmtCost(ui, combined_cost) });
     push(ui, nodes, ui.text(.{
-        .frame = rect(bars_right - 120, y + 1, 120, 14),
+        .frame = rect(bars_right - 140, y + 1, 140, 14),
         .size = .sm,
         .text_alignment = .end,
         .style_tokens = .{ .foreground = .text_muted },
     }, value));
 }
 
-fn windowRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), window: types.LimitWindow, now_ms: i64, y: f32, stale: bool) void {
+fn windowRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), window: types.LimitWindow, now_ms: i64, x: f32, y: f32, stale: bool) void {
     const label: []const u8 = switch (window.kind) {
         .five_hour => "5h",
         .weekly => "wk",
         .weekly_opus => "opus",
-        .weekly_sonnet => "sonnet",
+        .weekly_sonnet => "son",
         .monthly => "mo",
     };
     push(ui, nodes, ui.text(.{
-        .frame = rect(bars_x, y, 42, 14),
+        .frame = rect(x, y, 28, 14),
         .size = .sm,
         .style_tokens = .{ .foreground = .text_muted },
     }, label));
@@ -684,37 +1017,43 @@ fn windowRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), window: types.LimitWindow,
     const pct = std.math.clamp(window.used_percent, 0, 100);
     // Stale readings render at half strength, no tip glow — the bar is
     // the last known value, not the current one.
-    const ink = if (stale) withAlpha(barColor(pct), 0.45) else barColor(pct);
-    const track_x: f32 = bars_x + 46;
-    const track_w: f32 = 78;
+    const ink = if (stale) withAlpha(theme.windowZone(pct / 100), 0.45) else theme.windowZone(pct / 100);
+    // Row budget inside `col_w` (142): label 0..28, track 30..70,
+    // percent 72..96, reset 100..142. The track gave up 8pt so the reset
+    // column could have 42 instead of 36 — at 36 a five-glyph countdown
+    // ("4h40m", "5d11h") elided to "4h4…", and the percent column ended
+    // at exactly the x the reset column started, so a full-width percent
+    // printed "41%5d11h" with no space between two unrelated numbers.
+    const track_x: f32 = x + 30;
+    const track_w: f32 = 40;
     push(ui, nodes, ui.panel(.{
-        .frame = rect(track_x, y + 4, track_w, 6),
+        .frame = rect(track_x, y + 5, track_w, 6),
         .style = .{ .background = theme.track, .radius = 3, .stroke_width = 0 },
     }, .{}));
     if (pct > 0) {
         const fill_w = @max(track_w * @as(f32, @floatCast(pct)) / 100.0, 3);
         push(ui, nodes, ui.panel(.{
-            .frame = rect(track_x, y + 4, fill_w, 6),
+            .frame = rect(track_x, y + 5, fill_w, 6),
             .style = .{ .background = ink, .radius = 3, .stroke_width = 0 },
         }, .{}));
         if (!stale) {
             // LED tip glow at the leading edge.
             push(ui, nodes, ui.panel(.{
-                .frame = rect(track_x + fill_w - 4, y + 2, 10, 10),
+                .frame = rect(track_x + fill_w - 4, y + 3, 10, 10),
                 .style = .{ .background = withAlpha(ink, 0.35), .radius = 5, .stroke_width = 0 },
             }, .{}));
         }
     }
 
     push(ui, nodes, ui.paragraph(.{
-        .frame = rect(track_x + track_w + 6, y, 34, 14),
+        .frame = rect(x + 72, y, 24, 14),
         .text_alignment = .end,
         .style = .{ .foreground = ink },
     }, &.{.{ .text = ui.fmt("{d}%", .{@as(u64, @intFromFloat(pct))}), .monospace = true, .scale = 0.9 }}));
 
     if (window.resets_at_ms > now_ms) {
         push(ui, nodes, ui.text(.{
-            .frame = rect(bars_right - 48, y, 48, 14),
+            .frame = rect(x + col_w - 42, y, 42, 14),
             .size = .sm,
             .text_alignment = .end,
             .style_tokens = .{ .foreground = .text_muted },
@@ -722,10 +1061,390 @@ fn windowRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), window: types.LimitWindow,
     }
 }
 
-fn barColor(pct: f64) Color {
-    if (pct >= 80) return theme.red;
-    if (pct >= 50) return theme.amber;
-    return theme.green;
+// ------------------------------------------------- multi-function display
+
+const mfd_tab_w: f32 = 74;
+const mfd_tab_pitch: f32 = 78;
+const mfd_tab_h: f32 = 18;
+const fleet_row_h: f32 = 22;
+
+/// The MFD's three pages and the tab that selects each.
+///
+/// `.burn` is the engine's default page and it renders the AGENTS
+/// roster, which is not a pun: the roster IS the burn view — it answers
+/// "who is burning" where the needle can only answer "how much". The
+/// SESSIONS page is the same fleet at a finer grain (one row per live
+/// session, so two Claude windows on two projects are two rows), and
+/// SCOPE is the machine underneath.
+const mfd_tabs = [_]struct { label: []const u8, page: engine.MfdPage }{
+    .{ .label = "AGENTS", .page = .burn },
+    .{ .label = "SESSIONS", .page = .sessions },
+    .{ .label = "SCOPE", .page = .telemetry },
+};
+
+fn mfdPage(model: *const Model) engine.MfdPage {
+    return switch (model.ux.mfd_page) {
+        .sessions => .sessions,
+        .telemetry => .telemetry,
+        // `.windows` and `.ledger` have no page here — the limits panel
+        // above is always visible and the dashboard owns the ledger.
+        else => .burn,
+    };
+}
+
+fn mfdPanel(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, frame: geometry.RectF) void {
+    push(ui, nodes, ui.panel(.{
+        .frame = frame,
+        .style = .{ .background = theme.transparent, .border = theme.bezel_edge, .stroke_width = 1, .radius = 10 },
+        .semantics = .{ .label = "Fleet display" },
+    }, .{}));
+
+    const page = mfdPage(model);
+    const tabs_y = frame.y + 8;
+    for (mfd_tabs, 0..) |tab, i| {
+        const x = bars_x + mfd_tab_pitch * @as(f32, @floatFromInt(i));
+        const selected = page == tab.page;
+        push(ui, nodes, ui.panel(.{
+            .frame = rect(x, tabs_y, mfd_tab_w, mfd_tab_h),
+            .style = .{
+                .background = if (selected) theme.cluster_colors.surface_subtle else theme.transparent,
+                .radius = 3,
+                .stroke_width = 0,
+            },
+            .on_press = .{ .mfd_page = tab.page },
+            .semantics = .{ .label = ui.fmt("show {s}", .{tab.label}) },
+        }, .{}));
+        push(ui, nodes, ui.paragraph(.{
+            .frame = rect(x, tabs_y + 3, mfd_tab_w, 14),
+            .text_alignment = .center,
+            .style = .{ .foreground = if (selected) theme.cluster_colors.text else theme.cluster_colors.text_muted },
+        }, &.{.{ .text = tab.label, .weight = .bold, .monospace = true, .scale = 0.76 }}));
+        if (selected) {
+            push(ui, nodes, ui.panel(.{
+                .frame = rect(x + 10, tabs_y + mfd_tab_h, mfd_tab_w - 20, 2),
+                .style = .{ .background = theme.green, .radius = 1, .stroke_width = 0 },
+            }, .{}));
+        }
+    }
+
+    switch (page) {
+        .telemetry => scopePage(ui, nodes, model, frame),
+        .sessions => sessionsPage(ui, nodes, model, frame),
+        else => agentsPage(ui, nodes, model, frame),
+    }
+}
+
+/// How many fleet rows fit under the tabs and the detail line. Derived,
+/// never assumed: the MFD's height is whatever the limits region left,
+/// so the page shows as many rows as it honestly has room for — four
+/// limit windows on both agents costs two rows here and nothing else.
+fn fleetRowCapacity(frame: geometry.RectF) usize {
+    const top = frame.y + 48;
+    const space = frame.y + frame.height - 8 - top;
+    if (space < fleet_row_h) return 0;
+    return @intFromFloat(@floor(space / fleet_row_h));
+}
+
+/// One rendered fleet row, agent-grained or session-grained.
+const FleetRow = struct {
+    name: []const u8,
+    ink: Color,
+    activity: sessions.Activity,
+    /// Limit-weighted tokens/min right now.
+    burn: f64,
+    /// Oldest-first burn samples for the row sparkline.
+    spark: []const f32,
+    /// Small qualifier printed after the name (session count, turns).
+    qualifier: []const u8,
+    /// The full line the row reveals when selected.
+    detail: []const u8,
+    /// Global key for the activity pip, so `animations` can pulse it.
+    pip_key: u64,
+};
+
+fn agentsPage(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, frame: geometry.RectF) void {
+    const now = model.now_ms;
+    const by_agent = model.roster.byAgent(now);
+    const agent_count = @typeInfo(types.Agent).@"enum".fields.len;
+
+    var rows: [agent_count]FleetRow = undefined;
+    var n: usize = 0;
+    inline for (@typeInfo(types.Agent).@"enum".fields) |field| {
+        const agent: types.Agent = @enumFromInt(field.value);
+        const view = by_agent.get(agent);
+        const burn = model.agent_burn.tokensPerMin(agent, now);
+        // A row earns its place by being alive or hot; an agent that has
+        // not run since the machine booted belongs in the ledger, not on
+        // an instrument that answers "right now".
+        if (burn > 0 or view.activity != .done) {
+            rows[n] = .{
+                .name = agentUpper(ui, agent),
+                .ink = agentInk(agent),
+                .activity = view.activity,
+                .burn = burn,
+                .spark = agentSpark(ui, model, agent),
+                .qualifier = if (view.sessions > 1) ui.fmt("×{d}", .{view.sessions}) else "",
+                .detail = ui.fmt("{s} · {d} session{s} · {s} · {s}", .{
+                    agentUpper(ui, agent),
+                    view.sessions,
+                    if (view.sessions == 1) "" else "s",
+                    fmtTokens(ui, view.totals.totalTokens()),
+                    fmtCost(ui, view.totals.cost_usd),
+                }),
+                .pip_key = agentPipKey(agent),
+            };
+            n += 1;
+        }
+    }
+    sortByBurn(rows[0..n]);
+    fleetRows(ui, nodes, model, frame, rows[0..n], "no agent has run yet");
+}
+
+fn sessionsPage(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, frame: geometry.RectF) void {
+    var slots: [sessions.max_sessions]*const sessions.Session = undefined;
+    // `live` already orders running-first, then hottest — the roster's
+    // own display contract, which is exactly what this page wants.
+    const live = model.roster.live(&slots, model.now_ms);
+
+    var rows: [sessions.max_sessions]FleetRow = undefined;
+    for (live, 0..) |session, i| {
+        const project = session.project();
+        rows[i] = .{
+            .name = if (project.len > 0) project else agentUpper(ui, session.agent),
+            .ink = agentInk(session.agent),
+            .activity = session.activityAt(model.now_ms),
+            .burn = session.tokensPerMin(),
+            .spark = sessionSpark(ui, session),
+            // Mid-turn is the flagship signal: transcript bytes with no
+            // completed turn behind them means this agent is thinking at
+            // this instant, which no token count can tell you.
+            .qualifier = if (session.mid_turn) "···" else ui.fmt("{d}t", .{session.turns()}),
+            .detail = ui.fmt("{s} · {s} · {d} turns · {s}", .{
+                agentUpper(ui, session.agent),
+                if (session.modelName().len > 0) session.modelName() else "model unknown",
+                session.turns(),
+                fmtCost(ui, session.totals.cost_usd),
+            }),
+            .pip_key = sessionPipKey(i),
+        };
+    }
+    fleetRows(ui, nodes, model, frame, rows[0..live.len], "no live sessions");
+}
+
+/// Burn-descending, liveliness breaking ties.
+///
+/// Deliberately NOT the roster's running-first order: this page answers
+/// "who is burning right now", and an agent sitting at a prompt with a
+/// live process outranking one that is actually consuming tokens would
+/// answer a different question. The SESSIONS page keeps the roster's own
+/// running-first contract, where "is it alive" is the point.
+///
+/// Insertion sort: stable, so equal rows keep enum order and a redraw
+/// never shuffles them.
+fn sortByBurn(rows: []FleetRow) void {
+    var i: usize = 1;
+    while (i < rows.len) : (i += 1) {
+        const item = rows[i];
+        var j = i;
+        while (j > 0 and burnLess(item, rows[j - 1])) : (j -= 1) {
+            rows[j] = rows[j - 1];
+        }
+        rows[j] = item;
+    }
+}
+
+fn burnLess(a: FleetRow, b: FleetRow) bool {
+    if (a.burn != b.burn) return a.burn > b.burn;
+    return a.activity.rank() < b.activity.rank();
+}
+
+fn fleetRows(
+    ui: *Ui,
+    nodes: *std.ArrayList(Ui.Node),
+    model: *const Model,
+    frame: geometry.RectF,
+    rows: []const FleetRow,
+    empty_text: []const u8,
+) void {
+    const capacity = fleetRowCapacity(frame);
+    var shown = @min(rows.len, capacity);
+    // The overflow line needs a line's worth of room of its own, or it
+    // prints over the panel edge on the one frame that needs it most.
+    if (rows.len > shown and shown > 0) {
+        const used = frame.y + 48 + fleet_row_h * @as(f32, @floatFromInt(shown));
+        if (used + 14 > frame.y + frame.height - 4) shown -= 1;
+    }
+
+    if (shown == 0) {
+        push(ui, nodes, ui.text(.{
+            .frame = rect(bars_x, frame.y + 40, bars_right - bars_x, 16),
+            .style_tokens = .{ .foreground = .text_muted },
+        }, empty_text));
+        return;
+    }
+
+    // One row is always the selected one — row 0, the hottest, until the
+    // pointer says otherwise — and its full line lives where a column
+    // header would. A static "AGENT / TOK/MIN" header would spend the
+    // same pixels restating what the columns already look like, and the
+    // obvious alternative home for row detail (the footer) is already
+    // spoken for by the telemetry hover.
+    const selected: usize = @min(model.ux.selected_row, shown - 1);
+    push(ui, nodes, ui.text(.{
+        .frame = rect(bars_x, frame.y + 32, bars_right - bars_x, 13),
+        .size = .sm,
+        .style = .{ .foreground = rows[selected].ink },
+    }, rows[selected].detail));
+
+    var y = frame.y + 48;
+    for (rows[0..shown], 0..) |row, i| {
+        fleetRow(ui, nodes, row, i, i == selected, y);
+        y += fleet_row_h;
+    }
+    if (rows.len > shown) {
+        push(ui, nodes, ui.text(.{
+            .frame = rect(bars_x, y + 1, bars_right - bars_x, 13),
+            .size = .sm,
+            .text_alignment = .end,
+            .style = .{ .foreground = theme.text_faint },
+        }, ui.fmt("+{d} more", .{rows.len - shown})));
+    }
+}
+
+fn fleetRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), row: FleetRow, index: usize, selected: bool, y: f32) void {
+    if (selected) {
+        push(ui, nodes, ui.panel(.{
+            .frame = rect(bars_x - 6, y - 1, bars_right - bars_x + 12, fleet_row_h - 2),
+            .style = .{ .background = withAlpha(row.ink, 0.10), .radius = 3, .stroke_width = 0 },
+        }, .{}));
+    }
+
+    // The activity pip: lit and pulsing while running, a dim disc when
+    // idle. Keyed so `animations` can find it.
+    const running = row.activity == .running;
+    push(ui, nodes, ui.panel(.{
+        .global_key = canvas.uiKey(row.pip_key),
+        .frame = rect(bars_x, y + 7, 6, 6),
+        .style = .{
+            .background = if (running) theme.activity_dot else theme.idle_dot,
+            .radius = 3,
+            .stroke_width = 0,
+        },
+    }, .{}));
+
+    push(ui, nodes, ui.paragraph(.{
+        .frame = rect(bars_x + 12, y + 2, 118, 14),
+        .style = .{ .foreground = row.ink },
+    }, &.{
+        .{ .text = row.name, .weight = .bold, .monospace = true, .scale = 0.85 },
+        .{ .text = if (row.qualifier.len > 0) ui.fmt("  {s}", .{row.qualifier}) else "", .monospace = true, .scale = 0.75, .color = .text_muted },
+    }));
+
+    push(ui, nodes, ui.stack(.{
+        .frame = rect(bars_x + 136, y + 4, 84, 14),
+    }, .{
+        ui.chart(.{
+            .width = 84,
+            .height = 14,
+            .y_min = 0,
+            .stroke_width = 1,
+            .semantics = .{ .label = ui.fmt("{s} burn trace", .{row.name}) },
+        }, &.{.{ .kind = .line, .values = row.spark, .color = .accent, .fill = true }}),
+    }));
+
+    push(ui, nodes, ui.paragraph(.{
+        .frame = rect(bars_right - 76, y + 2, 76, 14),
+        .text_alignment = .end,
+        .style = .{ .foreground = if (running) theme.cluster_colors.text else theme.cluster_colors.text_muted },
+    }, &.{.{
+        .text = if (row.burn >= 1) fmtTokens(ui, @intFromFloat(row.burn)) else "—",
+        .weight = .bold,
+        .monospace = true,
+        .scale = 0.9,
+    }}));
+
+    push(ui, nodes, ui.panel(.{
+        .frame = rect(bars_x - 6, y - 1, bars_right - bars_x + 12, fleet_row_h - 2),
+        .style = .{ .background = theme.transparent, .radius = 3, .stroke_width = 0 },
+        .on_press = .{ .row_press = @intCast(index) },
+        .semantics = .{ .label = row.detail },
+    }, .{}));
+}
+
+// ------------------------------------------------------------ scope page
+
+/// Samples on the scope page's shared x axis: 10 s apart, 20 minutes
+/// wide — the span the fleet burn trace covers, so both lanes are the
+/// same window and one pointer position means one moment.
+const scope_points: usize = 120;
+
+/// The machine and the needle on ONE time axis.
+///
+/// Every system meter on this panel is otherwise a bar of NOW: nothing
+/// answers "was it like this a minute ago", which is the question that
+/// makes a system monitor a monitor. CPU renders as a min/max BAND (each
+/// 10 s cell holds two 5 s samples, and averaging them would hide
+/// exactly the spikes someone opens a scope to find) and the needle as
+/// its own percentage of full scale, so both lanes share one honest
+/// 0-100 domain.
+fn scopePage(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, frame: geometry.RectF) void {
+    push(ui, nodes, ui.text(.{
+        .frame = rect(bars_x, frame.y + 32, 160, 13),
+        .size = .sm,
+        .style = .{ .foreground = theme.text_faint },
+    }, "MACHINE · 20 MIN"));
+    // A CPU lane with no samples behind it would draw a confident flat
+    // line along zero, which is a claim about the machine and not the
+    // truth ("nothing recorded yet"). No samples, no lane.
+    const has_cpu = !model.system_history.cpu.isEmpty();
+    push(ui, nodes, ui.paragraph(.{
+        .frame = rect(bars_right - 150, frame.y + 32, 150, 13),
+        .text_alignment = .end,
+    }, &.{
+        .{ .text = if (has_cpu) "cpu" else "", .monospace = true, .scale = 0.78, .color = .info },
+        .{ .text = "  needle", .monospace = true, .scale = 0.78, .color = .accent },
+    }));
+
+    const plot_y = frame.y + 50;
+    const plot_h = @max(frame.y + frame.height - 20 - plot_y, 24);
+    const scale = engine.gaugeScaleTpm(model.gauge_peak_tpm);
+
+    var series: [2]canvas.ChartSeries = undefined;
+    var count: usize = 0;
+    if (has_cpu) {
+        const cpu = cpuBand(ui, model);
+        series[count] = .{ .kind = .band, .values = cpu.high, .low = cpu.low, .color = .info, .label = "cpu %" };
+        count += 1;
+    }
+    series[count] = .{ .kind = .line, .values = needleTrace(ui, model, scale), .color = .accent, .label = "needle %" };
+    count += 1;
+
+    push(ui, nodes, ui.stack(.{
+        .frame = rect(bars_x, plot_y, bars_right - bars_x, plot_h),
+    }, .{
+        ui.chart(.{
+            .width = bars_right - bars_x,
+            .height = plot_h,
+            .y_min = 0,
+            .y_max = 100,
+            .grid_lines = 2,
+            .y_labels = true,
+            .hover_details = true,
+            .stroke_width = 1.2,
+        }, series[0..count]),
+    }));
+
+    push(ui, nodes, ui.text(.{
+        .frame = rect(bars_x, frame.y + frame.height - 17, 80, 12),
+        .size = .sm,
+        .style = .{ .foreground = theme.text_faint },
+    }, "20 min ago"));
+    push(ui, nodes, ui.text(.{
+        .frame = rect(bars_right - 60, frame.y + frame.height - 17, 60, 12),
+        .size = .sm,
+        .text_alignment = .end,
+        .style = .{ .foreground = theme.text_faint },
+    }, "now"));
 }
 
 // ------------------------------------------------------ odometer strip
@@ -740,18 +1459,18 @@ fn odometerStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) v
     }, .{}));
 
     push(ui, nodes, ui.text(.{
-        .frame = rect(34, strip_y + 14, 52, 14),
+        .frame = rect(32, strip_y + 14, 52, 14),
         .size = .sm,
         .style_tokens = .{ .foreground = .text_muted },
     }, "TODAY"));
 
     push(ui, nodes, ui.paragraph(.{
-        .frame = rect(92, strip_y + 8, 140, 26),
+        .frame = rect(86, strip_y + 8, 140, 26),
         .style = .{ .foreground = theme.green },
     }, &.{.{ .text = fmtCost(ui, glance.today_cost_usd), .weight = .bold, .monospace = true, .scale = 1.5 }}));
 
     push(ui, nodes, ui.panel(.{
-        .frame = rect(244, strip_y + 8, 1, 26),
+        .frame = rect(238, strip_y + 8, 1, 26),
         .style = .{ .background = theme.hairline, .radius = 0, .stroke_width = 0 },
     }, .{}));
 
@@ -761,8 +1480,7 @@ fn odometerStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) v
     const cell_w: f32 = 18;
     const cell_h: f32 = 26;
     const cell_gap: f32 = 2;
-    const total = @as(f32, @floatFromInt(digits.len)) * (cell_w + cell_gap) - cell_gap;
-    var x: f32 = 478 - total;
+    var x: f32 = 262;
     var significant = false;
     for (digits, 0..) |d, i| {
         if (d != '0' or i == digits.len - 1) significant = true;
@@ -787,16 +1505,60 @@ fn odometerStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) v
         x += cell_w + cell_gap;
     }
     push(ui, nodes, ui.text(.{
-        .frame = rect(484, strip_y + 14, 44, 14),
+        .frame = rect(x + 4, strip_y + 14, 34, 14),
         .size = .sm,
         .style_tokens = .{ .foreground = .text_muted },
     }, "tok"));
+
+    tripMeter(ui, nodes, model);
+}
+
+/// The trip meter: what THIS launch has burned, in the trip ink so it
+/// never reads as part of the permanent odometer beside it. Held (not
+/// clicked) to zero — a stalk you can brush past is a stalk that loses
+/// your session total.
+fn tripMeter(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
+    const x: f32 = 500;
+    push(ui, nodes, ui.panel(.{
+        .frame = rect(x - 14, strip_y + 8, 1, 26),
+        .style = .{ .background = theme.hairline, .radius = 0, .stroke_width = 0 },
+    }, .{}));
+    push(ui, nodes, ui.text(.{
+        .frame = rect(x, strip_y + 7, 50, 13),
+        .size = .sm,
+        .style_tokens = .{ .foreground = .text_muted },
+    }, "TRIP"));
+    const rate_text = if (engine.tripCostPerHour(model)) |per_hour|
+        ui.fmt("{s}/hr", .{fmtCost(ui, per_hour)})
+    else
+        // "hold to zero" needed ~70pt at `sm` and had exactly 70, so it
+        // printed "hold to ze…" — an affordance hint that elides the
+        // verb it exists to teach is worse than no hint. Terser string,
+        // wider frame, and the frame no longer starts inside the "TRIP"
+        // label's box at x+40.
+        "hold to 0";
+    push(ui, nodes, ui.text(.{
+        .frame = rect(x + 34, strip_y + 7, 76, 13),
+        .size = .sm,
+        .text_alignment = .end,
+        .style = .{ .foreground = theme.text_faint },
+    }, rate_text));
+    push(ui, nodes, ui.paragraph(.{
+        .frame = rect(x, strip_y + 20, 110, 18),
+        .style = .{ .foreground = theme.trip },
+    }, &.{.{ .text = fmtCost(ui, model.trip.cost_usd), .weight = .bold, .monospace = true, .scale = 1.15 }}));
+    push(ui, nodes, ui.panel(.{
+        .frame = rect(x - 6, strip_y + 5, 122, 32),
+        .style = .{ .background = theme.transparent, .radius = 4, .stroke_width = 0 },
+        .on_hold = .trip_reset,
+        .semantics = .{ .label = ui.fmt("trip {s} since launch, hold to reset", .{fmtCost(ui, model.trip.cost_usd)}) },
+    }, .{}));
 }
 
 // -------------------------------------------------------- system strip
 
 /// One cell of the system telemetry strip: a label, a monospace reading,
-/// and a windowRow-grammar meter underneath.
+/// a windowRow-grammar meter, and five minutes of history under it.
 const SysCell = struct {
     label: []const u8,
     value: []const u8,
@@ -804,6 +1566,8 @@ const SysCell = struct {
     ink: Color,
     /// The hover target this cell reports (drives the footer reveal).
     target: engine.HoverTarget,
+    /// Oldest-first history samples, already scaled to 0..100.
+    spark: []const f32,
     /// Meter ink when it differs from the value ink (the DISK cell inks
     /// its value by capacity but its meter by live I/O activity).
     meter_ink: ?Color = null,
@@ -813,12 +1577,15 @@ const SysCell = struct {
 };
 
 /// The system telemetry strip: CPU / GPU / MEM / DISK / NET / BAT as
-/// quiet micro-meters in the limits-bar grammar. Cells exist only for
-/// modules that are enabled AND produced a reading — no zeros, no
-/// dashes; on a desktop the battery cell simply is not there.
+/// quiet micro-meters in the limits-bar grammar, each over its own
+/// five-minute trace. Cells exist only for modules that are enabled AND
+/// produced a reading — no zeros, no dashes; on a desktop the battery
+/// cell simply is not there.
 fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
     if (!model.cfg.system_stats.any()) return;
     const snap = model.system_snap;
+    const hist = &model.system_history;
+    const now = model.now_ms;
 
     var cells: [6]SysCell = undefined;
     var count: usize = 0;
@@ -828,7 +1595,8 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
             .target = .cpu,
             .value = ui.fmt("{d}%", .{pctInt(s.total_frac)}),
             .meter_frac = s.total_frac,
-            .ink = sysColor(s.total_frac),
+            .ink = theme.loadZone(s.total_frac),
+            .spark = seriesSpark(ui, &hist.cpu, now, .fraction),
         };
         count += 1;
     }
@@ -838,7 +1606,8 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
             .target = .gpu,
             .value = ui.fmt("{d}%", .{pctInt(s.device_utilization)}),
             .meter_frac = s.device_utilization,
-            .ink = sysColor(s.device_utilization),
+            .ink = theme.loadZone(s.device_utilization),
+            .spark = seriesSpark(ui, &hist.gpu, now, .fraction),
         };
         count += 1;
     }
@@ -848,7 +1617,7 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
         const ink = switch (s.pressure) {
             .critical => theme.red,
             .warn => theme.amber,
-            .normal, .unknown => sysColor(s.used_frac),
+            .normal, .unknown => theme.loadZone(s.used_frac),
         };
         cells[count] = .{
             .label = "MEM",
@@ -856,6 +1625,7 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
             .value = ui.fmt("{d}%", .{pctInt(s.used_frac)}),
             .meter_frac = s.used_frac,
             .ink = ink,
+            .spark = seriesSpark(ui, &hist.mem, now, .fraction),
         };
         count += 1;
     }
@@ -863,14 +1633,16 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
         // Value: free space, inked by how full the volume is. Meter:
         // live read+write activity against the ratcheted peak — the
         // capacity fraction barely moves for months, but I/O makes this
-        // a real instrument (tt-t7u).
+        // a real instrument (tt-t7u). The trace is capacity, which is
+        // the one of the two that HAS a history.
         cells[count] = .{
             .label = "DISK",
             .target = .disk,
             .value = fmtBytes(ui, s.free_bytes),
             .meter_frac = snap.disk_io_meter_frac orelse 0,
-            .ink = if (s.used_fraction >= 0.92) theme.red else if (s.used_fraction >= 0.8) theme.amber else theme.green,
+            .ink = theme.diskZone(s.used_fraction),
             .meter_ink = theme.green,
+            .spark = seriesSpark(ui, &hist.disk, now, .fraction),
         };
         count += 1;
     }
@@ -886,6 +1658,7 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
             }),
             .meter_frac = snap.net_meter_frac orelse 0,
             .ink = theme.green,
+            .spark = netSpark(ui, hist, now),
             .weight = 1.7,
         };
         count += 1;
@@ -896,7 +1669,8 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
             .target = .battery,
             .value = ui.fmt("{d}%", .{pctInt(s.charge)}),
             .meter_frac = s.charge,
-            .ink = if (s.charge <= 0.15) theme.red else if (s.charge <= 0.35) theme.amber else theme.green,
+            .ink = theme.chargeZone(s.charge),
+            .spark = seriesSpark(ui, &hist.battery, now, .fraction),
         };
         count += 1;
     }
@@ -937,7 +1711,7 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
         // The meter, in the windowRow grammar: track, fill, LED tip glow.
         const track_w = cell_w - 16;
         push(ui, nodes, ui.panel(.{
-            .frame = rect(x, system_y + 26, track_w, 5),
+            .frame = rect(x, system_y + 24, track_w, 5),
             .style = .{ .background = theme.track, .radius = 2, .stroke_width = 0 },
         }, .{}));
         const frac: f32 = @floatCast(std.math.clamp(cell.meter_frac, 0, 1));
@@ -945,14 +1719,33 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
             const meter_ink = cell.meter_ink orelse cell.ink;
             const fill_w = @max(track_w * frac, 2);
             push(ui, nodes, ui.panel(.{
-                .frame = rect(x, system_y + 26, fill_w, 5),
+                .frame = rect(x, system_y + 24, fill_w, 5),
                 .style = .{ .background = meter_ink, .radius = 2, .stroke_width = 0 },
             }, .{}));
             push(ui, nodes, ui.panel(.{
-                .frame = rect(x + fill_w - 3, system_y + 24, 8, 8),
+                .frame = rect(x + fill_w - 3, system_y + 22, 8, 8),
                 .style = .{ .background = withAlpha(meter_ink, 0.35), .radius = 4, .stroke_width = 0 },
             }, .{}));
         }
+
+        // Five minutes of it. A meter says where the machine is; the
+        // trace says where it is going, and the two together are what
+        // separates an instrument from a status line.
+        push(ui, nodes, ui.stack(.{
+            .frame = rect(x, system_y + 34, track_w, 20),
+        }, .{
+            // No explicit semantics label: the generated series summary
+            // ("chart: CPU 60 pts last 43.00") is both the a11y payload
+            // and the seam a test asserts the DATA through — an empty
+            // history reads "CPU empty" instead of a confident flat zero.
+            ui.chart(.{
+                .width = track_w,
+                .height = 20,
+                .y_min = 0,
+                .y_max = 100,
+                .stroke_width = 1,
+            }, &.{.{ .kind = .line, .values = cell.spark, .color = .text_muted, .fill = true, .label = cell.label }}),
+        }));
 
         // A transparent hover-hit region over the whole cell, pushed
         // last so it sits atop the readouts. Binding hover makes it
@@ -969,7 +1762,7 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
         }, .{}));
         if (hovered) {
             push(ui, nodes, ui.panel(.{
-                .frame = rect(x, system_y + 34, track_w, 2),
+                .frame = rect(x, system_y + 56, track_w, 2),
                 .style = .{ .background = withAlpha(cell.ink, 0.7), .radius = 1, .stroke_width = 0 },
             }, .{}));
         }
@@ -1017,14 +1810,6 @@ fn systemHoverDetail(ui: *Ui, model: *const Model, target: engine.HoverTarget) ?
     };
 }
 
-/// Utilization thresholds for system meters: quiet green until 70%,
-/// amber to 90%, red past it.
-fn sysColor(frac: f64) Color {
-    if (frac >= 0.9) return theme.red;
-    if (frac >= 0.7) return theme.amber;
-    return theme.green;
-}
-
 fn pctInt(frac: f64) u64 {
     return @intFromFloat(std.math.clamp(frac, 0, 1) * 100 + 0.5);
 }
@@ -1043,7 +1828,8 @@ fn fmtBytes(ui: *Ui, bytes: u64) []const u8 {
 pub const needle_command_ids = [_]canvas.ObjectId{ needle_blade_id, needle_edge_id, needle_glow_id };
 
 /// Render animations: the ignition sweep (boot / popover open), the
-/// steady needle sweep between poses, and the redline pulse.
+/// steady needle sweep between poses, the redline pulse, and the live
+/// pips.
 ///
 /// The needle's STATIC pose is already the target; animations only
 /// rotate a delta back to zero about the pivot, so a finished (or
@@ -1143,7 +1929,59 @@ pub fn animations(model: *const Model, tree: *const Ui.Tree, start_ns: u64, out:
         };
         count += 1;
     }
+
+    // Live pips: the header lamp and every running row's dot breathe
+    // while work is in flight. Slower than the redline pulse on purpose
+    // — a heartbeat, not an alarm. The keys must agree with the page the
+    // view is drawing, so this asks the same `mfdPage` the tree did; a
+    // key with no widget this frame simply matches no command, the same
+    // harmless miss `ledFade` relies on.
+    if (!engine.glanceState(model).idle and count < out.len) {
+        out[count] = livePulse(partCommandId(live_lamp_key, 2), start_ns);
+        count += 1;
+        if (mfdPage(model) == .sessions) {
+            var slots: [sessions.max_sessions]*const sessions.Session = undefined;
+            for (model.roster.live(&slots, model.now_ms), 0..) |session, i| {
+                if (count >= out.len) break;
+                if (session.activityAt(model.now_ms) != .running) continue;
+                out[count] = livePulse(partCommandId(sessionPipKey(i), 2), start_ns);
+                count += 1;
+            }
+        } else {
+            const by_agent = model.roster.byAgent(model.now_ms);
+            inline for (@typeInfo(types.Agent).@"enum".fields) |field| {
+                const agent: types.Agent = @enumFromInt(field.value);
+                if (by_agent.get(agent).activity == .running and count < out.len) {
+                    out[count] = livePulse(partCommandId(agentPipKey(agent), 2), start_ns);
+                    count += 1;
+                }
+            }
+        }
+    }
     return count;
+}
+
+/// Pip keys. Agents key by enum ordinal so a row keeps its identity as
+/// the sort moves it; sessions key by display position, offset clear of
+/// the agent block so the two pages can never collide.
+fn agentPipKey(agent: types.Agent) u64 {
+    return activity_key_base + @as(u64, @intCast(@intFromEnum(agent)));
+}
+
+fn sessionPipKey(index: usize) u64 {
+    return activity_key_base + 64 + @as(u64, @intCast(index));
+}
+
+fn livePulse(id: canvas.ObjectId, start_ns: u64) canvas.CanvasRenderAnimation {
+    return .{
+        .id = id,
+        .start_ns = start_ns,
+        .duration_ms = 1_400,
+        .easing = .standard,
+        .from_opacity = 0.45,
+        .to_opacity = 1,
+        .loop = .ping_pong,
+    };
 }
 
 /// One LED's ignition fade: opacity tweens on the dot and glow panels'
@@ -1281,6 +2119,208 @@ fn closePath() canvas.PathElement {
     return .{ .verb = .close };
 }
 
+// ---------------------------------------------------------- trace data
+// Every ring in the model is HEAD-anchored: its newest bucket is
+// wherever the last write left it. A renderer that maps slot to x
+// therefore draws a burst that ended half an hour ago hard against the
+// right edge, under a caption that says "now". These helpers re-anchor
+// each read on `now_ms`, so a ring nobody advanced renders as the
+// silence it represents.
+
+/// Index of the source sample that belongs at output position 0, for a
+/// head-anchored snapshot of `raw_len` buckets re-read as `span_len`
+/// consecutive buckets ENDING at `end_bucket`.
+///
+/// `raw[j]` holds bucket `head - (raw_len-1) + j`; output `i` wants
+/// bucket `end - (span_len-1) + i`; equate and the offset falls out. It
+/// is deliberately signed: an offset below zero means the caller asked
+/// for buckets older than the ring holds, and the per-index bounds check
+/// renders those as the absence they are rather than wrapping into
+/// somebody else's data.
+fn ringOffset(window_start_ms: i64, period_ms: i64, raw_len: usize, span_len: usize, end_bucket: i64) i64 {
+    const head_bucket = @divFloor(window_start_ms, period_ms) + @as(i64, @intCast(raw_len - 1));
+    return end_bucket - head_bucket + @as(i64, @intCast(raw_len)) - @as(i64, @intCast(span_len));
+}
+
+/// `raw[offset + i]`, or null when that index falls outside the ring —
+/// too old to still be held, or newer than anything recorded.
+fn ringAt(comptime T: type, raw: []const T, offset: i64, i: usize) ?T {
+    const src = offset + @as(i64, @intCast(i));
+    if (src < 0 or src >= @as(i64, @intCast(raw.len))) return null;
+    return raw[@intCast(src)];
+}
+
+/// The fleet burn trace: 10-second buckets over 20 minutes on a
+/// square-root scale (0 stays 0, ordering preserved, spikes tamed so one
+/// burst does not flatten the other nineteen minutes).
+fn burnSpark(ui: *Ui, model: *const Model) []const f32 {
+    const scope = &model.agent_burn.scope;
+    var raw: [predict.ScopeTrace.bucket_count]u64 = undefined;
+    _ = scope.snapshot(&raw);
+    // Drop the in-progress bucket: a partial 10 seconds always sits
+    // below trend, which used to make the trace dip at the right edge on
+    // every frame mid-burn.
+    const end_bucket = @divFloor(model.now_ms, predict.ScopeTrace.period_ms) - 1;
+    const out = ui.arena.alloc(f32, raw.len - 1) catch {
+        ui.failed = true;
+        return &.{};
+    };
+    const offset = ringOffset(scope.windowStartMs(), predict.ScopeTrace.period_ms, raw.len, out.len, end_bucket);
+    for (out, 0..) |*value, i| {
+        const tokens = ringAt(u64, &raw, offset, i) orelse 0;
+        value.* = @sqrt(@as(f32, @floatFromInt(tokens)));
+    }
+    return out;
+}
+
+/// One agent's minute buckets for a roster sparkline. `snapshotComplete`
+/// is now-anchored by construction and drops the partial minute.
+fn agentSpark(ui: *Ui, model: *const Model, agent: types.Agent) []const f32 {
+    var raw: [predict.BurnRate.window_minutes]u64 = undefined;
+    const window = model.agent_burn.burnFor(agent).snapshotComplete(model.now_ms, &raw);
+    return sqrtScaled(ui, window);
+}
+
+fn sessionSpark(ui: *Ui, session: *const sessions.Session) []const f32 {
+    var raw: [sessions.burn_buckets]u64 = undefined;
+    return sqrtScaled(ui, session.sparkline(&raw));
+}
+
+fn sqrtScaled(ui: *Ui, values: []const u64) []const f32 {
+    const out = ui.arena.alloc(f32, values.len) catch {
+        ui.failed = true;
+        return &.{};
+    };
+    for (out, values) |*slot, value| slot.* = @sqrt(@as(f32, @floatFromInt(value)));
+    return out;
+}
+
+/// The needle's own history: fleet burn as a percentage of the dial's
+/// full scale, so the scope page's two lanes share one 0-100 domain
+/// instead of pretending tokens and percent are the same unit.
+fn needleTrace(ui: *Ui, model: *const Model, scale_tpm: f64) []const f32 {
+    const scope = &model.agent_burn.scope;
+    var raw: [predict.ScopeTrace.bucket_count]u64 = undefined;
+    _ = scope.snapshot(&raw);
+    const end_bucket = @divFloor(model.now_ms, predict.ScopeTrace.period_ms) - 1;
+    const out = ui.arena.alloc(f32, scope_points) catch {
+        ui.failed = true;
+        return &.{};
+    };
+    const offset = ringOffset(scope.windowStartMs(), predict.ScopeTrace.period_ms, raw.len, out.len, end_bucket);
+    const per_min_factor: f64 = 60_000.0 / @as(f64, @floatFromInt(predict.ScopeTrace.period_ms));
+    for (out, 0..) |*value, i| {
+        const tokens: f64 = @floatFromInt(ringAt(u64, &raw, offset, i) orelse 0);
+        const tpm = tokens * per_min_factor;
+        value.* = @floatCast(std.math.clamp(tpm / @max(scale_tpm, 1) * 100, 0, 100));
+    }
+    return out;
+}
+
+const CpuBand = struct { low: []const f32, high: []const f32 };
+
+/// CPU as a min/max envelope: each 10-second cell of the scope's axis
+/// covers two 5-second samples, and averaging them would erase exactly
+/// the spikes a scope exists to show. Gaps hold the last known level —
+/// a stalled sampler is not the machine going to 0%.
+fn cpuBand(ui: *Ui, model: *const Model) CpuBand {
+    const series = &model.system_history.cpu;
+    const low = ui.arena.alloc(f32, scope_points) catch {
+        ui.failed = true;
+        return .{ .low = &.{}, .high = &.{} };
+    };
+    const high = ui.arena.alloc(f32, scope_points) catch {
+        ui.failed = true;
+        return .{ .low = &.{}, .high = &.{} };
+    };
+    var raw: [engine.SystemHistory.buckets]?f32 = undefined;
+    _ = series.snapshot(&raw);
+    const period = engine.SystemHistory.period_ms;
+    // Two 5 s source samples per 10 s output cell: the span consumed is
+    // twice the plotted width.
+    const offset = ringOffset(series.windowStartMs(), period, raw.len, scope_points * 2, @divFloor(model.now_ms, period));
+
+    var held: f32 = 0;
+    for (0..scope_points) |i| {
+        var lo: f32 = 1e9;
+        var hi: f32 = -1e9;
+        for (0..2) |k| {
+            if (ringAt(?f32, &raw, offset, i * 2 + k) orelse null) |value| {
+                const pct = std.math.clamp(value, 0, 1) * 100;
+                lo = @min(lo, pct);
+                hi = @max(hi, pct);
+                held = pct;
+            }
+        }
+        if (hi < lo) {
+            lo = held;
+            hi = held;
+        }
+        low[i] = lo;
+        high[i] = hi;
+    }
+    return .{ .low = low, .high = high };
+}
+
+/// Five minutes of one telemetry series, now-anchored, with gaps held at
+/// the last known level — a stalled sampler is not the machine dropping
+/// to zero, and a chart that says it is would be the worst kind of lie
+/// on a panel like this.
+const strip_spark_points: usize = 60;
+
+/// What the stored samples MEAN, which decides how they map to the
+/// chart's 0..100 domain. Utilization series are already fractions;
+/// throughput is bytes per second and has no ceiling to divide by.
+const SparkScale = enum { fraction, raw };
+
+fn seriesSpark(ui: *Ui, series: *const engine.SystemHistory.Series, now_ms: i64, scaling: SparkScale) []const f32 {
+    // Nothing recorded yet (the first seconds after launch, or a module
+    // the sampler has never answered for): draw NOTHING. A flat line
+    // along zero under a live "43%" reading is a contradiction the eye
+    // resolves by trusting the picture.
+    if (series.isEmpty()) return &.{};
+    const out = ui.arena.alloc(f32, strip_spark_points) catch {
+        ui.failed = true;
+        return &.{};
+    };
+    var raw: [engine.SystemHistory.buckets]?f32 = undefined;
+    _ = series.snapshot(&raw);
+    const period = engine.SystemHistory.period_ms;
+    const offset = ringOffset(series.windowStartMs(), period, raw.len, out.len, @divFloor(now_ms, period));
+    var held: f32 = 0;
+    for (out, 0..) |*slot, i| {
+        if (ringAt(?f32, &raw, offset, i) orelse null) |value| {
+            held = switch (scaling) {
+                .fraction => std.math.clamp(value, 0, 1) * 100,
+                .raw => @max(value, 0),
+            };
+        }
+        slot.* = held;
+    }
+    return out;
+}
+
+/// The NET cell's trace: rx + tx against the window's own peak, because
+/// throughput has no natural 100% and a fixed denominator would render
+/// every home connection as a flat line at zero.
+fn netSpark(ui: *Ui, hist: *const engine.SystemHistory, now_ms: i64) []const f32 {
+    const rx = seriesSpark(ui, &hist.net_rx, now_ms, .raw);
+    const tx = seriesSpark(ui, &hist.net_tx, now_ms, .raw);
+    const out = ui.arena.alloc(f32, @min(rx.len, tx.len)) catch {
+        ui.failed = true;
+        return &.{};
+    };
+    var peak: f32 = 0;
+    for (out, 0..) |*slot, i| {
+        slot.* = rx[i] + tx[i];
+        peak = @max(peak, slot.*);
+    }
+    if (peak > 0) {
+        for (out) |*slot| slot.* = slot.* / peak * 100;
+    }
+    return out;
+}
+
 // -------------------------------------------------------------- helpers
 
 fn rect(x: f32, y: f32, w: f32, h: f32) geometry.RectF {
@@ -1297,26 +2337,23 @@ fn withAlpha(color: Color, alpha: f32) Color {
     return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a * alpha };
 }
 
-fn zoneColor(frac: f32, red_start: f32, lit: bool) Color {
+fn zoneColor(frac: f32, lit: bool) Color {
     if (frac >= red_start) return if (lit) theme.red else theme.red_dim;
     if (frac >= green_end) return if (lit) theme.amber else theme.amber_dim;
     return if (lit) theme.green else theme.green_dim;
 }
 
-/// Oldest-first tokens-per-minute buckets for the burn trace, on a
-/// square-root scale (0 stays 0, ordering preserved, spikes tamed).
-fn burnSpark(ui: *Ui, model: *const Model) []const f32 {
-    const len = model.burn.buckets.len;
-    const out = ui.arena.alloc(f32, len) catch {
+fn agentInk(agent: types.Agent) Color {
+    return theme.agentInk(@intFromEnum(agent));
+}
+
+fn agentUpper(ui: *Ui, agent: types.Agent) []const u8 {
+    const label = agent.label();
+    const out = ui.arena.alloc(u8, label.len) catch {
         ui.failed = true;
-        return &.{};
+        return label;
     };
-    for (out, 0..) |*value, i| {
-        const back = len - 1 - i;
-        const idx = (model.burn.head + len - back) % len;
-        value.* = @sqrt(@as(f32, @floatFromInt(model.burn.buckets[idx])));
-    }
-    return out;
+    return std.ascii.upperString(out, label);
 }
 
 fn fmtTokens(ui: *Ui, tokens: u64) []const u8 {
