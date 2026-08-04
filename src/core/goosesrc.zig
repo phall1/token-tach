@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const dbgate = @import("dbgate.zig");
 const c = struct {
     pub const sqlite3 = opaque {};
     pub const sqlite3_stmt = opaque {};
@@ -75,51 +76,6 @@ pub fn defaultDbPath(arena: Allocator, env: Env) !?[]const u8 {
 
 // The projection is intentionally explicit. Do not add cost/cost_source or
 // any content-bearing columns.
-// ---------------------------------------------------------------------------
-// Change gate
-// ---------------------------------------------------------------------------
-
-/// Filesystem identity of the database (and its WAL sidecar, where the newest
-/// rows live before a checkpoint). Same idiom as opencode.zig's gate — see the
-/// Wave-2 note there about folding these three into one shared helper.
-const FileStamp = struct {
-    mtime_ns: i96,
-    size: u64,
-
-    fn eql(self: FileStamp, other: FileStamp) bool {
-        return self.mtime_ns == other.mtime_ns and self.size == other.size;
-    }
-};
-
-const DbFingerprint = struct {
-    main: FileStamp,
-    wal: ?FileStamp,
-
-    fn eql(self: DbFingerprint, other: DbFingerprint) bool {
-        if (!self.main.eql(other.main)) return false;
-        if (self.wal == null or other.wal == null) return self.wal == null and other.wal == null;
-        return self.wal.?.eql(other.wal.?);
-    }
-};
-
-/// Two stats, no SQLite. Null means the database is gone or unreadable, which
-/// the caller treats as "nothing to poll" — never as "unchanged".
-fn databaseFingerprint(path: []const u8) ?DbFingerprint {
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    const io = threaded.io();
-    var cwd = std.Io.Dir.cwd();
-    const main = cwd.statFile(io, path, .{}) catch return null;
-    var wal_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const wal_path = std.fmt.bufPrint(&wal_buf, "{s}-wal", .{path}) catch return null;
-    const wal = if (cwd.statFile(io, wal_path, .{})) |stat|
-        FileStamp{ .mtime_ns = stat.mtime.nanoseconds, .size = stat.size }
-    else |_|
-        null;
-    return .{
-        .main = .{ .mtime_ns = main.mtime.nanoseconds, .size = main.size },
-        .wal = wal,
-    };
-}
 
 const ledger_sql: [:0]const u8 =
     "SELECT rowid,session_id,created_timestamp,model," ++
@@ -131,8 +87,9 @@ pub const Poller = struct {
     allocator: Allocator,
     agent: types.Agent,
     last_rowid: i64 = 0,
-    /// Fingerprint of the last database this poller read to completion.
-    last_fingerprint: ?DbFingerprint = null,
+    /// Filesystem change gate — the shared one in dbgate.zig, which owns the
+    /// two ordering rules (stat before open, commit only on SQLITE_DONE).
+    gate: dbgate.Gate = .{},
     /// NUL-terminated copy of the last polled path. `sqlite3_open_v2` needs
     /// one and the path never changes in practice, so duping it on every
     /// 2 s tick was pure churn on the long-lived allocator.
@@ -183,10 +140,7 @@ pub const Poller = struct {
         // Goose only appends, so an untouched file and WAL cannot hold a row
         // past the high-water mark. Two stats beat an open/prepare/step/close
         // on every 2 s tick of an idle session.
-        const fingerprint = databaseFingerprint(path) orelse return;
-        if (self.last_fingerprint) |last| {
-            if (fingerprint.eql(last)) return;
-        }
+        const fingerprint = self.gate.beforeOpen(path) orelse return;
         self.scan_count += 1;
         const zpath = try self.zPathFor(path);
 
@@ -246,7 +200,7 @@ pub const Poller = struct {
         // the gate has to let the next tick retry. `last_rowid` is safe to
         // keep either way: it only ever advances over rows already consumed.
         if (step_result != c.SQLITE_DONE) return;
-        self.last_fingerprint = fingerprint;
+        self.gate.commit(fingerprint);
     }
 };
 

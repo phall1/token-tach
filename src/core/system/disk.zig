@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const clock = @import("clock.zig");
+const cfcache = @import("../cfcache.zig");
 const c = @cImport({
     // IOKitLib.h pulls in <mach/message.h>, whose packed unions translate-c
     // renders opaque; the header's _Static_asserts on their sizes then fail
@@ -201,17 +202,19 @@ fn readIoTotals() ?IoTotals {
 }
 
 /// The `Statistics` dictionary keys this sampler names. An enum with one
-/// cache slot per value, rather than a cache keyed on the literal itself: a
-/// generic keyed on a `[*:0]const u8` comptime argument silently shares one
-/// instantiation across distinct literals, which would hand back the wrong
-/// string — and reading the write counter under the read key is exactly the
-/// kind of bug that looks plausible on a dashboard.
+/// cache slot per value, rather than a cache keyed on the literal itself —
+/// see cfcache.zig for why a `comptime literal` generic silently shares one
+/// instantiation across distinct literals, and why reading the write counter
+/// under the read key is exactly the kind of bug that looks plausible on a
+/// dashboard.
 const Key = enum {
     statistics,
     bytes_read,
     bytes_written,
 
-    fn literal(self: Key) [*:0]const u8 {
+    /// `pub` because the shared cache in cfcache.zig calls it; that is the
+    /// whole contract a `Key` owes the cache.
+    pub fn literal(self: Key) [*:0]const u8 {
         return switch (self) {
             .statistics => c.kIOBlockStorageDriverStatisticsKey,
             .bytes_read => c.kIOBlockStorageDriverStatisticsBytesReadKey,
@@ -220,23 +223,7 @@ const Key = enum {
     }
 };
 
-/// Real `CFStringCreateWithCString` calls made by `cachedString`. One per
-/// `Key` for the life of the process; the tests assert it stops growing.
-var cf_string_creates: std.atomic.Value(usize) = .init(0);
-
-pub fn cfStringCreateCount() usize {
-    return cf_string_creates.load(.monotonic);
-}
-
-/// One immortal CFString per `Key`, 0 until first use.
-///
-/// Relaxed atomics rather than plain vars: the app samples from a dedicated
-/// producer thread while the loop thread keeps a fallback sampler. The
-/// create is idempotent, so the worst a race can do is build one duplicate
-/// immortal string — never hand back a dangling one.
-var key_cache: [@typeInfo(Key).@"enum".fields.len]std.atomic.Value(usize) = @splat(.init(0));
-
-/// The immortal CFString for `key`.
+/// This sampler's slice of the shared immortal-CFString cache.
 ///
 /// The keys were already hoisted out of the per-service loop; this hoists
 /// them out of the tick as well, which is the loop that actually runs
@@ -247,16 +234,15 @@ var key_cache: [@typeInfo(Key).@"enum".fields.len]std.atomic.Value(usize) = @spl
 /// makes reuse safe — nothing else holds a claim on the object, so it cannot
 /// be freed out from under the next sample. The cost is three small objects
 /// for the process lifetime.
-fn cachedString(key: Key) c.CFStringRef {
-    const slot = &key_cache[@intFromEnum(key)];
-    const cached = slot.load(.monotonic);
-    if (cached != 0) return @ptrFromInt(cached);
+const key_strings = cfcache.Cache(Key, c.CFStringRef);
 
-    const created = c.CFStringCreateWithCString(c.kCFAllocatorDefault, key.literal(), c.kCFStringEncodingUTF8);
-    if (created == null) return null;
-    _ = cf_string_creates.fetchAdd(1, .monotonic);
-    slot.store(@intFromPtr(created), .monotonic);
-    return created;
+/// The immortal CFString for `key`. Never release the result.
+const cachedString = key_strings.get;
+
+/// Real `CFStringCreateWithCString` calls made by `cachedString`. One per
+/// `Key` for the life of the process; the tests assert it stops growing.
+pub fn cfStringCreateCount() usize {
+    return key_strings.createCount();
 }
 
 /// Read a u64 counter out of a Statistics dictionary; 0 when the entry is

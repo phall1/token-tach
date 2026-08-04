@@ -147,51 +147,18 @@ pub const name_buf_len: usize = 24;
 // Stable identities
 // ---------------------------------------------------------------------------
 
-/// Agent -> on-disk id. These numbers are the persisted identity of an
-/// agent, exactly as `Agent.label()` is in the statefile: they may be
-/// appended to but MUST NEVER be reordered or reused, or every record
-/// ever written re-attributes itself to a different tool. The switch is
-/// exhaustive on purpose — adding an `Agent` member fails to compile
-/// here until someone assigns it a number.
-///
-/// Wave-2 request: this belongs on `types.Agent` as `storageId()`;
-/// it lives here for now because `types.zig` is owned by another change.
-pub fn agentStorageId(agent: types.Agent) u8 {
-    return switch (agent) {
-        .claude => 1,
-        .codex => 2,
-        .opencode => 3,
-        .pi => 4,
-        .gemini => 5,
-        .qwen => 6,
-        .kimi => 7,
-        .goose => 8,
-        .kilo => 9,
-        .cline => 10,
-        .roo => 11,
-        .copilot => 12,
-        .continue_cli => 13,
-        .droid => 14,
-    };
-}
-
-/// On-disk id -> Agent, or null for an id this build has never heard of
-/// (a record written by a NEWER build, or a removed agent). Callers must
-/// keep such rows: an unrecognized producer is still real spend.
-pub fn agentFromStorageId(id: u8) ?types.Agent {
-    inline for (@typeInfo(types.Agent).@"enum".fields) |field| {
-        const agent: types.Agent = @enumFromInt(field.value);
-        if (agentStorageId(agent) == id) return agent;
-    }
-    return null;
-}
+// The agent <-> on-disk-id mapping lives on `types.Agent` as `storageId()`
+// / `fromStorageId()`, next to `label()` — the statefile's equivalent frozen
+// identity. It is a wire format: append only, never reorder. See types.zig
+// for the exhaustive switch that makes a new `Agent` member a compile error
+// until someone numbers it.
 
 /// Display name for an on-disk agent id. Unknown ids render as
 /// `agent-<n>` rather than being dropped or coerced to some neighbor —
 /// a row nobody can name still belongs in the totals.
 pub fn agentName(id: u8, buf: []u8) []const u8 {
     if (id == synthetic_agent_id) return "synthetic";
-    if (agentFromStorageId(id)) |agent| return agent.label();
+    if (types.Agent.fromStorageId(id)) |agent| return agent.label();
     return std.fmt.bufPrint(buf, "agent-{d}", .{id}) catch "agent-?";
 }
 
@@ -294,7 +261,7 @@ fn dayOfMinute(minute: u32, tz_offset_min: i32) u32 {
 pub const Record = extern struct {
     /// Index in the file's unit (UTC minute/hour, local day).
     bucket: u32 = 0,
-    /// `agentStorageId` value, or `synthetic_agent_id`.
+    /// `types.Agent.storageId()` value, or `synthetic_agent_id`.
     agent: u8 = 0,
     /// `flag_covered` | `flag_delta` | `flag_synthetic`.
     flags: u8 = 0,
@@ -1010,7 +977,7 @@ pub const Writer = struct {
         const session_id = try self.dict.intern(self.io, dict_kind_session, ev.session_id);
 
         const rec = Record{
-            .agent = opts.agent_storage_id orelse agentStorageId(ev.agent),
+            .agent = opts.agent_storage_id orelse ev.agent.storageId(),
             .flags = flags,
             .model_id = model_id,
             .project_id = project_id,
@@ -1457,7 +1424,7 @@ pub const Reader = struct {
         if (filter.project_id != 0 and rec.project_id != filter.project_id) return false;
         if (filter.session_id != 0 and rec.session_id != filter.session_id) return false;
         if (filter.agents) |set| {
-            const agent = agentFromStorageId(rec.agent) orelse return false;
+            const agent = types.Agent.fromStorageId(rec.agent) orelse return false;
             if (!set.contains(agent)) return false;
         }
         return true;
@@ -1822,7 +1789,41 @@ const Tmp = struct {
     }
 };
 
-/// 2026-07-08T12:00:00Z — a round instant to build buckets from.
+/// Suppress an EXPECTED `std.log.warn` for the body of one test.
+///
+/// The warns themselves are correct runtime behavior and stay exactly as
+/// they are: a second writer that cannot take the flock, or a reader that
+/// meets a corrupt header, must say so in a real app's log. The problem is
+/// downstream. Zig's build runner treats any stderr from the test Run step
+/// as failure-shaped output and prints a red `failed command: …` line
+/// directly above `Build Summary: 11/11 steps succeeded`. Exit code 0, the
+/// step genuinely passed — and every reader, human or CI, sees red and
+/// concludes something broke. A gate that cries wolf gets ignored, which is
+/// the actual failure mode this avoids.
+///
+/// The mechanism is `std.testing.log_level`, not a root `std_options`
+/// declaration: in a test build the compilation root is Zig's own
+/// `test_runner.zig`, which already owns `std_options` and gates printing
+/// on this variable. A `pub const std_options` in the app's test file is
+/// never consulted.
+///
+/// Scoped by construction — restore on the way out, so a test that does NOT
+/// expect a warning still surfaces one.
+const QuietWarnings = struct {
+    prior: std.log.Level,
+
+    fn begin() QuietWarnings {
+        const self = QuietWarnings{ .prior = testing.log_level };
+        testing.log_level = .err;
+        return self;
+    }
+
+    fn end(self: QuietWarnings) void {
+        testing.log_level = self.prior;
+    }
+};
+
+/// 2026-07-09T12:00:00Z — a round instant to build buckets from.
 const t0: i64 = 1_783_598_400_000;
 
 fn mkEv(agent: types.Agent, ts: i64, model: []const u8, project: []const u8, out: u64) types.UsageEvent {
@@ -1866,26 +1867,22 @@ test "defaultDir honors XDG_STATE_HOME and falls back to ~/.local/state" {
     try testing.expectEqualStrings("/home/u/.local/state/token-tach/history", unset);
 }
 
-test "agent storage ids are stable, dense, and never collide" {
-    // Reordering types.Agent must not renumber anything already written.
-    try testing.expectEqual(@as(u8, 1), agentStorageId(.claude));
-    try testing.expectEqual(@as(u8, 2), agentStorageId(.codex));
-    try testing.expectEqual(@as(u8, 3), agentStorageId(.opencode));
-    try testing.expectEqual(@as(u8, 14), agentStorageId(.droid));
-
-    var seen = std.AutoHashMap(u8, void).init(testing.allocator);
-    defer seen.deinit();
+test "every on-disk agent id has a name, including ids from newer builds" {
+    // The numbering itself is types.zig's wire format and is asserted
+    // there; what history owns is that no stored byte can come back
+    // nameless. `synthetic_agent_id` must stay outside the agent range or
+    // it would rename a real tool.
     inline for (@typeInfo(types.Agent).@"enum".fields) |field| {
         const agent: types.Agent = @enumFromInt(field.value);
-        const id = agentStorageId(agent);
-        try testing.expect(id != 0 and id != synthetic_agent_id);
-        try testing.expect(!seen.contains(id));
-        try seen.put(id, {});
-        try testing.expectEqual(agent, agentFromStorageId(id).?);
+        const id = agent.storageId();
+        try testing.expect(id != synthetic_agent_id);
+        var buf: [name_buf_len]u8 = undefined;
+        try testing.expectEqualStrings(agent.label(), agentName(id, &buf));
     }
 
-    // An id from a newer build is named, not dropped.
     var buf: [name_buf_len]u8 = undefined;
+    // An id from a newer build is named, not dropped and not coerced to a
+    // neighbor: a row nobody can name still belongs in the totals.
     try testing.expectEqualStrings("agent-200", agentName(200, &buf));
     try testing.expectEqualStrings("synthetic", agentName(synthetic_agent_id, &buf));
     try testing.expectEqualStrings("claude", agentName(1, &buf));
@@ -2326,6 +2323,12 @@ test "days.log reports the offset it was keyed with instead of re-bucketing" {
 }
 
 test "flock contention makes the second writer inert, not corrupting" {
+    // The losing writer logs `history: disabled (…)` — expected, and the
+    // whole point of the test. See QuietWarnings for why it must not reach
+    // the build runner's stderr.
+    const quiet = QuietWarnings.begin();
+    defer quiet.end();
+
     const io = testing.io;
     var tmp = try Tmp.init(io);
     defer tmp.deinit();

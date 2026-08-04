@@ -16,6 +16,8 @@ const testing = std.testing;
 test {
     _ = @import("core/types.zig");
     _ = @import("core/config.zig");
+    _ = @import("core/cfcache.zig");
+    _ = @import("core/dbgate.zig");
     _ = @import("core/claude.zig");
     _ = @import("core/codex.zig");
     _ = @import("core/opencode.zig");

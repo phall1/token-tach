@@ -28,6 +28,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const dbgate = @import("dbgate.zig");
 const c = struct {
     pub const sqlite3 = opaque {};
     pub const sqlite3_stmt = opaque {};
@@ -84,52 +85,6 @@ pub fn defaultDbPath(arena: Allocator, env: Env) !?[]const u8 {
     return try std.fs.path.join(arena, &.{ home, ".local", "share", "kilo", "kilo.db" });
 }
 
-// ---------------------------------------------------------------------------
-// Change gate
-// ---------------------------------------------------------------------------
-
-/// Filesystem identity of the database (and its WAL sidecar, where the newest
-/// rows live before a checkpoint). Same idiom as opencode.zig's gate — see the
-/// Wave-2 note there about folding these three into one shared helper.
-const FileStamp = struct {
-    mtime_ns: i96,
-    size: u64,
-
-    fn eql(self: FileStamp, other: FileStamp) bool {
-        return self.mtime_ns == other.mtime_ns and self.size == other.size;
-    }
-};
-
-const DbFingerprint = struct {
-    main: FileStamp,
-    wal: ?FileStamp,
-
-    fn eql(self: DbFingerprint, other: DbFingerprint) bool {
-        if (!self.main.eql(other.main)) return false;
-        if (self.wal == null or other.wal == null) return self.wal == null and other.wal == null;
-        return self.wal.?.eql(other.wal.?);
-    }
-};
-
-/// Two stats, no SQLite. Null means the database is gone or unreadable, which
-/// the caller treats as "nothing to poll" — never as "unchanged".
-fn databaseFingerprint(path: []const u8) ?DbFingerprint {
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    const io = threaded.io();
-    var cwd = std.Io.Dir.cwd();
-    const main = cwd.statFile(io, path, .{}) catch return null;
-    var wal_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const wal_path = std.fmt.bufPrint(&wal_buf, "{s}-wal", .{path}) catch return null;
-    const wal = if (cwd.statFile(io, wal_path, .{})) |stat|
-        FileStamp{ .mtime_ns = stat.mtime.nanoseconds, .size = stat.size }
-    else |_|
-        null;
-    return .{
-        .main = .{ .mtime_ns = main.mtime.nanoseconds, .size = main.size },
-        .wal = wal,
-    };
-}
-
 // Usage-bearing columns only. `m.data` is parsed in Zig for role/tokens/model
 // fields exclusively; content text is never extracted or copied.
 const message_sql: [:0]const u8 =
@@ -144,8 +99,9 @@ pub const Poller = struct {
     /// Ids already ingested (or classified non-usage) whose time_updated
     /// equals cursor_ms — the ">=" tail window revisits them each poll.
     tail: std.StringHashMapUnmanaged(void) = .empty,
-    /// Fingerprint of the last database this poller read to completion.
-    last_fingerprint: ?DbFingerprint = null,
+    /// Filesystem change gate — the shared one in dbgate.zig, which owns the
+    /// two ordering rules (stat before open, commit only on SQLITE_DONE).
+    gate: dbgate.Gate = .{},
     /// NUL-terminated copy of the last polled path. `sqlite3_open_v2` needs
     /// one and the path never changes in practice, so duping it on every
     /// 2 s tick was pure churn on the long-lived allocator.
@@ -200,10 +156,7 @@ pub const Poller = struct {
         // The `>=` cursor re-reads and re-parses the whole tail window every
         // tick, JSON and all. An untouched file and WAL cannot have grown a
         // row, so two stats replace the entire open/prepare/step/close.
-        const fingerprint = databaseFingerprint(path) orelse return;
-        if (self.last_fingerprint) |last| {
-            if (fingerprint.eql(last)) return;
-        }
+        const fingerprint = self.gate.beforeOpen(path) orelse return;
         self.scan_count += 1;
         const zpath = try self.zPathFor(path);
 
@@ -320,7 +273,7 @@ pub const Poller = struct {
         // above are committed either way — they are the dedup mechanism, and
         // withholding them would re-emit the rows this scan already emitted.
         if (step_result != c.SQLITE_DONE) return;
-        self.last_fingerprint = fingerprint;
+        self.gate.commit(fingerprint);
     }
 
     fn clearTail(self: *Poller) void {
