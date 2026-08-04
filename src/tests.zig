@@ -46,6 +46,7 @@ test {
     _ = @import("core/system/system.zig");
     _ = @import("cli.zig");
     _ = @import("dashboard.zig");
+    _ = @import("hud.zig");
     _ = @import("engine.zig");
 }
 
