@@ -116,6 +116,12 @@ fn containsSemantics(widget: canvas.Widget, needle: []const u8) bool {
     return false;
 }
 
+fn countKind(widget: canvas.Widget, kind: canvas.WidgetKind) usize {
+    var n: usize = if (widget.kind == kind) 1 else 0;
+    for (widget.children) |child| n += countKind(child, kind);
+    return n;
+}
+
 const Layout = struct {
     tree: canvas.WidgetLayoutTree,
 
@@ -217,8 +223,9 @@ test "the instrument cluster binds the engine's structured state" {
     try testing.expect(containsText(tree.root, "wk"));
     // Reset countdown for the 5h window (90 min from now_ms=10min).
     try testing.expect(containsText(tree.root, "1h20m"));
-    // Dial furniture: unit caption and the burn trace caption.
-    try testing.expect(containsText(tree.root, "tok/min ×1000"));
+    // Dial furniture: the scale legend (which carries BOTH endpoints,
+    // since the extreme numerals are not printed) and the trace caption.
+    try testing.expect(containsText(tree.root, "0–10k tok/min"));
     try testing.expect(containsText(tree.root, "BURN · 20 MIN"));
     // The trip meter shares the odometer strip with the all-time count.
     try testing.expect(containsText(tree.root, "TRIP"));
@@ -228,19 +235,28 @@ test "the instrument cluster binds the engine's structured state" {
     try testing.expect(containsText(tree.root, "SCOPE"));
 }
 
-test "the telltale row prints every lamp and lights only what applies" {
+test "the telltale row prints the lamps that qualify the panel and hides the rest" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var model = instrumentedModel();
     const calm = try buildTree(arena, &model);
-    // Unlit lamps still render — the dark glyph is the design.
-    try testing.expect(containsText(calm.root, "RED"));
+    // Three lamps are printed dark always — they are the ones that
+    // qualify what the rest of the panel is claiming.
     try testing.expect(containsText(calm.root, "WALL"));
-    try testing.expect(containsText(calm.root, "ALRT"));
-    try testing.expect(findBySemanticsLabel(calm.root, "redline telltale off") != null);
+    try testing.expect(containsText(calm.root, "STL"));
+    try testing.expect(containsText(calm.root, "SRC"));
     try testing.expect(findBySemanticsLabel(calm.root, "source error telltale off") != null);
+    try testing.expect(findBySemanticsLabel(calm.root, "limit wall projected telltale off") != null);
+    // The conditional lamps are absent entirely at rest: seven cryptic
+    // acronyms competing with the wordmark bought a row of noise to say
+    // nothing, and each of these is already reported elsewhere (the live
+    // lamp for redline, the telemetry strip for load and battery).
+    try testing.expect(findBySemanticsLabel(calm.root, "redline telltale off") == null);
+    try testing.expect(findBySemanticsLabel(calm.root, "machine load telltale off") == null);
+    try testing.expect(findBySemanticsLabel(calm.root, "battery low telltale off") == null);
+    try testing.expect(!containsText(calm.root, "ALRT"));
 
     // A failing source lights SRC; a stale OAuth reading lights STL.
     model.status_error = true;
@@ -248,6 +264,12 @@ test "the telltale row prints every lamp and lights only what applies" {
     const lit = try buildTree(arena, &model);
     try testing.expect(findBySemanticsLabel(lit.root, "source error telltale on") != null);
     try testing.expect(findBySemanticsLabel(lit.root, "stale limit reading telltale on") != null);
+
+    // A lamp that fires appears; it does not merely change colour.
+    model.system_snap = .{ .mem = .{ .used_bytes = 50, .total_bytes = 51, .used_frac = 0.98, .pressure = .critical } };
+    const loaded = try buildTree(arena, &model);
+    try testing.expect(findBySemanticsLabel(loaded.root, "machine load telltale on") != null);
+    try testing.expect(containsText(loaded.root, "LOAD"));
 }
 
 test "the limits region cannot overlap at four claude windows" {
@@ -286,6 +308,98 @@ test "the limits region cannot overlap at four claude windows" {
     // The fleet display starts below the aggregate row, never over it.
     const fleet = laid.frameOfSemanticsPrefix("Fleet display").?;
     try testing.expect(fleet.y >= others.y + others.height);
+}
+
+test "no dial numeral can reach the burn readout" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = instrumentedModel();
+    model.gauge_peak_tpm = 27_500;
+    model.needle_to_deg = engine.needleDeg(27_500, engine.gaugeScaleTpm(27_500));
+    model.needle_from_deg = model.needle_to_deg;
+
+    const tree = try buildTree(arena, &model);
+    var nodes: [max_nodes]canvas.WidgetLayoutNode = undefined;
+    const laid = try layoutTree(&nodes, tree);
+
+    // At a 240° sweep the two extreme graduations land BELOW the pivot,
+    // which is where the readout lives — the shipped panel drew "0
+    // 27.5k 50" as one line of three numbers, with the red full-scale
+    // glyph reading as a redline annotation on the burn rate. Four
+    // numerals are printed, all of them clear above the window.
+    var printed: usize = 0;
+    for (laid.nodes()) |node| {
+        if (!std.mem.startsWith(u8, node.widget.semantics.label, "graduation ")) continue;
+        printed += 1;
+        try testing.expect(node.frame.y + node.frame.height <= view.readout_window.y);
+    }
+    try testing.expectEqual(@as(usize, 4), printed);
+
+    // The endpoints the numerals no longer carry come back as words,
+    // below the window where nothing can be read into the burn number.
+    const legend = laid.frameOfSemanticsPrefix("dial scale").?;
+    try testing.expect(legend.y >= view.readout_window.y + view.readout_window.height);
+    try testing.expect(containsText(tree.root, "0–50k tok/min"));
+}
+
+test "the fleet display fills its panel with one agent burning" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The common case, not the four-agent case: one agent, one session.
+    var model = instrumentedModel();
+    model.now_ms = 60 * 60_000;
+    model.roster.record(.{
+        .agent = .claude,
+        .timestamp_ms = model.now_ms - 30_000,
+        .model = "claude-fable-5",
+        .session_id = "s-alpha",
+        .cwd = "/w/token-tach",
+        .output_tokens = 1_000,
+    }, 0.5);
+    model.agent_burn.addTokens(.claude, model.now_ms - 60_000, 10_000);
+
+    const tree = try buildTree(arena, &model);
+    // The leftover height breaks the selected row down instead of
+    // rendering 190pt of black: its live sessions over a wider trace.
+    try testing.expect(containsText(tree.root, "LIVE SESSIONS"));
+    try testing.expect(containsText(tree.root, "token-tach"));
+    try testing.expect(containsText(tree.root, "claude-fable-5"));
+    try testing.expect(containsText(tree.root, "BURN · 15 MIN"));
+
+    var nodes: [max_nodes]canvas.WidgetLayoutNode = undefined;
+    const laid = try layoutTree(&nodes, tree);
+    const panel = laid.frameOfSemanticsPrefix("Fleet display").?;
+    // Whatever the block drew, it stayed inside the panel.
+    var lowest: f32 = panel.y;
+    for (laid.nodes()) |node| {
+        if (node.frame.x < panel.x or node.frame.x > panel.x + panel.width) continue;
+        if (node.frame.y < panel.y or node.frame.y + node.frame.height > panel.y + panel.height) continue;
+        lowest = @max(lowest, node.frame.y + node.frame.height);
+    }
+    // ...and it reached most of the way down: an MFD that is mostly
+    // black on the common case is worse than a smaller MFD.
+    try testing.expect(lowest >= panel.y + panel.height * 0.85);
+
+    // Four agents leave nothing over, and the block simply is not there.
+    var busy = instrumentedModel();
+    busy.now_ms = 60 * 60_000;
+    for ([_]types.Agent{ .claude, .codex, .opencode, .gemini }, 0..) |agent, i| {
+        busy.roster.record(.{
+            .agent = agent,
+            .timestamp_ms = busy.now_ms - 30_000,
+            .model = "m",
+            .session_id = &[_]u8{ 's', @intCast('a' + i) },
+            .cwd = "/w/p",
+            .output_tokens = 1_000,
+        }, 0.5);
+        busy.agent_burn.addTokens(agent, busy.now_ms - 60_000, 10_000);
+    }
+    const busy_tree = try buildTree(arena, &busy);
+    try testing.expect(!containsText(busy_tree.root, "BURN · 15 MIN"));
 }
 
 test "the burn trace reads empty after a long idle" {
@@ -372,7 +486,7 @@ test "the dial readout cycles through rate, today, trip and eta" {
     {
         const tree = try buildTree(arena, &model);
         try testing.expect(findBySemanticsLabel(tree.root, "cycle readout: rate, today, trip, eta") != null);
-        try testing.expect(containsText(tree.root, "idle"));
+        try testing.expect(containsText(tree.root, "resets 50m"));
     }
 
     // Trip: the since-launch spend and its hourly rate.
@@ -451,9 +565,18 @@ test "telemetry cells trace their own five-minute history" {
     // The same history, half an hour of silence later: the ring was
     // never advanced, and the trace must still scroll to nothing instead
     // of pinning the last sample under the reading.
+    //
+    // "Nothing" is now drawn as nothing. This used to assert
+    // "CPU 60 pts last 0.00" — 60 points of flat zero, because the
+    // sample-and-hold seeded its accumulator at 0 and no bucket in the
+    // window ever overwrote it. A flat line along 0% is not the absence
+    // of a reading, it is a reading of zero, and it is the one claim this
+    // strip must never make about a machine it has not looked at. Same
+    // route as a module the sampler has never answered for.
     model.now_ms += 40 * 60_000;
     const stale = try buildTree(arena, &model);
-    try testing.expect(containsSemantics(stale.root, "CPU 60 pts last 0.00"));
+    try testing.expect(containsSemantics(stale.root, "CPU empty"));
+    try testing.expect(!containsSemantics(stale.root, "CPU 60 pts"));
 }
 
 test "hovering a system cell reveals its full reading in the footer" {
@@ -557,8 +680,12 @@ test "dashboard view exposes hero stats and attribution sections" {
 
     const tree = try buildDashboardTree(arena, &model);
     try testing.expect(containsText(tree.root, "TOKEN TACH / LEDGER"));
-    try testing.expect(containsText(tree.root, "API EQUIVALENT"));
-    try testing.expect(containsText(tree.root, "SUBSCRIPTION VALUE"));
+    // Both KPI labels were shortened ("API EQUIVALENT", "SUBSCRIPTION
+    // VALUE") because neither fit its own card at the 820pt window
+    // floor; dashboard.zig now holds every label and caption on this
+    // row to the narrowest card the floor can produce.
+    try testing.expect(containsText(tree.root, "API EQUIV"));
+    try testing.expect(containsText(tree.root, "PLAN VALUE"));
     try testing.expect(containsText(tree.root, "30-DAY API-EQUIVALENT COST"));
     try testing.expect(containsText(tree.root, "MODELS"));
     try testing.expect(containsText(tree.root, "PROJECTS"));
@@ -605,16 +732,41 @@ test "catch-up renders a scanning treatment instead of confident zeros" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
 
+    const arena = arena_state.allocator();
     var model = instrumentedModel();
     model.claude_limits = null;
     model.codex_limits = null;
     model.catchup_active = true;
+    model.catchup_queue = &.{};
+    model.catchup_next = 0;
     model.status_text = "scanning history… 3/12 files";
-    const tree = try buildTree(arena_state.allocator(), &model);
+    const tree = try buildTree(arena, &model);
 
     // Both the dial readout and the empty agent rows say "scanning…".
     try testing.expect(containsText(tree.root, "scanning…"));
     try testing.expect(!containsText(tree.root, "no sessions found"));
+    // The fleet display says the same thing in its own words rather than
+    // stranding one muted line at the top of a black rectangle.
+    try testing.expect(containsText(tree.root, "reading history"));
+    try testing.expect(containsText(tree.root, "0 of 0 files"));
+
+    var nodes: [max_nodes]canvas.WidgetLayoutNode = undefined;
+    const laid = try layoutTree(&nodes, tree);
+    // The scanning treatment lives INSIDE the readout window — the frame
+    // that makes the burn number an instrument has to hold the "not yet"
+    // state too, or catch-up reads as a rendering failure.
+    // A live spinner is part of that treatment: an indeterminate mark
+    // over a determinate bar is what makes catch-up read as busy rather
+    // than as broken, and a widget kind that silently renders nothing
+    // would leave the well emptier than the dash it replaced.
+    try testing.expect(countKind(tree.root, .spinner) == 1);
+    const scanning = laid.frameOfSemanticsPrefix("readout scanning").?;
+    const window = view.readout_window;
+    try testing.expect(scanning.y >= window.y);
+    try testing.expect(scanning.y + scanning.height <= window.y + window.height);
+    // A frame with no burn recorded must not draw a confident accent
+    // rule across the trace band: the lane goes muted.
+    try testing.expect(containsSemantics(tree.root, "burn 119 pts last 0.00"));
 }
 
 test "stale oauth tags the claude group and mutes its bars" {

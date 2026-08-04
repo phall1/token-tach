@@ -292,13 +292,18 @@ fn arc(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, danger: boo
     // Full-scale legend. Without it the arc is a mood ring: the same
     // sweep means 10k/m on a quiet day and 200k/m during a fleet run,
     // and the engine re-ranges the dial underneath you.
+    //
+    // Phrased as a RANGE, not "fs": view.zig's dial foot prints
+    // "0–50k tok/min" for this exact number, and an instrument that
+    // spells one fact two ways on two surfaces is two instruments.
+    // "fs" also has to be decoded first; "0–" does not.
     const scale = engine.gaugeScaleTpm(model.gauge_peak_tpm);
     push(ui, nodes, ui.text(.{
         .frame = rect(gauge_cx - 40, gauge_cy + 32, 80, 12),
         .size = .sm,
         .text_alignment = .center,
         .style = .{ .foreground = theme.text_faint },
-    }, ui.fmt("fs {s}/m", .{fmtTokens(ui, @intFromFloat(@max(scale, 0)))})));
+    }, ui.fmt("0–{s}/m", .{fmtTokens(ui, @intFromFloat(@max(scale, 0)))})));
 }
 
 /// Seven tapering blocks along the needle's radius, plus the tip halo
