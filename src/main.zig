@@ -72,7 +72,24 @@ const TachApp = native_sdk.UiApp(Model, Msg);
 /// from the model after every dispatch; the runtime patches only what
 /// changed.
 fn statusItem(model: *const Model, scratch: *TachApp.StatusItemScratch) TachApp.StatusItemState {
-    const title = trayfmt.render(&scratch.title_buffer, model.cfg.tray_format, engine.glanceState(model));
+    // The engine already rendered this exact template into `glance_text`
+    // on the refresh that produced the model we are looking at, so
+    // re-rendering it here would repeat a `ledger.today` lookup, a
+    // `nearestWall` scan and a `maxUtilization` scan for a string we
+    // already have. Returned slices may point at the model (the SDK
+    // copies what it keeps).
+    //
+    // The length guard is not decoration: the runtime REJECTS a tray
+    // title over `max_tray_title_bytes`, and rendering into the scratch
+    // buffer was what silently clamped a long `tray-format` to that
+    // bound. `glance_buf` is wider (the popover shows the same line
+    // untruncated), so a long template falls back to the scratch render
+    // and gets exactly the truncation it always got. The other branch is
+    // the pre-first-refresh window, where `glance_text` is still empty.
+    const title = if (model.glance_text.len > 0 and model.glance_text.len <= scratch.title_buffer.len)
+        model.glance_text
+    else
+        trayfmt.render(&scratch.title_buffer, model.cfg.tray_format, engine.glanceState(model));
     scratch.items[0] = .{ .id = 1, .label = model.claude_text, .enabled = false };
     scratch.items[1] = .{ .id = 2, .label = model.codex_text, .enabled = false };
     scratch.items[2] = .{ .id = 3, .label = model.opencode_text, .enabled = false };
@@ -138,10 +155,6 @@ fn tachWindowView(ui: *AppUi, model: *const Model, window_label: []const u8) App
     return ui.panel(.{}, .{});
 }
 
-pub fn initialModel() Model {
-    return .{};
-}
-
 pub fn main(init: std.process.Init) !void {
     if (try cli.maybeRunCli(init)) return;
 
@@ -172,6 +185,10 @@ pub fn main(init: std.process.Init) !void {
         .on_command = onCommand,
     });
     defer app_state.destroy();
+    // Runs before `destroy` (defers unwind LIFO): flush the history store
+    // and release its flock on every way out of here EXCEPT the tray Quit
+    // item, which exits the process from inside `update` and does its own.
+    defer engine.deinit(&app_state.model);
 
     engine.setup(&app_state.model, app_allocator, .{
         .home = init.environ_map.get("HOME") orelse "",
