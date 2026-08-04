@@ -15,13 +15,27 @@
 //! all-zero usage) are skipped. `costUSD` is ignored per plan — cost is
 //! always computed downstream from tokens and pricing tables.
 //!
-//! Ownership: every string inside an emitted `types.UsageEvent` is duped
-//! with the allocator the `Tailer` was initialized with (or, for the free
-//! function `parseLine`, the allocator passed in) and ownership transfers
-//! to the sink consumer — the tailer never frees them. Arena allocators make
-//! this trivial; with a general-purpose allocator, free each event's strings
-//! via `freeUsageEventStrings` (which `ListSink.deinit` does for you when it
-//! shares the tailer's allocator).
+//! Ownership (two allocators, deliberately split — see `tailsource.zig`,
+//! the generic engine this module is the ancestor of):
+//! - The *event allocator* holds everything born and buried inside one
+//!   sweep: the per-line JSON DOM and the strings duped into each emitted
+//!   `types.UsageEvent`. Ownership of those strings transfers to the sink
+//!   consumer — the tailer never frees them. Point it at the caller's
+//!   per-sweep arena and the whole lot dies in one `deinit`; point it at a
+//!   GPA and each event must be freed with `freeUsageEventStrings` (which
+//!   `ListSink.deinit` does for you when the sink shares that allocator).
+//! - The *tailer allocator* (the one `Tailer.init` takes) holds state that
+//!   outlives the sweep by design and is serialized to the statefile: file
+//!   offsets, carry buffers, dir mtimes, the hot list, and the dedup `seen`
+//!   keys. Dedup keys are always re-duped onto it before entering `seen`,
+//!   precisely so a caller-supplied arena can be destroyed without turning
+//!   the dedup set into dangling pointers.
+//!
+//! The `feed`/`scanFile`/`sweep`/`sweepIncremental` entry points use the
+//! tailer allocator for both roles (historical behavior, kept so existing
+//! call sites are untouched); the `...With` variants take the event
+//! allocator explicitly and are the ones new code should call. The free
+//! function `parseLine` uses the allocator passed in.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -55,8 +69,11 @@ pub const EventSink = struct {
 };
 
 /// EventSink adapter that appends into an owned ArrayList.
-/// Initialize it with the SAME allocator as the Tailer feeding it: `deinit`
-/// frees the strings inside each collected event with that allocator.
+/// Initialize it with the SAME allocator the feeding tailer uses for events
+/// — its own for `feed`/`sweep`, the one handed to a `...With` variant
+/// otherwise: `deinit` frees the strings inside each collected event with
+/// that allocator. (When that allocator is the caller's sweep arena, the
+/// frees are redundant but harmless; the arena reclaims everything anyway.)
 pub const ListSink = struct {
     allocator: std.mem.Allocator,
     events: std.ArrayList(types.UsageEvent) = .empty,
@@ -371,17 +388,32 @@ fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
 /// How long the incremental sweep may go without a full tree re-walk.
 /// The safety net for changes invisible to dir mtimes + the hot list
 /// (e.g. an old, cold transcript growing again).
-pub const full_walk_interval_ms: i64 = 30_000;
+///
+/// 10 s, not 30: the fast tick is ~2 s, so this is the worst-case staleness
+/// a user can see on a transcript that fell off the hot list, and 30 s of
+/// a frozen needle reads as a broken app. A full walk is one stat per
+/// *.jsonl plus one per directory — cheap next to the read+parse work it
+/// gates — so paying it 3x as often buys a 3x tighter latency bound.
+pub const full_walk_interval_ms: i64 = 10_000;
 /// How many recently-modified files the incremental sweep stats every tick.
-pub const hot_files_max = 8;
+///
+/// 32, not 8: a single Claude Code session with subagents running writes to
+/// the main transcript plus one file per live subagent, and 8 slots are
+/// exhausted by one busy session — pushing every other project's active
+/// transcript onto the full-walk path, i.e. up to `full_walk_interval_ms`
+/// of invisible growth. 32 stats per tick is still noise against the
+/// syscall budget of one full walk; the hot list only costs stats.
+pub const hot_files_max = 32;
 
 /// Incremental NDJSON tailer with per-file byte offsets, per-file partial-line
 /// carry buffers, and a global message dedup set.
 ///
 /// Lifetime: init with a long-lived allocator; internal state (offsets map,
-/// carry buffers, dedup keys) is freed by `deinit`. Strings inside emitted
-/// events are allocated with the same allocator, but ownership passes to the
-/// sink consumer — `deinit` does NOT free them.
+/// carry buffers, dir mtimes, hot list, dedup keys) is freed by `deinit` and
+/// never borrows from a caller's arena. Strings inside emitted events are
+/// allocated with the event allocator (the tailer's own, unless a `...With`
+/// variant was handed a different one) and ownership passes to the sink
+/// consumer — `deinit` does NOT free them.
 pub const Tailer = struct {
     allocator: std.mem.Allocator,
     files: std.StringHashMapUnmanaged(FileState) = .empty,
@@ -461,7 +493,24 @@ pub const Tailer = struct {
     /// scanFile uses the path). Splits on '\n', parses complete lines, and
     /// buffers a trailing partial line until the next feed for the same key.
     /// Deduplicated events are emitted to `sink` in file order.
+    ///
+    /// Events land on the tailer's own allocator; prefer `feedWith`.
     pub fn feed(self: *Tailer, file_key: []const u8, chunk: []const u8, sink: EventSink) !void {
+        return self.feedWith(self.allocator, file_key, chunk, sink);
+    }
+
+    /// `feed`, with the event allocator named explicitly (the tailsource.zig
+    /// idiom). Only the transient JSON DOM and the emitted events' strings
+    /// come from `event_allocator` — carry buffers and dedup keys stay on
+    /// the tailer's allocator, so passing a per-sweep arena here is safe
+    /// even though `seen` must survive the arena's destruction.
+    pub fn feedWith(
+        self: *Tailer,
+        event_allocator: std.mem.Allocator,
+        file_key: []const u8,
+        chunk: []const u8,
+        sink: EventSink,
+    ) !void {
         const state = try self.fileState(file_key);
         var rest = chunk;
         while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
@@ -469,14 +518,14 @@ pub const Tailer = struct {
             rest = rest[nl + 1 ..];
             if (state.carry.items.len != 0) {
                 try state.carry.appendSlice(self.allocator, segment);
-                try self.processLine(state.carry.items, sink);
+                try self.processLine(event_allocator, state.carry.items, sink);
                 if (state.carry.capacity > carry_shrink_threshold) {
                     state.carry.clearAndFree(self.allocator);
                 } else {
                     state.carry.clearRetainingCapacity();
                 }
             } else {
-                try self.processLine(segment, sink);
+                try self.processLine(event_allocator, segment, sink);
             }
         }
         if (rest.len != 0) try state.carry.appendSlice(self.allocator, rest);
@@ -486,8 +535,25 @@ pub const Tailer = struct {
     /// advance the offset. A shrunken file (rotation/truncation) resets the
     /// offset and carry. A vanished file is silently skipped. `scratch` is
     /// only used for the transient read buffer (arena-friendly).
+    ///
+    /// Events land on the tailer's own allocator; prefer `scanFileWith`.
     pub fn scanFile(
         self: *Tailer,
+        scratch: std.mem.Allocator,
+        io: std.Io,
+        path: []const u8,
+        sink: EventSink,
+    ) !void {
+        return self.scanFileWith(self.allocator, scratch, io, path, sink);
+    }
+
+    /// `scanFile`, with the event allocator named explicitly. tailsource.zig
+    /// folds the two into one arena parameter; this module keeps them apart
+    /// only so the legacy entry points above can stay exact wrappers — new
+    /// callers should pass the same per-sweep arena for both.
+    pub fn scanFileWith(
+        self: *Tailer,
+        event_allocator: std.mem.Allocator,
         scratch: std.mem.Allocator,
         io: std.Io,
         path: []const u8,
@@ -516,7 +582,7 @@ pub const Tailer = struct {
         while (offset < size) {
             const n = try file.readPositionalAll(io, buf, offset);
             if (n == 0) break;
-            try self.feed(path, buf[0..n], sink);
+            try self.feedWith(event_allocator, path, buf[0..n], sink);
             offset += n;
             // Re-fetch: feed may touch the files map (same key, but stay safe
             // against pointer invalidation across hash map operations).
@@ -528,8 +594,22 @@ pub const Tailer = struct {
     /// Recursively find every *.jsonl under each root (which covers the
     /// `<session>/subagents/agent-*.jsonl` trees) and scanFile it. Unreadable
     /// roots and files are skipped, not errors: sweeps race live writers.
+    ///
+    /// Events land on the tailer's own allocator; prefer `sweepWith`.
     pub fn sweep(
         self: *Tailer,
+        scratch: std.mem.Allocator,
+        io: std.Io,
+        roots: []const []const u8,
+        sink: EventSink,
+    ) !void {
+        return self.sweepWith(self.allocator, scratch, io, roots, sink);
+    }
+
+    /// `sweep`, with the event allocator named explicitly.
+    pub fn sweepWith(
+        self: *Tailer,
+        event_allocator: std.mem.Allocator,
         scratch: std.mem.Allocator,
         io: std.Io,
         roots: []const []const u8,
@@ -547,7 +627,7 @@ pub const Tailer = struct {
                 if (!std.mem.endsWith(u8, entry.path, ".jsonl")) continue;
                 const path = try std.fs.path.join(scratch, &.{ root, entry.path });
                 defer scratch.free(path);
-                self.scanFile(scratch, io, path, sink) catch continue;
+                self.scanFileWith(event_allocator, scratch, io, path, sink) catch continue;
             }
         }
     }
@@ -566,8 +646,28 @@ pub const Tailer = struct {
     /// Worst-case detection latency for a change neither pass can see (a
     /// cold, not-hot file growing without any dir change) is one full-walk
     /// interval. Returns true when any new bytes were parsed.
+    ///
+    /// Events land on the tailer's own allocator; prefer
+    /// `sweepIncrementalWith`.
     pub fn sweepIncremental(
         self: *Tailer,
+        scratch: std.mem.Allocator,
+        io: std.Io,
+        roots: []const []const u8,
+        sink: EventSink,
+        now_ms: i64,
+    ) !bool {
+        return self.sweepIncrementalWith(self.allocator, scratch, io, roots, sink, now_ms);
+    }
+
+    /// `sweepIncremental`, with the event allocator named explicitly. This
+    /// is the entry point a per-tick arena belongs on: a cold-start backfill
+    /// parses thousands of lines, and every one of them otherwise charges a
+    /// JSON arena create/destroy plus four string dupes to the long-lived
+    /// allocator.
+    pub fn sweepIncrementalWith(
+        self: *Tailer,
+        event_allocator: std.mem.Allocator,
         scratch: std.mem.Allocator,
         io: std.Io,
         roots: []const []const u8,
@@ -578,8 +678,8 @@ pub const Tailer = struct {
             now_ms - last >= full_walk_interval_ms
         else
             true;
-        if (due or self.dirsChanged(io)) return self.fullWalk(scratch, io, roots, sink, now_ms);
-        return self.hotPass(scratch, io, sink);
+        if (due or self.dirsChanged(io)) return self.fullWalk(event_allocator, scratch, io, roots, sink, now_ms);
+        return self.hotPass(event_allocator, scratch, io, sink);
     }
 
     /// Did any known directory's mtime move since the last full walk?
@@ -596,14 +696,20 @@ pub const Tailer = struct {
 
     /// Stat only the hot files; scan the ones whose size left the stored
     /// offset. Unreadable files are skipped (sweeps race live writers).
-    fn hotPass(self: *Tailer, scratch: std.mem.Allocator, io: std.Io, sink: EventSink) !bool {
+    fn hotPass(
+        self: *Tailer,
+        event_allocator: std.mem.Allocator,
+        scratch: std.mem.Allocator,
+        io: std.Io,
+        sink: EventSink,
+    ) !bool {
         var changed = false;
         var cwd = std.Io.Dir.cwd();
         for (self.inc.hot.items) |*h| {
             const stat = cwd.statFile(io, h.path, .{}) catch continue;
             const known = self.offsetFor(h.path) orelse 0;
             if (stat.size == known) continue;
-            self.scanFile(scratch, io, h.path, sink) catch continue;
+            self.scanFileWith(event_allocator, scratch, io, h.path, sink) catch continue;
             h.mtime_ns = stat.mtime.nanoseconds;
             changed = true;
         }
@@ -615,6 +721,7 @@ pub const Tailer = struct {
     /// ones, and rebuild the dir-mtime map + hot list for the fast path.
     fn fullWalk(
         self: *Tailer,
+        event_allocator: std.mem.Allocator,
         scratch: std.mem.Allocator,
         io: std.Io,
         roots: []const []const u8,
@@ -649,7 +756,7 @@ pub const Tailer = struct {
                         const path = try std.fs.path.join(scratch, &.{ root, entry.path });
                         defer scratch.free(path);
                         if (stat.size != (self.offsetFor(path) orelse 0)) {
-                            self.scanFile(scratch, io, path, sink) catch {};
+                            self.scanFileWith(event_allocator, scratch, io, path, sink) catch {};
                             changed = true;
                         }
                         try insertHot(self.allocator, &next.hot, path, stat.mtime.nanoseconds);
@@ -672,40 +779,62 @@ pub const Tailer = struct {
         return self.files.getPtr(owned).?;
     }
 
-    fn processLine(self: *Tailer, line: []const u8, sink: EventSink) !void {
+    /// Parse one complete line and emit it if it survives dedup.
+    ///
+    /// Ownership split, and it is load-bearing: everything `extractLine`
+    /// produces — the JSON DOM, the event's strings, the message/request ids,
+    /// and the dedup key assembled from them — belongs to `event_allocator`
+    /// and may be freed the moment the caller's sweep arena dies. The `seen`
+    /// entry must outlive that (it is what the statefile serializes), so the
+    /// key is re-duped onto `self.allocator` before it enters the map. That
+    /// dupe is redundant when the two allocators coincide, which is exactly
+    /// the case that used to be the only one — a wasted `strdup` per new
+    /// message is the price of not owning a dangling `seen` set.
+    fn processLine(
+        self: *Tailer,
+        event_allocator: std.mem.Allocator,
+        line: []const u8,
+        sink: EventSink,
+    ) !void {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) return;
-        const ex = extractLine(self.allocator, trimmed) orelse return;
+        const ex = extractLine(event_allocator, trimmed) orelse return;
 
         const key = blk: {
             if (ex.request_id) |rid| {
-                break :blk std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ ex.message_id, rid }) catch |err| {
-                    ex.deinit(self.allocator);
+                break :blk std.fmt.allocPrint(event_allocator, "{s}:{s}", .{ ex.message_id, rid }) catch |err| {
+                    ex.deinit(event_allocator);
                     return err;
                 };
             }
-            break :blk self.allocator.dupe(u8, ex.message_id) catch |err| {
-                ex.deinit(self.allocator);
+            break :blk event_allocator.dupe(u8, ex.message_id) catch |err| {
+                ex.deinit(event_allocator);
                 return err;
             };
         };
-        self.allocator.free(ex.message_id);
-        if (ex.request_id) |rid| self.allocator.free(rid);
+        defer event_allocator.free(key);
+        event_allocator.free(ex.message_id);
+        if (ex.request_id) |rid| event_allocator.free(rid);
 
         const gop = self.seen.getOrPut(self.allocator, key) catch |err| {
-            self.allocator.free(key);
-            freeUsageEventStrings(self.allocator, ex.event);
+            freeUsageEventStrings(event_allocator, ex.event);
             return err;
         };
         if (gop.found_existing) {
-            self.allocator.free(key);
-            freeUsageEventStrings(self.allocator, ex.event);
+            freeUsageEventStrings(event_allocator, ex.event);
             return;
         }
+        // getOrPut parked the borrowed key in the map; replace it with a
+        // long-lived copy before anything can observe (or free) it.
+        gop.key_ptr.* = self.allocator.dupe(u8, key) catch |err| {
+            self.seen.removeByPtr(gop.key_ptr);
+            freeUsageEventStrings(event_allocator, ex.event);
+            return err;
+        };
         // The dedup key is recorded before emitting: if the sink errors the
         // event is dropped rather than risked double-counted on retry.
         sink.emit(ex.event) catch |err| {
-            freeUsageEventStrings(self.allocator, ex.event);
+            freeUsageEventStrings(event_allocator, ex.event);
             return err;
         };
     }
@@ -990,6 +1119,141 @@ test "tailer survives a garbage file and still emits the one valid event" {
     try tailer.feed("garbage.jsonl", garbage_fixture, sink.sink());
     try testing.expectEqual(@as(usize, 1), sink.events.items.len);
     try testing.expectEqual(@as(u64, 13), sink.events.items[0].totalTokens());
+}
+
+test "feedWith on an arena emits exactly what the legacy path emits" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var legacy_tailer = Tailer.init(testing.allocator);
+    defer legacy_tailer.deinit();
+    var legacy = ListSink.init(testing.allocator);
+    defer legacy.deinit();
+    try legacy_tailer.feed("session1.jsonl", session1_fixture, legacy.sink());
+    try legacy_tailer.feed("agent-sub1.jsonl", sub1_fixture, legacy.sink());
+
+    var arena_tailer = Tailer.init(testing.allocator);
+    defer arena_tailer.deinit();
+    var arena_sink = ListSink.init(arena);
+    try arena_tailer.feedWith(arena, "session1.jsonl", session1_fixture, arena_sink.sink());
+    try arena_tailer.feedWith(arena, "agent-sub1.jsonl", sub1_fixture, arena_sink.sink());
+
+    try testing.expectEqual(@as(usize, 10), legacy.events.items.len);
+    try testing.expectEqual(legacy.events.items.len, arena_sink.events.items.len);
+    for (legacy.events.items, arena_sink.events.items) |want, got| {
+        try testing.expectEqual(want.agent, got.agent);
+        try testing.expectEqual(want.timestamp_ms, got.timestamp_ms);
+        try testing.expectEqualStrings(want.model, got.model);
+        try testing.expectEqual(want.input_tokens, got.input_tokens);
+        try testing.expectEqual(want.output_tokens, got.output_tokens);
+        try testing.expectEqual(want.cache_creation_tokens, got.cache_creation_tokens);
+        try testing.expectEqual(want.cache_read_tokens, got.cache_read_tokens);
+        try testing.expectEqualStrings(want.session_id, got.session_id);
+        try testing.expectEqualStrings(want.cwd, got.cwd);
+    }
+}
+
+test "the dedup set outlives the event arena" {
+    // The regression this module must never have again: parse onto a
+    // per-sweep arena, destroy it, and the tailer's `seen` keys (which the
+    // statefile serializes and the next sweep probes) must still be its own
+    // memory. A borrowed key here reads as silently corrupted session data.
+    var tailer = Tailer.init(testing.allocator);
+    defer tailer.deinit();
+
+    {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var sink = ListSink.init(arena);
+        try tailer.feedWith(arena, "session1.jsonl", session1_fixture, sink.sink());
+        try testing.expectEqual(@as(usize, 8), sink.events.items.len);
+    }
+
+    // Touch every key: a dangling slice fails here, under the GPA's
+    // freed-memory poisoning, rather than three sweeps later.
+    try testing.expectEqual(@as(usize, 8), tailer.seen.count());
+    var it = tailer.seen.keyIterator();
+    while (it.next()) |key| try testing.expect(std.mem.startsWith(u8, key.*, "msg_"));
+    try testing.expect(tailer.seen.contains("msg_a0000000000000000000008"));
+
+    // And it still dedups: re-feeding the same bytes on a fresh arena
+    // emits nothing.
+    var arena2_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2_state.deinit();
+    const arena2 = arena2_state.allocator();
+    var sink2 = ListSink.init(arena2);
+    try tailer.feedWith(arena2, "session1.jsonl", session1_fixture, sink2.sink());
+    try testing.expectEqual(@as(usize, 0), sink2.events.items.len);
+    try testing.expectEqual(@as(usize, 8), tailer.seen.count());
+}
+
+test "feedWith degrades gracefully on the garbage fixture" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tailer = Tailer.init(testing.allocator);
+    defer tailer.deinit();
+    var sink = ListSink.init(arena);
+
+    try tailer.feedWith(arena, "garbage.jsonl", garbage_fixture, sink.sink());
+    try testing.expectEqual(@as(usize, 1), sink.events.items.len);
+    try testing.expectEqual(@as(u64, 13), sink.events.items[0].totalTokens());
+}
+
+test "sweepIncrementalWith threads the arena through scan and hot passes" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const slug_dir = "projects/-home-dev-example-project";
+    const session_rel = slug_dir ++ "/" ++ fixture_session_id ++ ".jsonl";
+    try tmp.dir.createDirPath(io, slug_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = session_rel, .data = session1_fixture });
+
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "{s}/projects", .{base});
+    const roots = [_][]const u8{root};
+
+    var tailer = Tailer.init(testing.allocator);
+    defer tailer.deinit();
+
+    var now: i64 = 1_000_000;
+    {
+        // Sweep 1: full walk, everything parsed onto a sweep-scoped arena.
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var sink = ListSink.init(arena);
+        try testing.expect(try tailer.sweepIncrementalWith(arena, arena, io, &roots, sink.sink(), now));
+        try testing.expectEqual(@as(usize, 8), sink.events.items.len);
+    }
+    try testing.expectEqual(@as(usize, 8), tailer.seen.count());
+
+    const appended =
+        "{\"type\":\"assistant\",\"timestamp\":\"2026-07-08T03:05:00.000Z\"," ++
+        "\"requestId\":\"req_inc0000000000000000001\",\"sessionId\":\"" ++ fixture_session_id ++ "\"," ++
+        "\"message\":{\"model\":\"claude-fable-5\",\"id\":\"msg_inc0000000000000000001\"," ++
+        "\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"cache_creation_input_tokens\":0," ++
+        "\"cache_read_input_tokens\":0}}}\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = session_rel, .data = session1_fixture ++ appended });
+
+    // Sweep 2: hot pass, a second arena, offsets and dedup carried across
+    // the first arena's grave.
+    now += sweep_test_tick_ms;
+    var arena2_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2_state.deinit();
+    const arena2 = arena2_state.allocator();
+    var sink2 = ListSink.init(arena2);
+    try testing.expect(try tailer.sweepIncrementalWith(arena2, arena2, io, &roots, sink2.sink(), now));
+    try testing.expectEqual(@as(usize, 1), sink2.events.items.len);
+    try testing.expectEqual(@as(u64, 10), sink2.events.items[0].input_tokens);
+    try testing.expectEqualStrings(fixture_session_id, sink2.events.items[0].session_id);
+    try testing.expectEqual(@as(usize, 9), tailer.seen.count());
 }
 
 test "discoverRoots honors env order, trims entries, dedups, and skips missing dirs" {
