@@ -15,6 +15,7 @@ It points `core.hooksPath` at the tracked `.githooks/`, initializes
 ```sh
 scripts/verify            # check + test + build + headless smoke drive
 scripts/verify --no-smoke # CI-safe subset (no GUI launch)
+native test               # just the tests — the fast inner gate
 native dev                # run with hot-reloading .native markup
 ```
 
@@ -56,26 +57,52 @@ field mirrors the manifest. The build imports the manifest version directly
 for CLI, JSON, and menu consumers, while Native SDK packaging uses it for
 bundle metadata and artifact names.
 
-Why: we carry patches to the macOS host (`src/platform/macos/appkit_host.m`)
-for NSPopover-under-status-item, LSUIElement, and SMAppService — upstream
-PRs pending.
+Currently pinned to **upstream v0.8.0**, on the fork branch
+`phall1/native@token-tach-patches-v0.8.0`. Four patches ride on top:
+
+1. **status-item NSPopover hosting** — an `NSPopover` anchored to the tray
+   item, reparenting the app's Metal surface in and out of an
+   `NSViewController` (`src/platform/macos/appkit_host.m`).
+2. **`app.zon` `.macos.accessory`** — emits `LSUIElement` so the app is
+   menu-bar-only with no Dock icon.
+3. **launch-at-login** — a runtime API over `SMAppService` (macOS 13+).
+4. **render animations anchored to the presenting frame**, not the
+   declarer's stale clock — without it the ignition sweep replays from
+   whatever time the declaring frame happened to carry.
+
+These stay on the fork. Do not open upstream PRs to vercel-labs/native;
+a prior one was withdrawn on explicit instruction. "Patches available on
+request" is the correct posture.
 
 The `native` CLI itself (check/test/build/automate verbs) still comes from
 the vendored fork (`cd vendor/native && zig build cli` -> vendor/native/zig-out/bin/native); scripts/setup builds it. The stock npm CLI cannot parse app.zon's `.macos` key.
 
 ### Rebasing onto a new SDK release
 
+The fork branch carries the upstream version it was rebased onto, so the
+branch that produced any given release is still reachable after the next
+bump:
+
 ```sh
 cd vendor/native
-git fetch https://github.com/vercel-labs/native main
-git rebase FETCH_HEAD          # replay our patches
-cd ../.. && scripts/verify     # prove the world still stands
-(cd vendor/native && zig build cli)   # rebuild the fork CLI
+git fetch upstream                       # https://github.com/vercel-labs/native
+git switch -c token-tach-patches-vX.Y.Z token-tach-patches-<previous>
+git rebase vX.Y.Z                        # replay our four patches onto the tag
+git push origin token-tach-patches-vX.Y.Z
+cd ../.. && scripts/verify               # prove the world still stands
+(cd vendor/native && zig build cli)      # rebuild the fork CLI — required
 git add vendor/native && git commit
 ```
 
+`git -C vendor/native describe --tags` names the upstream tag plus the
+patch count (`v0.8.0-4-g<sha>`), which is the fastest way to confirm what
+the submodule is actually pinned to.
+
 Patches are kept small and mechanical; if a rebase fights back, check
 whether the upstream API for trays/windows changed and fix forward.
+Rebuilding the fork CLI is not optional: the stock npm CLI cannot parse
+`app.zon`'s `.macos` key, and a stale fork CLI will `check` against the
+wrong SDK.
 
 ## Hygiene
 
@@ -105,3 +132,39 @@ costs 100x more to notice. CI runs the same `zig fmt --check` and
 Editor settings are kept honest by `.editorconfig` (4-space Zig, 2-space
 YAML/JSON/Markdown, LF, final newline) and `.gitattributes` (LF
 normalization).
+
+## Local state a dev run touches
+
+Running the app (not the tests) writes two things under
+`$XDG_STATE_HOME/token-tach/` — `~/.local/state/token-tach/` when the
+variable is unset:
+
+- `tailers.json` — the state file (tailer offsets + ledger rollups). A
+  **cache**: deleting it costs one full re-parse and nothing else. Its
+  `format_version` is bumped on every wire change and `restore` demands an
+  exact match, so an older file is declined and the boot path re-derives
+  everything. That is the entire upgrade mechanism; there is no migration
+  code.
+- `history/` — the durable time series (`.lock`, `dict.log`, `hot.ring`,
+  `hours.log`, `days.log`). **Not** a cache: the source transcripts get
+  rotated and deleted out from under us, so this is the only copy. Do not
+  delete it to "reset" something. A single writer holds `.lock` via
+  `flock`; a second instance logs once and runs inert rather than
+  corrupting anything.
+
+Both are 0600 under a 0700 directory. To sandbox a run entirely, point
+`XDG_STATE_HOME` (and `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / …) at a scratch
+tree — that is also how `token-tach --bench` is aimed at a fixture corpus.
+
+Tests never touch either: every history test builds its own `TmpDir`.
+
+## Releasing
+
+Read **docs/DIRECT_RELEASES.md**. The short version: Release Please owns
+`version.txt`, `.release-please-manifest.json`, and the
+`x-release-please-start-version` lines in `app.zon` and `build.zig.zon`,
+and creates the `vX.Y.Z` tag; the `Release` workflow owns the GitHub
+Release and its artifacts. Do not bump a version by hand and do not create
+a `v*` tag — doing either desyncs the four mirrors and produces a tag the
+publisher did not author. `scripts/release --universal` is the local build
+equivalent and publishes nothing.

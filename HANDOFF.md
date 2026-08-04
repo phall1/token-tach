@@ -1,6 +1,31 @@
 # HANDOFF — continuation playbook
 
-## 2026-07-25 addendum (read first)
+## 2026-08-04 addendum (read first — it corrects the ones below)
+
+- **CI is green and required.** The account-wide Actions billing lock
+  recorded in the 2026-07-25 addendum is over; `CI` runs on `macos-15`
+  on every push and PR, and `Release Please` runs on `ubuntu-latest`.
+  Check with `gh run list --limit 5` before believing any claim about
+  CI being down.
+- **Nobody hand-tags any more.** Release Please owns all four version
+  mirrors — `version.txt`, `.release-please-manifest.json`, and the
+  `x-release-please-start-version` lines in `app.zon` and
+  `build.zig.zon`. Creating a `vX.Y.Z` tag by hand desyncs them and
+  produces a tag the release workflow did not author. The current
+  instruction is **docs/DIRECT_RELEASES.md**; cardinal rule 5 below is
+  superseded and marked as such.
+- **Vendored SDK is upstream v0.8.0.** `vendor/native` tracks
+  `phall1/native@token-tach-patches-v0.8.0` and carries four patches on
+  top of upstream `v0.8.0`: status-item NSPopover hosting, `app.zon`
+  `.macos.accessory` (LSUIElement), launch-at-login via `SMAppService`,
+  and render animations anchored to the presenting frame.
+- **Wave 2 landed**: the durable history store
+  (`src/core/history.zig`), the live session roster
+  (`src/core/sessions.zig`), per-agent burn (`predict.AgentBurn`),
+  30 minutes of system telemetry history (`engine.SystemHistory`), the
+  trip odometer, and six CLI query verbs. Statefile is at v5.
+
+## 2026-07-25 addendum
 
 - **v0.6.0 shipped** (collector fleet: 11 zero-config sources). Canonical
   architecture: per-source modules on tailsource/snapsource generic
@@ -12,11 +37,10 @@
   in_progress issues AND `git fetch && git log origin/main` before
   starting work on an open bead — another session may be mid-flight.
   Claim beads with `bd update <id> --status in_progress` first.
-- **GitHub Actions is DOWN account-wide (billing lock)** — CI and the
-  Homebrew tap's poll are dead until the account is unlocked at
-  github.com/settings/billing. v0.6.0 was released manually
-  (scripts/release --universal → gh release create → direct tap cask
-  commit). Re-enable CI verification once billing is fixed.
+- v0.6.0 was released by hand (`scripts/release --universal` →
+  `gh release create` → direct tap cask commit) during an Actions
+  billing lock. That lock is over and that path is no longer the
+  release flow — see the 2026-08-04 addendum.
 
 ---
 
@@ -47,9 +71,13 @@ patches as reports.
 4. Commit style: conventional, `Co-Authored-By:` trailer per repo history.
    Push to main is authorized. Beads (`bd`) is the issue tracker — close
    issues with `--reason`, file follow-ups.
-5. The release flow: bump app.zon version → `scripts/release` → verify the
-   "launch check (cwd=/)" passes → `git tag vX.Y.Z` → push tag →
-   `gh release create vX.Y.Z zig-out/package/token-tach-X.Y.Z-*.dmg`.
+5. ~~The release flow: bump app.zon version → `scripts/release` → ...~~
+   **SUPERSEDED.** Release Please owns every version mirror and creates
+   the tag; the `Release` workflow owns the GitHub Release and its
+   artifacts. Do not bump a version by hand and do not create a `v*`
+   tag. Read **docs/DIRECT_RELEASES.md** — that is the current flow.
+   `scripts/release --universal` remains useful as a *local* build
+   equivalent, but it does not publish anything.
 
 ## In-flight subagents (their deliverables)
 

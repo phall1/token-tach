@@ -6,8 +6,15 @@ known coding-harness storage locations without modifying them. The bar is
 usage, Token Tach reports the gap instead of estimating.
 
 `token-tach --json` carries the live answer in `coverage`: per source,
-whether it is enabled in config, whether its data location exists on this
-machine, and how many events it has contributed.
+whether it is enabled in config (`enabled`), whether its data location
+exists on this machine (`detected`; `null` means no collector probes it
+yet), how many events it has contributed (`events`), and the span the
+durable history store has seen it over (`first_seen_ms` / `last_seen_ms`).
+
+Those two are UTC hour-bucket **start** instants, at hour resolution — the
+durable record keeps buckets, not timestamps — and are `null` for a source
+the store has never seen. `token-tach top --dim agent --since 30d` is the
+same question asked with numbers attached.
 
 ## Automatic sources (shipped)
 
@@ -33,22 +40,29 @@ Environment overrides are honored per harness: `CLAUDE_CONFIG_DIR`,
 ## Pending reconciliation
 
 Two independent format-research passes reached conflicting conclusions for
-these sources, so their collectors are held back (enum-reserved, config-
-recognized, zero counters) until the formats are re-verified against real
-data — exact-only is the bar:
+these sources, so their collectors are held back until the formats are
+re-verified against real data — exact-only is the bar. All three hold a
+reserved `types.Agent` slot (`copilot`, `continue_cli`, `droid`), are
+recognized in the `source` config key, and report zero counters:
 
 | Source | Contested question |
 |---|---|
 | GitHub Copilot CLI | usage rows in `session-store.db` vs cumulative `session.shutdown` events in `events.jsonl` |
 | Continue CLI | mutable session-cumulative totals with an estimation fallback when the API omits usage |
 | Factory Droid | sidecar `settings.json` aggregate vs per-call JSONL |
-| Grok Build | whether `updates.jsonl`/`signals.json` persist billable usage at all |
+
+Grok Build has **no** reserved slot: the research never established that
+it persists billable usage at all (`updates.jsonl` / `signals.json` were
+the candidates), so reserving an identity for it would have been an
+assumption the enum is not allowed to make. It sits in the gaps table
+below instead.
 
 ## Honest gaps
 
 | Surface | Status | Why automatic exact history is unavailable |
 |---|---|---|
 | Cursor | unsupported | Local chat/session state has no verified durable exact-token ledger |
+| Grok Build | unsupported | No verified durable record of billable usage; `updates.jsonl`/`signals.json` did not reconcile across two research passes |
 | Windsurf | unsupported | Local state has no verified durable exact-token ledger |
 | Aider | needs setup | Exact response usage is not persisted by default |
 | Amp | needs setup | Runtime usage is exposed, but no default durable ledger is documented |
@@ -61,3 +75,23 @@ Provider admin APIs and gateways can reconcile organization-level usage, but
 they require credentials, account selection, or prior traffic routing. They
 cannot be zero-config and are intentionally separate from the automatic local
 story.
+
+## Coverage in time, not just in sources
+
+Every surface above is a *harness*, and every harness rotates and deletes
+its own transcripts on its own schedule. So "supported" used to have an
+unstated expiry: the app could only tell you about usage the harness still
+happened to be keeping.
+
+The durable history store fixes that half of the problem. Once an event
+has been read once, it is recorded in
+`$XDG_STATE_HOME/token-tach/history/` and stays there whether or not the
+harness keeps its side. On first launch the store is seeded by one
+catch-up pass over whatever the harnesses currently hold — so a machine's
+coverage *begins* at the oldest transcript still on disk, and is complete
+from there forward. `token-tach doctor --history` reports exactly where
+that boundary is; `coverage[].first_seen_ms` reports it per source.
+
+This makes the store the only copy of anything older than the harnesses'
+own retention, which is why it is quarantined rather than deleted on
+corruption, and why the README discloses it as a write.
