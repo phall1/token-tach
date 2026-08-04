@@ -25,6 +25,20 @@
 //! Per-agent totals ARE range-scoped, but only out of `per_hour`,
 //! which retains 14 local days; spans wider than that fall back to the
 //! lifetime split and say so in the tag.
+//!
+//! SIX NUMBERED SECTIONS, 01 THROUGH 06. The KPI strip used to be the
+//! one unnumbered band on a page whose other five panels all carried an
+//! index, which reads as an omission rather than a hierarchy. It is
+//! section 01 now and carries the month line that used to crowd the
+//! title bar.
+//!
+//! HEIGHTS: TWO FIXED BANDS, TWO ELASTIC ONES. `01` and `06` are
+//! readouts — a label, a number and a trace each — so their height is a
+//! constant. The chart/fleet split and the two tables are *lists*, and
+//! lists want whatever is left, so they share the remainder by weight.
+//! That is what keeps the window honest between its 560pt floor and a
+//! full-screen desktop instead of pinning 400pt of tables under a
+//! squeezed chart.
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
@@ -47,22 +61,41 @@ pub const Ui = canvas.Ui(Msg);
 pub const window_label = "dashboard";
 pub const canvas_label = "dashboard-canvas";
 pub const window_width: f32 = 960;
-pub const window_height: f32 = 700;
+/// Six bands need more than 700pt: at that height the machine strip
+/// could only be paid for out of the chart, which is the panel that
+/// earns the window. 800 still clears a 900pt-tall laptop screen with
+/// the menu bar and title bar taken out, and everything below `header`
+/// flexes anyway (see `split_weight` / `table_weight`), so the declared
+/// 560pt floor composes too.
+pub const window_height: f32 = 800;
 
 const pad: f32 = 18;
 const gap: f32 = 12;
 const card_pad: f32 = 13;
+
+/// How the two elastic bands divide whatever the fixed ones leave. The
+/// chart/fleet split leads because it carries the page's headline
+/// reading; the tables trail because they scroll and a short table is
+/// still a usable table.
+const split_weight: f32 = 1.65;
+const table_weight: f32 = 1.15;
 
 const agent_count = @typeInfo(types.Agent).@"enum".fields.len;
 
 // ------------------------------------------------------- node budgeting
 // The SDK fails a frame at RUNTIME past 1024 widget nodes per view, so
 // every unbounded list here is bounded HERE, next to the reason, rather
-// than discovered as a blank window. Worst case with all 14 agents
-// present and both tables saturated is ~570 nodes (a typical panel is
-// ~135); the caps exist so that number cannot grow with the user's
-// history. Chart budgets are comfortable too: 9 series, ~1.6k points,
-// no anchored surfaces and no loop animations.
+// than discovered as a blank window. Measured on the saturated frame
+// the budget test builds — all 14 agents, both tables past their caps,
+// a full roster, every telemetry lane live — the window costs 591 nodes
+// / 798 draw commands / 1314 chart path elements against 1024 / 2048 /
+// 2048. The caps exist so those numbers cannot grow with the user's
+// history. No anchored surfaces and no loop animations.
+//
+// THE PATH-ELEMENT BUDGET IS THE TIGHT ONE, and it is the machine
+// strip's: a filled line series costs `2n + 3` elements, so six lanes
+// alone would blow it at the SDK's 256-point downsample ceiling. See
+// `lane_points`.
 //
 // Rows past a cap are never dropped silently — that was the old
 // panel's real bug. Each capped list renders a "+N more" line carrying
@@ -269,15 +302,15 @@ pub fn rootView(ui: *Ui, model: *const Model) Ui.Node {
         .style = .{ .background = theme.bg, .radius = 0 },
         .semantics = .{ .label = "Token Tach dashboard" },
     }, .{
-        header(ui, model, &frame),
-        kpiRow(ui, model, &frame),
+        header(ui, model),
+        kpiSection(ui, model, &frame),
         mainSplit(ui, model, &frame),
         detailRow(ui, model),
         systemRow(ui, model),
     });
 }
 
-fn header(ui: *Ui, model: *const Model, frame: *const Frame) Ui.Node {
+fn header(ui: *Ui, model: *const Model) Ui.Node {
     return ui.row(.{ .height = 30, .gap = 10, .cross = .center }, .{
         ui.paragraph(.{
             .semantics = .{ .label = "Token Tach history dashboard" },
@@ -286,16 +319,7 @@ fn header(ui: *Ui, model: *const Model, frame: *const Frame) Ui.Node {
             .{ .text = " TACH", .weight = .bold, .monospace = true, .scale = 1.3, .color = .accent },
             .{ .text = " / LEDGER", .weight = .medium, .monospace = true, .scale = 1.0, .color = .text_muted },
         }),
-        ui.text(.{
-            .grow = 1,
-            .size = .sm,
-            .text_alignment = .end,
-            .style_tokens = .{ .foreground = .text_muted },
-        }, ui.fmt("{s} {d} · {d} active days", .{
-            monthName(frame.month.month),
-            frame.month.year,
-            frame.month.active_days,
-        })),
+        ui.spacer(1),
         rangeControl(ui, model),
     });
 }
@@ -324,8 +348,30 @@ fn rangeControl(ui: *Ui, model: *const Model) Ui.Node {
 
 // ------------------------------------------------------------- KPI row
 
+/// Section 01. The five cards are five different time bases on purpose
+/// — that is what the per-card tags are for — so the band's own caption
+/// claims no scope of its own; it carries the calendar context the
+/// title bar used to have to squeeze in.
+fn kpiSection(ui: *Ui, model: *const Model, frame: *const Frame) Ui.Node {
+    return ui.column(.{ .gap = 6 }, .{
+        ui.row(.{ .height = 15, .gap = 8, .cross = .center }, .{
+            ui.text(.{ .grow = 1, .style_tokens = .{ .foreground = .text_muted } }, "01 / SUMMARY"),
+            ui.text(.{
+                .size = .sm,
+                .text_alignment = .end,
+                .style_tokens = .{ .foreground = .text_muted },
+            }, ui.fmt("{s} {d} · {d} active days", .{
+                monthName(frame.month.month),
+                frame.month.year,
+                frame.month.active_days,
+            })),
+        }),
+        kpiRow(ui, model, frame),
+    });
+}
+
 fn kpiRow(ui: *Ui, model: *const Model, frame: *const Frame) Ui.Node {
-    return ui.row(.{ .height = 104, .gap = gap }, .{
+    return ui.row(.{ .height = 112, .gap = gap }, .{
         costCard(ui, frame),
         tokensCard(ui, frame),
         burnCard(ui, model),
@@ -340,7 +386,7 @@ fn costCard(ui: *Ui, frame: *const Frame) Ui.Node {
         .min_width = 130,
         .semantics = .{ .label = "API-equivalent cost over the selected range" },
     }, .{
-        kpiLabel(ui, "API EQUIVALENT", frame.scope.tag),
+        kpiLabel(ui, "API EQUIV", frame.scope.tag),
         kpiValue(ui, fmtCost(ui, frame.totals.cost_usd), theme.green),
         sparkline(ui, frame.cost, .accent, "range cost sparkline"),
     });
@@ -352,7 +398,7 @@ fn tokensCard(ui: *Ui, frame: *const Frame) Ui.Node {
         .min_width = 130,
         .semantics = .{ .label = "Tokens processed over the selected range" },
     }, .{
-        kpiLabel(ui, "TOKENS PROCESSED", frame.scope.tag),
+        kpiLabel(ui, "TOKENS", frame.scope.tag),
         kpiValue(ui, fmtTokens(ui, frame.totals.totalTokens()), theme.cluster_colors.text),
         sparkline(ui, frame.tokens, .text_muted, "range token sparkline"),
     });
@@ -365,8 +411,19 @@ fn burnCard(ui: *Ui, model: *const Model) Ui.Node {
     const hot = model.agent_burn.hottest(model.now_ms);
     const tpm = model.agent_burn.totalPerMin(model.now_ms);
     const ink = if (hot) |h| theme.agentInk(@intFromEnum(h.agent)) else theme.text_faint;
+    // The caption names WHO, and must not restate WHAT. It used to print
+    // the hottest agent's rate — but the value above it is the fleet
+    // total, and with one live agent (the overwhelmingly common case, and
+    // the case in every screenshot ever taken of this card) those two are
+    // the same number rendered 8pt apart. Share says the same thing about
+    // dominance without echoing: "82% of fleet" when others are running,
+    // "100% of fleet" when this agent IS the reading above.
+    // "hottest: <agent>" is 17 characters at the longest agent label
+    // ("opencode"/"continue") and clears the 121.2pt floor box that the
+    // fits-its-own-card test enforces; a share ("· 100% of fleet") does
+    // not, by 29pt. The word costs nothing now that the rate is gone.
     const caption = if (hot) |h|
-        ui.fmt("{s} hottest · {s}/m", .{ h.agent.label(), fmtTokens(ui, @intFromFloat(@max(h.tokens_per_min, 0))) })
+        ui.fmt("hottest: {s}", .{h.agent.label()})
     else
         "fleet idle";
     return card(ui, .{
@@ -401,7 +458,7 @@ fn tripCard(ui: *Ui, model: *const Model) Ui.Node {
         },
         .semantics = .{ .label = "Trip odometer since launch" },
     }, .{
-        kpiLabel(ui, "TRIP", "SINCE LAUNCH"),
+        kpiLabel(ui, "TRIP", "LAUNCH"),
         kpiValue(ui, fmtCost(ui, model.trip.cost_usd), theme.trip),
         ui.text(.{
             .size = .sm,
@@ -421,31 +478,38 @@ fn planCard(ui: *Ui, frame: *const Frame) Ui.Node {
         "unknown"
     else
         "no plan";
-    // This is the only KPI caption long enough to wrap, and the card is
-    // sized by its siblings — whose captions are one line — so the third
-    // line the old prose needed had nowhere to go and got sheared off
-    // mid-glyph ("plans"). The layout audit missed it because the seeded
-    // test model has no recognized plan and never took this branch.
-    //
-    // Two lines is the hard budget, and the band ("$300.00–$400.00/mo")
-    // is one unbreakable ~18-glyph token that must own the second line
-    // by itself. So the prose ahead of it gets exactly one line's worth,
-    // and "of plans" goes: "/mo" already says these are plan rates, and
-    // the card is titled SUBSCRIPTION VALUE.
+    // NO WRAPPING CAPTION ANYWHERE ON THIS ROW, and the cents are why.
+    // This was the one caption long enough to need two lines, the cards
+    // are sized by a row height their siblings' one-liners set, and the
+    // second line spilled past the card's bottom border — which the
+    // layout audit cannot see (the tree is internally consistent; the
+    // shear happens at paint). Dropping the cents off a plan PRICE BAND
+    // — a number that is $200.00 or $300.00–$400.00 and never anything
+    // between — takes "API-equiv vs $300.00–$400.00/mo" down to
+    // "vs $300–400/mo", which fits one line inside the narrowest card
+    // the 820pt floor can produce. The "every KPI and machine label
+    // fits its own card" test holds this whole row to that.
     const caption = if (value.plan_hi_usd > 0)
-        ui.fmt("API-equiv vs {s}/mo", .{planBand(ui, value)})
+        ui.fmt("vs {s}/mo", .{planBand(ui, value)})
     else
-        "no recognizable paid plan yet";
+        "no paid plan detected";
     return card(ui, .{
         .grow = 1,
         .min_width = 150,
         .semantics = .{ .label = "Subscription value, month to date" },
     }, .{
-        kpiLabel(ui, "SUBSCRIPTION VALUE", "MTD"),
-        kpiValue(ui, multiple, if (value.incomplete) theme.amber else theme.needle),
+        kpiLabel(ui, "PLAN VALUE", "MTD"),
+        // Green, not the needle ink. A subscription multiple above 1x is
+        // the one number on this row that is unambiguously GOOD news —
+        // you are getting more API-equivalent value than you pay for.
+        // Inking it signal-orange put three of the five summary cards in
+        // warning colours and made "you are winning" read as an alarm.
+        // Amber stays reserved for `incomplete`, where the plan tier is
+        // unknown and the multiple is therefore only a lower bound.
+        kpiValue(ui, multiple, if (value.incomplete) theme.amber else theme.green),
         ui.text(.{
             .size = .sm,
-            .wrap = true,
+            .wrap = false,
             .style_tokens = .{ .foreground = .text_muted },
         }, caption),
     });
@@ -485,7 +549,7 @@ fn sparkline(ui: *Ui, values: []const f32, ink: canvas.ChartSeriesColor, label: 
 // --------------------------------------------------- chart + fleet pane
 
 fn mainSplit(ui: *Ui, model: *const Model, frame: *const Frame) Ui.Node {
-    return ui.split(.{ .grow = 1, .value = 0.62 }, .{
+    return ui.split(.{ .grow = split_weight, .value = 0.62 }, .{
         chartCard(ui, model, frame),
         fleetCard(ui, model, frame),
     });
@@ -595,18 +659,60 @@ fn fleetCard(ui: *Ui, model: *const Model, frame: *const Frame) Ui.Node {
     return card(ui, .{
         .grow = 1,
         .min_width = 250,
+        .gap = 6,
         .semantics = .{ .label = "Fleet attribution" },
     }, .{
-        ui.row(.{ .height = 20, .gap = 8, .cross = .center }, .{
-            ui.text(.{ .grow = 1, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("03 / FLEET · {s}", .{tag})),
-            ui.el(.tabs, .{ .gap = 2, .semantics = .{ .label = "Fleet pane" } }, pane_nodes),
+        // Title and rail are ONE block on a 4pt gap: the rail is the
+        // header's reading, not a third sibling, and every point spent
+        // separating them came out of the roster below.
+        ui.column(.{ .gap = 4 }, .{
+            ui.row(.{ .height = 20, .gap = 8, .cross = .center }, .{
+                ui.text(.{ .grow = 1, .style_tokens = .{ .foreground = .text_muted } }, ui.fmt("03 / FLEET · {s}", .{tag})),
+                ui.el(.tabs, .{ .gap = 2, .semantics = .{ .label = "Fleet pane" } }, pane_nodes),
+            }),
+            attributionRail(ui, frame),
         }),
-        attributionRail(ui, frame),
         ui.scroll(.{ .grow = 1 }, ui.column(
             .{ .gap = 4 },
             if (sessions_pane) sessionRows(ui, model) else agentRows(ui, model, frame),
         )),
+        fleetFoot(ui, model, frame, sessions_pane),
     });
+}
+
+/// The pane's closing rule. Two jobs, and the second is why it exists:
+/// it reconciles (the roster shows a ranked few, this counts all of
+/// them), and it ANCHORS THE BOTTOM EDGE. A scroll region whose content
+/// runs out mid-card leaves a hole that reads as an unfinished panel —
+/// the same failure the popover MFD had — and the chart card beside
+/// this one has carried a footer line all along, so the split was
+/// visually lopsided as well.
+fn fleetFoot(ui: *Ui, model: *const Model, frame: *const Frame, sessions_pane: bool) Ui.Node {
+    var buffer: [sessions_mod.max_sessions]*const sessions_mod.Session = undefined;
+    const live = model.roster.live(&buffer, model.now_ms);
+    var running: usize = 0;
+    for (live) |session| {
+        if (session.isRunning(model.now_ms)) running += 1;
+    }
+    const text = if (sessions_pane)
+        ui.fmt("{d} live · {d} running · {d} seen", .{ live.len, running, model.roster.count() })
+    else blk: {
+        var storage: [agent_count]AgentRow = undefined;
+        const ranked = rankAgents(frame, &storage);
+        var total: f64 = 0;
+        for (ranked) |row| total += row.totals.cost_usd;
+        break :blk ui.fmt("{d} agents · {d} live · {s} {s}", .{
+            ranked.len,
+            live.len,
+            fmtCost(ui, total),
+            if (frame.agents_scoped) frame.scope.tag else "all-time",
+        });
+    };
+    return ui.text(.{
+        .height = 14,
+        .size = .sm,
+        .style = .{ .foreground = theme.text_faint },
+    }, text);
 }
 
 /// The stacked-by-agent reading, drawn by hand rather than as a chart
@@ -702,8 +808,8 @@ fn agentRows(ui: *Ui, model: *const Model, frame: *const Frame) []const Ui.Node 
         const share = if (total > 0) row.totals.cost_usd / total else 0;
         nodes[i] = ui.column(.{
             .key = .{ .int = ordinal },
-            .gap = 4,
-            .padding = 4,
+            .gap = 2,
+            .padding = 2,
             .style = .{
                 .background = if (selected) theme.panel_raised else theme.transparent,
                 .radius = 4,
@@ -717,7 +823,7 @@ fn agentRows(ui: *Ui, model: *const Model, frame: *const Frame) []const Ui.Node 
                 .focusable = true,
             },
         }, .{
-            ui.row(.{ .gap = 6, .cross = .center }, .{
+            ui.row(.{ .height = 17, .gap = 6, .cross = .center }, .{
                 ui.panel(.{ .width = 6, .height = 6, .style = .{ .background = ink, .radius = 3 } }, .{}),
                 ui.text(.{ .grow = 1, .style_tokens = .{ .foreground = .text } }, upperLabel(ui, row.agent)),
                 ui.text(.{
@@ -734,6 +840,20 @@ fn agentRows(ui: *Ui, model: *const Model, frame: *const Frame) []const Ui.Node 
                 }, fmtCost(ui, row.totals.cost_usd)),
             }),
             shareBar(ui, share, ink),
+            // The third register. A roster row that is a name, a rate
+            // and a total is four data points thick and 30pt tall, and
+            // four of those in a 180pt pane is the ~90pt of dead air
+            // this card shipped with. Share, volume and call count are
+            // already in `Totals` — the row was throwing them away.
+            ui.text(.{
+                .height = 12,
+                .size = .sm,
+                .style = .{ .foreground = theme.text_faint },
+            }, ui.fmt("{d:.0}% share · {s} · {s} calls", .{
+                share * 100,
+                fmtTokens(ui, row.totals.totalTokens()),
+                fmtTokens(ui, row.totals.events),
+            })),
         });
     }
     return nodes;
@@ -786,7 +906,7 @@ fn sessionRows(ui: *Ui, model: *const Model) []const Ui.Node {
         nodes[i] = ui.column(.{
             .key = .{ .str = session.sessionId() },
             .gap = 2,
-            .padding = 4,
+            .padding = 2,
             .style = .{
                 .background = if (model.ux.selected_row == i) theme.panel_raised else theme.transparent,
                 .radius = 4,
@@ -846,7 +966,7 @@ fn overflowNote(ui: *Ui, more: usize, rest_cost: f64) Ui.Node {
 // -------------------------------------------------------- detail tables
 
 fn detailRow(ui: *Ui, model: *const Model) Ui.Node {
-    return ui.row(.{ .height = 196, .gap = gap }, .{
+    return ui.row(.{ .grow = table_weight, .gap = gap }, .{
         keyedTable(ui, model, "04 / MODELS", model.ledger.per_model.keys(), model.ledger.per_model.values(), false),
         keyedTable(ui, model, "05 / PROJECTS", model.ledger.per_project.keys(), model.ledger.per_project.values(), true),
     });
@@ -1005,32 +1125,62 @@ fn sortedRows(
 
 // ---------------------------------------------------------- system row
 
-/// The machine over the last 30 minutes. Every system meter in this app
-/// draws a bar of NOW; `model.system_history` is the same readings on a
-/// wall clock, which is what makes the "system monitor" claim true.
+/// Section 06: the machine over the last half hour. Every system meter
+/// elsewhere in this app draws a bar of NOW; `model.system_history` is
+/// the same readings on a wall clock, and this strip is the only place
+/// the app makes good on "system monitor" rather than "system gauge".
+///
+/// THE OLD STRIP WAS AN AFTERTHOUGHT and read as one: 78pt of card
+/// holding four labels, four readings shoved to the far right of their
+/// cells with a hand's width of nothing between, and four traces 17pt
+/// tall — a sliver that cannot show a shape, which is the entire reason
+/// to keep thirty minutes of samples. What changed:
+///
+///   - The trace gets the height. A lane is a label, a reading and a
+///     plot, and the plot is now the tallest thing in it.
+///   - Label and reading are ONE unit, set left, in the two registers
+///     the cluster uses everywhere else: proportional muted for the
+///     name, monospace bold for the number. Nothing is pushed right; the
+///     trace under them spans the lane and does the spanning.
+///   - Six channels, not four. `SystemHistory` has always recorded net
+///     and battery and this panel ignored both, so a laptop on battery
+///     during a long agent run — the exact situation the panel exists
+///     for — had nothing to say about either.
 fn systemRow(ui: *Ui, model: *const Model) Ui.Node {
-    var cells: [5]Ui.Node = undefined;
+    var cells: [6]Ui.Node = undefined;
     var count: usize = 0;
     const history = &model.system_history;
 
     if (!history.cpu.isEmpty()) {
-        cells[count] = systemCell(ui, "CPU", &history.cpu, 1, theme.loadZone(fractionOf(&history.cpu)), true);
+        cells[count] = percentLane(ui, "CPU", &history.cpu, theme.loadZone(fractionOf(&history.cpu)));
         count += 1;
     }
     if (!history.gpu.isEmpty()) {
-        cells[count] = systemCell(ui, "GPU", &history.gpu, 1, theme.loadZone(fractionOf(&history.gpu)), true);
+        cells[count] = percentLane(ui, "GPU", &history.gpu, theme.loadZone(fractionOf(&history.gpu)));
         count += 1;
     }
     if (!history.mem.isEmpty()) {
-        cells[count] = systemCell(ui, "MEM", &history.mem, 1, theme.loadZone(fractionOf(&history.mem)), true);
+        cells[count] = percentLane(ui, "MEM", &history.mem, theme.loadZone(fractionOf(&history.mem)));
         count += 1;
     }
     if (!history.disk.isEmpty()) {
-        cells[count] = systemCell(ui, "DISK", &history.disk, 1, theme.diskZone(fractionOf(&history.disk)), true);
+        // "DISK USED", not "DISK". The popover's DISK cell shows free
+        // space (tt-t7u: capacity barely moves, so free bytes plus an I/O
+        // meter is the more useful instrument there). This lane is a
+        // percentage row, so it necessarily shows the complement — and
+        // two surfaces printing "DISK" for opposite quantities in
+        // opposite polarity is how a reader ends up believing a nearly
+        // full volume is a nearly empty one. Naming the quantity costs
+        // five glyphs and removes the ambiguity entirely.
+        cells[count] = percentLane(ui, "DISK USED", &history.disk, theme.diskZone(fractionOf(&history.disk)));
+        count += 1;
+    }
+    if (!history.net_rx.isEmpty() or !history.net_tx.isEmpty()) {
+        cells[count] = netLane(ui, history);
         count += 1;
     }
     if (!history.battery.isEmpty()) {
-        cells[count] = systemCell(ui, "BAT", &history.battery, 1, theme.chargeZone(fractionOf(&history.battery)), true);
+        cells[count] = percentLane(ui, "BAT", &history.battery, theme.chargeZone(fractionOf(&history.battery)));
         count += 1;
     }
 
@@ -1043,63 +1193,249 @@ fn systemRow(ui: *Ui, model: *const Model) Ui.Node {
         });
     }
 
+    // Every series advances on the same clock, so whichever channel is
+    // live answers for the strip — but it has to BE live: a machine
+    // with the CPU sampler disabled and the disk one on is not a
+    // machine with no history.
+    const recorded = recordedSamples(sampleSource(history));
+
     const nodes: []const Ui.Node = cells[0..count];
-    return card(ui, .{ .height = 78, .gap = 6, .semantics = .{ .label = "System telemetry history" } }, .{
-        ui.text(.{
-            .height = 14,
-            .size = .sm,
-            .style_tokens = .{ .foreground = .text_muted },
-        }, "06 / MACHINE · LAST 30 MIN"),
+    return card(ui, .{
+        .height = system_card_height,
+        .gap = 6,
+        .semantics = .{ .label = "System telemetry history" },
+    }, .{
+        // Span and cadence are READ OFF THE RING, not typed. The card
+        // said "LAST 30 MIN" as a literal while the window length lived
+        // in `SystemHistory.span_ms`; the two were one constant edit
+        // away from disagreeing, and the caption would have been the
+        // liar.
+        ui.row(.{ .height = 14, .gap = 8, .cross = .center }, .{
+            ui.text(.{
+                .grow = 1,
+                .size = .sm,
+                .style_tokens = .{ .foreground = .text_muted },
+            }, ui.fmt("06 / MACHINE · LAST {d} MIN", .{@divTrunc(engine.SystemHistory.span_ms, 60_000)})),
+            // How much of the window is actually RECORDED. A ring that
+            // has been alive for ninety seconds holds eighteen samples
+            // against a thirty-minute axis, and a trace of three dots
+            // under a caption claiming "360 samples" reads as a broken
+            // panel rather than a young one. Counting says which it is.
+            ui.text(.{
+                .size = .sm,
+                .text_alignment = .end,
+                .style = .{ .foreground = theme.text_faint },
+            }, if (recorded < engine.SystemHistory.buckets)
+                ui.fmt("filling · {d} of {d} samples · {d}s apart", .{
+                    recorded,
+                    engine.SystemHistory.buckets,
+                    @divTrunc(engine.SystemHistory.period_ms, 1000),
+                })
+            else
+                ui.fmt("{d} samples · {d}s apart", .{
+                    engine.SystemHistory.buckets,
+                    @divTrunc(engine.SystemHistory.period_ms, 1000),
+                })),
+        }),
         ui.row(.{ .grow = 1, .gap = gap }, nodes),
     });
 }
+
+/// Fixed, and deliberately: 06 is a readout, not a list. Card padding
+/// (26) + title (14) + gap (6) + a lane's header (18) + gap (3) leaves
+/// the plot 45pt — 2.6x what it had, and enough for a trace to have a
+/// shape at a glance.
+const system_card_height: f32 = 112;
 
 fn fractionOf(series: *const engine.SystemHistory.Series) f64 {
     return @floatCast(series.latest() orelse 0);
 }
 
-/// One telemetry lane. Gaps in the ring (a module disabled mid-run)
-/// become NaN, which the chart SKIPS rather than plotting as zero — a
-/// disabled sampler must not look like an idle machine.
-fn systemCell(
-    ui: *Ui,
-    label: []const u8,
-    series: *const engine.SystemHistory.Series,
-    y_max: f32,
-    ink: Color,
-    percent: bool,
-) Ui.Node {
+/// The first channel with anything in it, for the strip's shared
+/// "how much of the window is recorded" caption.
+fn sampleSource(history: *const engine.SystemHistory) *const engine.SystemHistory.Series {
+    inline for (.{ &history.cpu, &history.mem, &history.gpu, &history.disk, &history.net_rx, &history.battery }) |series| {
+        if (!series.isEmpty()) return series;
+    }
+    return &history.cpu;
+}
+
+/// Slots in the ring that hold a reading.
+fn recordedSamples(series: *const engine.SystemHistory.Series) usize {
     var raw: [engine.SystemHistory.buckets]?f32 = undefined;
-    const window = series.snapshot(&raw);
-    const values = ui.arena.alloc(f32, window.len) catch {
-        ui.failed = true;
-        return ui.spacer(1);
+    var n: usize = 0;
+    for (series.snapshot(&raw)) |sample| {
+        if (sample != null) n += 1;
+    }
+    return n;
+}
+
+/// A 0..1 channel: CPU, GPU, memory, disk, battery. The domain is
+/// pinned to full scale rather than fitted to the window, so a lane at
+/// 12% LOOKS like 12% and the six lanes are readable against each other
+/// — an auto-fitted trace would draw an idle machine and a pegged one
+/// identically.
+fn percentLane(ui: *Ui, label: []const u8, series: *const engine.SystemHistory.Series, ink: Color) Ui.Node {
+    const values = laneValues(ui, series);
+    return lane(ui, .{
+        .label = label,
+        .reading = ui.fmt("{d:.0}%", .{(series.latest() orelse 0) * 100}),
+        .ink = ink,
+        .values = values,
+        .y_max = 1,
+        .grid_lines = 1,
+        .semantics = ui.fmt("{s} percent over the last {d} minutes", .{
+            label,
+            @divTrunc(engine.SystemHistory.span_ms, 60_000),
+        }),
+    });
+}
+
+/// Throughput has no full scale to pin to, so this lane fits its own
+/// window and the READING carries the absolute — the opposite contract
+/// from `percentLane`, and the reason the two are separate functions
+/// rather than one with a flag.
+///
+/// Both directions are plotted (receive filled, transmit as a bare
+/// line) because a lane that showed only one would be silent about
+/// uploads, and one summed trace would hide which way the traffic went.
+/// The reading is the combined rate: on a strip this narrow two numbers
+/// do not fit, and the pair of traces already separates them.
+fn netLane(ui: *Ui, history: *const engine.SystemHistory) Ui.Node {
+    const rx = laneValues(ui, &history.net_rx);
+    const tx = laneValues(ui, &history.net_tx);
+    var peak: f32 = 0;
+    for (rx) |v| peak = @max(peak, if (std.math.isNan(v)) 0 else v);
+    for (tx) |v| peak = @max(peak, if (std.math.isNan(v)) 0 else v);
+    const now = @max((history.net_rx.latest() orelse 0) + (history.net_tx.latest() orelse 0), 0);
+    return lane(ui, .{
+        .label = "NET",
+        .reading = ui.fmt("{s}/s", .{fmtBytes(ui, @intFromFloat(now))}),
+        // No zone function covers throughput — there is no "too much
+        // network" threshold to colour against — so it stays on the
+        // neutral text ink instead of borrowing a severity it cannot
+        // justify.
+        .ink = theme.cluster_colors.text,
+        .values = rx,
+        .second = tx,
+        .y_max = @max(peak * 1.1, 1),
+        .semantics = ui.fmt("network receive and transmit over the last {d} minutes", .{
+            @divTrunc(engine.SystemHistory.span_ms, 60_000),
+        }),
+    });
+}
+
+const LaneSpec = struct {
+    label: []const u8,
+    reading: []const u8,
+    ink: Color,
+    values: []const f32,
+    second: []const f32 = &.{},
+    y_max: f32,
+    /// Hairline divisions of the plot. A percent lane gets one, at half
+    /// scale: it turns an empty or near-flat trace into a READING
+    /// against a scale rather than a blank box, which is the difference
+    /// between an idle instrument and a dead one. Throughput has no
+    /// meaningful fraction of its own auto-fitted domain, so it gets
+    /// none.
+    grid_lines: u8 = 0,
+    semantics: []const u8,
+};
+
+fn lane(ui: *Ui, spec: LaneSpec) Ui.Node {
+    var series: [2]canvas.ChartSeries = undefined;
+    // Filled ONLY when there is a second trace to be told apart from —
+    // which is the NET lane and nothing else. On a percent lane the fill
+    // is pinned to a 0..100 domain, so a channel that is both high and
+    // steady (memory parked at 71%, a volume parked at 83% for months)
+    // draws as a solid block: no shape, and the heaviest object in a
+    // panel of five. It also buries the only thing the trace encodes,
+    // because the eye lands on the mass and not on its top edge. Bare
+    // strokes make all five lanes comparable against the same baseline,
+    // and match view.zig's telemetry strip, which unfilled for exactly
+    // this reason. NET keeps the fill: there, filled-vs-stroked IS the
+    // legend separating receive from transmit.
+    series[0] = .{
+        .kind = .line,
+        .values = spec.values,
+        .color = .info,
+        .fill = spec.second.len > 0,
+        .label = spec.label,
     };
-    for (window, values) |sample, *slot| slot.* = sample orelse std.math.nan(f32);
-
-    const latest = series.latest() orelse 0;
-    const reading = if (percent)
-        ui.fmt("{d:.0}%", .{latest * 100})
-    else
-        ui.fmt("{d:.2}", .{latest});
-
-    return ui.column(.{ .grow = 1, .gap = 2, .key = .{ .str = label } }, .{
-        ui.row(.{ .height = 13, .gap = 4, .cross = .center }, .{
-            ui.text(.{ .size = .sm, .grow = 1, .style_tokens = .{ .foreground = .text_muted } }, label),
-            ui.text(.{
+    var series_count: usize = 1;
+    if (spec.second.len > 0) {
+        series[1] = .{ .kind = .line, .values = spec.second, .color = .text_muted, .label = "tx" };
+        series_count = 2;
+    }
+    return ui.column(.{ .grow = 1, .gap = 3, .key = .{ .str = spec.label } }, .{
+        ui.row(.{ .height = 18, .gap = 6, .cross = .center }, .{
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, spec.label),
+            ui.paragraph(.{
+                .grow = 1,
                 .size = .sm,
-                .text_alignment = .end,
-                .style = .{ .foreground = ink },
-            }, reading),
+                .wrap = false,
+                .style = .{ .foreground = spec.ink },
+            }, &.{.{ .text = spec.reading, .weight = .bold, .monospace = true, .scale = 1.1 }}),
         }),
         ui.chart(.{
             .grow = 1,
             .y_min = 0,
-            .y_max = y_max,
+            .y_max = spec.y_max,
+            .grid_lines = spec.grid_lines,
             .baseline = true,
-            .semantics = .{ .label = ui.fmt("{s} over the last 30 minutes", .{label}) },
-        }, &.{.{ .kind = .line, .values = values, .color = .info, .fill = true, .label = label }}),
+            .semantics = .{ .label = spec.semantics },
+        }, series[0..series_count]),
     });
+}
+
+/// Plotted points per lane, and the ratio that gets `SystemHistory`'s
+/// 360 samples down to it.
+///
+/// THIS IS A HARD RUNTIME BUDGET, not a taste call. A filled line series
+/// costs `2n + 3` path elements and the SDK refuses a frame past
+/// `max_chart_path_elements_per_frame` (2048) with
+/// `ChartPathElementListFull` — a blank window, not a warning. Six
+/// filled lanes at the SDK's own 256-point downsample ceiling is 3090
+/// elements and fails; at 90 points the whole window (six lanes, the
+/// net lane's second trace, both KPI sparklines and the bar chart) fits
+/// with room to spare. 90 points across a lane 140pt wide is still
+/// finer than one point per 1.5pt of plot.
+const lane_points: usize = 90;
+const lane_stride: usize = engine.SystemHistory.buckets / lane_points;
+
+/// A lane's samples as the chart wants them: `lane_stride` consecutive
+/// readings collapsed to their PEAK, newest bucket last.
+///
+/// Peak-hold rather than mean, because this is a load trace and the
+/// spike is the event worth seeing — averaging is how a monitor hides
+/// the thing you opened it to find. The stride divides the ring evenly
+/// (360 / 90), so the final bucket ends exactly on the newest sample and
+/// the right edge of the trace agrees with the reading printed above it.
+///
+/// Gaps in the ring (a module disabled mid-run) stay NaN, which the
+/// chart SKIPS rather than plotting as zero — a disabled sampler must
+/// not look like an idle machine. A bucket is NaN only when every
+/// sample in it was missing.
+fn laneValues(ui: *Ui, series: *const engine.SystemHistory.Series) []const f32 {
+    var raw: [engine.SystemHistory.buckets]?f32 = undefined;
+    const window = series.snapshot(&raw);
+    const out_len = window.len / lane_stride;
+    const values = ui.arena.alloc(f32, out_len) catch {
+        ui.failed = true;
+        return &.{};
+    };
+    // Anchored on the END of the window: any remainder is dropped from
+    // the OLDEST edge, never the newest.
+    const offset = window.len - out_len * lane_stride;
+    for (values, 0..) |*slot, i| {
+        var peak: ?f32 = null;
+        for (window[offset + i * lane_stride ..][0..lane_stride]) |sample| {
+            const value = sample orelse continue;
+            peak = if (peak) |p| @max(p, value) else value;
+        }
+        slot.* = peak orelse std.math.nan(f32);
+    }
+    return values;
 }
 
 // ------------------------------------------------------------- material
@@ -1156,6 +1492,16 @@ fn fmtCost(ui: *Ui, cost: f64) []const u8 {
     };
 }
 
+fn fmtBytes(ui: *Ui, bytes: u64) []const u8 {
+    var buf: [32]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    trayfmt.writeHumanBytes(&w, bytes) catch {};
+    return ui.arena.dupe(u8, w.buffered()) catch {
+        ui.failed = true;
+        return "";
+    };
+}
+
 fn fmtTokens(ui: *Ui, tokens: u64) []const u8 {
     var buf: [32]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -1166,9 +1512,13 @@ fn fmtTokens(ui: *Ui, tokens: u64) []const u8 {
     };
 }
 
+/// Whole dollars, one currency mark for the pair: "$200", "$300–400".
+/// Plan prices are published as round monthly figures, so the cents
+/// `fmtCost` prints are two guaranteed zeroes per side — 12 glyphs of
+/// nothing on the narrowest card in the window (see `planCard`).
 fn planBand(ui: *Ui, value: engine.SubscriptionValue) []const u8 {
-    if (value.plan_lo_usd == value.plan_hi_usd) return fmtCost(ui, value.plan_hi_usd);
-    return ui.fmt("{s}–{s}", .{ fmtCost(ui, value.plan_lo_usd), fmtCost(ui, value.plan_hi_usd) });
+    if (value.plan_lo_usd == value.plan_hi_usd) return ui.fmt("${d:.0}", .{value.plan_hi_usd});
+    return ui.fmt("${d:.0}–{d:.0}", .{ value.plan_lo_usd, value.plan_hi_usd });
 }
 
 fn monthName(month: u8) []const u8 {
@@ -1215,6 +1565,28 @@ fn seed(model: *Model, agent: types.Agent, at_ms: i64, model_name: []const u8, c
     }, cost);
 }
 
+/// Every channel `SystemHistory` records, over the full window. The
+/// audit used to run against a model with NO telemetry at all, which
+/// meant section 06 was laid out in its 44pt empty state and its six
+/// populated lanes were never measured at any window size.
+fn seedTelemetry(model: *Model) void {
+    const h = &model.system_history;
+    const start = model.now_ms - engine.SystemHistory.span_ms + engine.SystemHistory.period_ms;
+    var t = start;
+    var i: usize = 0;
+    while (t <= model.now_ms) : (t += engine.SystemHistory.period_ms) {
+        const phase: f32 = @floatFromInt(i % 20);
+        h.cpu.record(t, 0.2 + phase / 60.0);
+        h.gpu.record(t, 0.05 + phase / 120.0);
+        h.mem.record(t, 0.66 + phase / 300.0);
+        h.disk.record(t, 0.83);
+        h.net_rx.record(t, 400_000 + phase * 90_000);
+        h.net_tx.record(t, 40_000 + phase * 9_000);
+        h.battery.record(t, 0.92 - phase / 400.0);
+        i += 1;
+    }
+}
+
 fn buildTree(arena: std.mem.Allocator, model: *const Model) !Ui.Tree {
     var ui = Ui.init(arena);
     const node = rootView(&ui, model);
@@ -1256,26 +1628,49 @@ fn countNodes(widget: canvas.Widget) usize {
     return n;
 }
 
+/// The seeded worst case every layout test runs against: two agents
+/// with a month of history, RECOGNIZED plans on both, and every
+/// telemetry channel populated.
+///
+/// Each of those is a branch the audit is otherwise blind to. Without
+/// the plans the subscription card takes its short "no paid plan
+/// detected" caption and the row's longest string is never laid out —
+/// which is exactly how a sheared caption reached the shipped window.
+/// Without the telemetry, section 06 lays out in its 44pt empty state
+/// and its six populated lanes are measured at no window size at all.
+/// Two plans is also the widest band the price table can produce
+/// (claude max $100–200 + codex pro $200 = "$300–400").
+fn seedWorstCase(model: *Model) !void {
+    for (0..24) |i| {
+        try seed(model, .claude, model.now_ms - @as(i64, @intCast(i)) * 86_400_000, "claude-fable-5", "/w/token-tach", 4.5);
+        try seed(model, .codex, model.now_ms - @as(i64, @intCast(i)) * 3_600_000, "gpt-5.5", "/w/home-ops", 1.25);
+    }
+    model.claude_plan = "max";
+    model.codex_limits = .{ .agent = .codex, .read_at_ms = model.now_ms, .plan = "pro" };
+    seedTelemetry(model);
+}
+
+/// Every window size the panel has to hold: the declared floor
+/// (main.zig: min 820x560), a small laptop window, the default, a
+/// common 16:10 desktop, and a wide one. Absolute rects against a 920
+/// constant used to clip the right column below that and leave dead
+/// margin above it; the flow tree has to answer for all of them.
+const test_sizes = [_][2]f32{
+    .{ 820, 560 },
+    .{ 1024, 640 },
+    .{ window_width, window_height },
+    .{ 1280, 860 },
+    .{ 1600, 1000 },
+    .{ 2400, 1400 },
+};
+
 test "dashboard lays out cleanly from the window floor to a wide desktop" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
 
     var model = testModel(testing.allocator);
     defer model.ledger.deinit();
-    for (0..24) |i| {
-        try seed(&model, .claude, model.now_ms - @as(i64, @intCast(i)) * 86_400_000, "claude-fable-5", "/w/token-tach", 4.5);
-        try seed(&model, .codex, model.now_ms - @as(i64, @intCast(i)) * 3_600_000, "gpt-5.5", "/w/home-ops", 1.25);
-    }
-    // RECOGNIZED plans on BOTH agents, because the audit is blind to any
-    // branch the model does not take. Without these the subscription
-    // card falls to its short "no recognizable paid plan yet" caption
-    // and the only wrapping caption on the KPI row is never laid out at
-    // any size — which is exactly how a sheared third line ("plans")
-    // reached the shipped window. Two plans is also the WIDEST band the
-    // price table can produce ($100-200 + $200 = "$300.00-$400.00", 18
-    // glyphs), so this pins the worst case, not a comfortable one.
-    model.claude_plan = "max";
-    model.codex_limits = .{ .agent = .codex, .read_at_ms = model.now_ms, .plan = "pro" };
+    try seedWorstCase(&model);
 
     const tree = try buildTree(arena_state.allocator(), &model);
 
@@ -1286,11 +1681,7 @@ test "dashboard lays out cleanly from the window floor to a wide desktop" {
     const nodes = try testing.allocator.alloc(canvas.WidgetLayoutNode, canvas.max_layout_audit_nodes);
     defer testing.allocator.free(nodes);
 
-    // The declared floor (main.zig: min 820x560), the default, and a
-    // wide desktop. Absolute rects against a 920 constant used to clip
-    // the right column below that and leave dead margin above it.
-    const sizes = [_][2]f32{ .{ 820, 560 }, .{ window_width, window_height }, .{ 1600, 1000 } };
-    for (sizes) |size| {
+    for (test_sizes) |size| {
         const bounds = geometry.RectF.init(0, 0, size[0], size[1]);
         const layout = try canvas.layoutWidgetTreeWithTokens(tree.root, bounds, theme.tokens(), nodes);
         var findings: [canvas.max_layout_audit_findings]canvas.LayoutAuditFinding = undefined;
@@ -1305,6 +1696,238 @@ test "dashboard lays out cleanly from the window floor to a wide desktop" {
         // size the window can take.
         try testing.expectEqual(@as(usize, 0), issues.total);
     }
+}
+
+// THREE runtime budgets, on a SATURATED frame: every agent present,
+// both tables past their caps, the roster full, every telemetry lane
+// live. Exceeding any of them fails the FRAME at runtime — a blank
+// window, not a compile error — so they are asserted here or they are
+// not checked at all.
+//
+// The third one is not hypothetical. Section 06 handed the SDK six
+// filled line series; at the SDK's own 256-point downsample ceiling
+// that is 3090 path elements against a 2048 budget, and the first
+// version of this strip failed the frame outright. `lane_points` is
+// sized against this test, not against taste.
+test "a saturated dashboard frame stays inside every runtime budget" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = testModel(testing.allocator);
+    defer model.ledger.deinit();
+    try seedWorstCase(&model);
+    var buf: [24]u8 = undefined;
+    for (std.enums.values(types.Agent)) |agent| {
+        const name = try std.fmt.bufPrint(&buf, "model-{s}", .{agent.label()});
+        try seed(&model, agent, model.now_ms, name, "/w/token-tach", 3.0);
+        model.agent_burn.addTokens(agent, model.now_ms, 50_000);
+    }
+    for (0..max_table_rows + 8) |i| {
+        const name = try std.fmt.bufPrint(&buf, "project-{d:0>3}", .{i});
+        try seed(&model, .claude, model.now_ms, name, name, @floatFromInt(i + 1));
+    }
+    for (0..sessions_mod.max_sessions) |i| {
+        const id = try std.fmt.bufPrint(&buf, "session-{d:0>3}", .{i});
+        model.roster.record(.{
+            .agent = .claude,
+            .timestamp_ms = model.now_ms,
+            .model = "claude-fable-5",
+            .session_id = id,
+            .cwd = "/w/token-tach",
+            .output_tokens = 1_000,
+        }, 1.0);
+    }
+
+    const nodes = try testing.allocator.alloc(canvas.WidgetLayoutNode, canvas.max_layout_audit_nodes);
+    defer testing.allocator.free(nodes);
+    const commands = try testing.allocator.alloc(canvas.CanvasCommand, max_commands);
+    defer testing.allocator.free(commands);
+
+    // Both fleet panes: the sessions roster is the taller of the two and
+    // only reachable through `dashboard_focus`.
+    for ([_]engine.DashboardPane{ .agents, .sessions }) |focus| {
+        model.ux.dashboard_focus = focus;
+        const tree = try buildTree(arena_state.allocator(), &model);
+        const layout = try canvas.layoutWidgetTreeWithTokens(
+            tree.root,
+            geometry.RectF.init(0, 0, window_width, window_height),
+            theme.tokens(),
+            nodes,
+        );
+        var builder = canvas.Builder.init(commands);
+        try canvas.emitWidgetLayout(&builder, layout, theme.tokens());
+        std.debug.print("\nDASHBOARD {s}: {d} nodes / {d} commands / {d} path elements\n", .{
+            @tagName(focus),
+            countNodes(tree.root),
+            builder.displayList().commandCount(),
+            builder.path_element_len,
+        });
+        try testing.expect(countNodes(tree.root) <= max_view_nodes);
+        try testing.expect(builder.displayList().commandCount() <= max_commands);
+        try testing.expect(builder.path_element_len <= canvas.max_chart_path_elements_per_frame);
+    }
+}
+
+/// `canvas_limits.max_canvas_widget_nodes_per_view` and
+/// `max_canvas_commands_per_view`, restated because the limits module is
+/// runtime-internal and not reachable from the SDK's public canvas
+/// namespace.
+const max_view_nodes: usize = 1024;
+const max_commands: usize = 2048;
+
+/// Text size a `.text` leaf resolves to, replicating
+/// `widget_metrics.widgetTypographySize` (not exported). Only the two
+/// rungs this window uses.
+fn leafTextSize(widget: canvas.Widget, tokens: canvas.DesignTokens) f32 {
+    return switch (widget.size) {
+        .sm => @max(8, tokens.typography.body_size - 1),
+        else => tokens.typography.body_size,
+    };
+}
+
+/// Assert every single-style text leaf inside `within` fits the box it
+/// was given.
+///
+/// THE LAYOUT AUDIT CANNOT DO THIS. Its own docs are explicit: an
+/// ellipsized single line is correct rendering, never a finding. So a
+/// title too long for its own card — "TOKENS PROCESSED · 30D" in a
+/// 121pt box — audits perfectly clean and ships truncated. The same
+/// blind spot on the other axis (a wrapped caption reserving more
+/// height than its card) is why nothing on the KPI row wraps any more.
+///
+/// Spanned paragraphs are skipped: they mix mono, weights and scales,
+/// so a single sans measurement of their concatenated text would be
+/// meaningless.
+fn expectTextFits(
+    layout: canvas.WidgetLayoutTree,
+    within: geometry.RectF,
+    tokens: canvas.DesignTokens,
+) !void {
+    for (layout.nodes) |node| {
+        if (node.widget.kind != .text) continue;
+        if (node.widget.text.len == 0 or node.widget.spans.len > 0) continue;
+        if (!within.containsRect(node.frame)) continue;
+        const width = canvas.estimateTextWidthForFont(
+            canvas.default_sans_font_id,
+            node.widget.text,
+            leafTextSize(node.widget, tokens),
+        );
+        if (width > node.frame.width + 0.5) {
+            std.debug.print(
+                "\n\"{s}\" needs {d:.1}pt and has {d:.1}pt\n",
+                .{ node.widget.text, width, node.frame.width },
+            );
+            return error.TextDoesNotFitItsBox;
+        }
+    }
+}
+
+fn frameOfSemantics(layout: canvas.WidgetLayoutTree, label: []const u8) ?geometry.RectF {
+    for (layout.nodes) |node| {
+        if (std.mem.eql(u8, node.widget.semantics.label, label)) return node.frame;
+    }
+    return null;
+}
+
+test "every KPI and machine label fits its own card at the window floor" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = testModel(testing.allocator);
+    defer model.ledger.deinit();
+    try seedWorstCase(&model);
+    // The burn caption names an agent, so it is only as wide as the
+    // longest label in the enum: pin the widest one rather than the
+    // convenient one.
+    model.agent_burn.addTokens(.opencode, model.now_ms, 987_654);
+
+    const tree = try buildTree(arena_state.allocator(), &model);
+    const nodes = try testing.allocator.alloc(canvas.WidgetLayoutNode, canvas.max_layout_audit_nodes);
+    defer testing.allocator.free(nodes);
+
+    // Chrome-only regions: fixed strings in boxes this file sizes. User
+    // data (model names, project paths) legitimately elides and is not
+    // asserted here.
+    const chrome = [_][]const u8{
+        "API-equivalent cost over the selected range",
+        "Tokens processed over the selected range",
+        "Fleet burn rate right now",
+        "Trip odometer since launch",
+        "Subscription value, month to date",
+        "System telemetry history",
+    };
+
+    for (test_sizes) |size| {
+        const bounds = geometry.RectF.init(0, 0, size[0], size[1]);
+        const layout = try canvas.layoutWidgetTreeWithTokens(tree.root, bounds, theme.tokens(), nodes);
+        for (chrome) |label| {
+            const frame = frameOfSemantics(layout, label) orelse return error.MissingCard;
+            try expectTextFits(layout, frame, theme.tokens());
+        }
+    }
+}
+
+test "the page numbers all six of its sections, starting at 01" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = testModel(testing.allocator);
+    defer model.ledger.deinit();
+    try seedWorstCase(&model);
+
+    const tree = try buildTree(arena_state.allocator(), &model);
+    // The KPI strip was the one unnumbered band on a page whose other
+    // five panels all carried an index. Either everything is numbered or
+    // nothing is; this holds the page to the former.
+    for ([_][]const u8{ "01 / ", "02 / ", "03 / ", "04 / ", "05 / ", "06 / " }) |section| {
+        try testing.expect(findText(tree.root, section));
+    }
+}
+
+test "a young telemetry ring says so instead of looking broken" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = testModel(testing.allocator);
+    defer model.ledger.deinit();
+    // Three samples: what the strip actually holds fifteen seconds
+    // after launch, and how every user sees it first. Three dots on a
+    // thirty-minute axis under a caption promising 360 samples reads as
+    // a broken panel; the count is what makes it a young one.
+    for (0..3) |i| {
+        const at = model.now_ms - @as(i64, @intCast(2 - i)) * engine.SystemHistory.period_ms;
+        model.system_history.cpu.record(at, 0.3);
+    }
+
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findText(tree.root, "filling · 3 of 360 samples"));
+    // And it is still a strip, not the "no telemetry recorded yet"
+    // placeholder — one channel is enough to draw.
+    try testing.expect(hasExactText(tree.root, "CPU"));
+    try testing.expect(!findText(tree.root, "no telemetry recorded yet"));
+}
+
+test "the machine strip plots every channel the history records" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = testModel(testing.allocator);
+    defer model.ledger.deinit();
+    try seedWorstCase(&model);
+
+    const tree = try buildTree(arena_state.allocator(), &model);
+    // Net and battery are recorded by `SystemHistory` and were dropped
+    // on the floor by the old four-lane strip.
+    // "DISK USED" rather than "DISK": this lane is a used-percentage and
+    // the popover's DISK cell is free bytes, so the label has to name
+    // which of the two it is.
+    for ([_][]const u8{ "CPU", "GPU", "MEM", "DISK USED", "NET", "BAT" }) |channel| {
+        try testing.expect(hasExactText(tree.root, channel));
+    }
+    // And the span/cadence caption is derived from the ring, not typed:
+    // 360 samples 5 s apart IS 30 minutes.
+    try testing.expect(findText(tree.root, "LAST 30 MIN"));
+    try testing.expect(findText(tree.root, "360 samples · 5s apart"));
 }
 
 test "the time-range control emits time_range and re-scopes the chart" {
@@ -1412,46 +2035,27 @@ test "hourly and daily rollups agree over a span both series cover" {
     try testing.expect(!ui.failed);
 }
 
-test "the subscription caption fits its card at the window floor" {
-    // The layout audit does NOT catch this. `auditWidgetLayout` reports
-    // sibling overlap, clip escape and silent elision, but a wrapped
-    // text whose reserved height exceeds the card its siblings sized is
-    // none of those — the tree is internally consistent and the shear
-    // happens at paint. Verified by restoring the old caption with the
-    // audit in place: it still passed while the real window printed a
-    // half-height "plans" below the card border. So the constraint is
-    // asserted here, on the string, where it is actually checkable.
+test "the plan band is whole dollars, and stays one line" {
+    // The band is the only string on the KPI row assembled from live
+    // numbers rather than written down, and it is the one that forced a
+    // second line. `expectTextFits` proves the rendered caption fits its
+    // box; this proves the FORMAT that keeps it fitting — cents on a
+    // published monthly plan price are two guaranteed zeroes per side.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var ui = Ui.init(arena_state.allocator());
 
+    const widest = engine.SubscriptionValue{ .plan_lo_usd = 300, .plan_hi_usd = 400 };
+    try testing.expectEqualStrings("$300–400", planBand(&ui, widest));
+    try testing.expectEqualStrings("$200", planBand(&ui, .{ .plan_lo_usd = 200, .plan_hi_usd = 200 }));
+
     // Card content width at the declared 820pt floor: five cards share
     // the row after the window padding and four gaps, each spending
-    // `card_pad` per side. At `sm` a glyph is ~5.8pt.
+    // `card_pad` per side.
     const card_content_w = (820 - 2 * pad - 4 * gap) / 5 - 2 * card_pad;
-    const per_line: usize = @intFromFloat(@floor(card_content_w / 5.8));
-
-    // The widest band the price table can produce: claude max ($100-200)
-    // plus codex pro ($200) — the same pairing the audit test seeds.
-    const widest = engine.SubscriptionValue{ .plan_lo_usd = 300, .plan_hi_usd = 400 };
-    const caption = ui.fmt("API-equiv vs {s}/mo", .{planBand(&ui, widest)});
-
-    // Greedy word wrap, the way the renderer breaks it. Two lines is the
-    // budget: a third has nowhere to go.
-    var lines: usize = 1;
-    var used: usize = 0;
-    var it = std.mem.tokenizeScalar(u8, caption, ' ');
-    while (it.next()) |word| {
-        // An unbreakable token wider than the line is the failure mode
-        // that forced three lines even after the prose was shortened.
-        try testing.expect(word.len <= per_line);
-        const need = if (used == 0) word.len else used + 1 + word.len;
-        if (need > per_line) {
-            lines += 1;
-            used = word.len;
-        } else used = need;
-    }
-    try testing.expect(lines <= 2);
+    const caption = ui.fmt("vs {s}/mo", .{planBand(&ui, widest)});
+    const size = @max(8, theme.tokens().typography.body_size - 1);
+    try testing.expect(canvas.estimateTextWidthForFont(canvas.default_sans_font_id, caption, size) <= card_content_w);
 }
 
 test "scopes fold live onto the default and describe themselves" {

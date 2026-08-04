@@ -97,6 +97,37 @@ const minor_count: usize = 56;
 const major_count: usize = 6; // five intervals, numerals 0..scale
 const numeral_r: f32 = 74;
 
+/// The readout window: the digital pane in the dial's lower third.
+///
+/// It lives THERE and not under the pivot because of the sweep geometry.
+/// At `engine.half_sweep_deg` = 120 the two extreme graduations sit below
+/// the pivot at roughly (86, 235) and (214, 235) — which is exactly where
+/// a centred readout well lands. The shipped panel drew both: the eye
+/// read "0   27.5k   50" as one line of three numbers, and because the
+/// full-scale glyph is inked red it read as a redline annotation ON the
+/// burn rate. The fix is structural, not cosmetic: the extreme numerals
+/// are not printed at all (`scaleLegend` names both endpoints in words
+/// instead, which also saves the reader the ×1000 arithmetic the old
+/// unit caption asked for), which vacates the ENTIRE lower dial. The
+/// remaining numerals (10..40 of 50) all sit above the pivot.
+///
+/// Everything here is bounded by two hard constraints:
+///   * the dial rim — every corner is inside `dial_r` of the pivot;
+///   * the needle — the blade reaches r = 93, so at full deflection it
+///     crosses y = 230 at x = 95 / 205. The hero glyphs start at x = 94
+///     at scale 2.35, so the needle grazes the window's rounded corner
+///     and never the type.
+pub const readout_window = geometry.RectF.init(84, 230, 132, 62);
+const well_x: f32 = readout_window.x;
+const well_y: f32 = readout_window.y;
+const well_w: f32 = readout_window.width;
+const well_h: f32 = readout_window.height;
+const hero_y: f32 = 234;
+const hero_h: f32 = 40;
+const hero_scale: f32 = 2.35;
+const caption_y: f32 = 275;
+const legend_y: f32 = 295;
+
 // The machined needle: a tapered blade polygon from hub to just short
 // of the LED ring, a counterweight stub past the pivot, a tip glow.
 const blade_tip_r: f32 = 93;
@@ -138,7 +169,13 @@ pub const needle_edge_id: canvas.ObjectId = chrome_id_base + 17;
 pub const needle_glow_id: canvas.ObjectId = chrome_id_base + 18;
 
 /// Commands painted UNDER the widget tree (cabin + dial face).
-pub const chrome_prefix_commands: usize = 11;
+///
+/// This used to be 12: a concentric r=58 print circled the readout. The
+/// readout is no longer concentric with the dial (it sits in the lower
+/// third, clear of the sweep), so its frame is a rounded rect the widget
+/// pass draws — a circle centred on the pivot could only ever cut
+/// through it.
+pub const chrome_prefix_commands: usize = 10;
 /// Commands painted OVER the widget tree (needle metal + glass).
 pub const chrome_suffix_commands: usize = 7;
 
@@ -149,7 +186,6 @@ var dial_face_elems: [6]canvas.PathElement = undefined;
 var vignette_elems: [6]canvas.PathElement = undefined;
 var bezel_ring_elems: [6]canvas.PathElement = undefined;
 var dial_edge_elems: [6]canvas.PathElement = undefined;
-var inner_ring_elems: [6]canvas.PathElement = undefined;
 var blade_elems: [11]canvas.PathElement = undefined;
 var tip_glow_elems: [6]canvas.PathElement = undefined;
 var hub_elems: [6]canvas.PathElement = undefined;
@@ -222,13 +258,6 @@ pub fn buildChrome(
         .elements = circlePath(&dial_edge_elems, center, dial_r - 1.5),
         .stroke = .{ .fill = .{ .color = theme.dial_edge }, .width = 1 },
     });
-    // Inner dial print: a faint circle framing the readout well.
-    try builder.strokePath(.{
-        .id = chrome_id_base + 9,
-        .elements = circlePath(&inner_ring_elems, center, 58),
-        .stroke = .{ .fill = .{ .color = withAlpha(theme.dial_edge, 0.7) }, .width = 1 },
-    });
-
     // ---- suffix: needle metal + glass (over every widget) ----
     const deg = model.needle_to_deg;
     const blade = bladePath(deg);
@@ -429,10 +458,7 @@ fn header(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
 
 // ------------------------------------------------------------ telltales
 
-/// One warning lamp. A cluster prints every lamp it owns and lights only
-/// what applies, so the dark glyph is design rather than absence — and
-/// the row reads the same way every time, which is what makes a lit lamp
-/// noticeable at a glance.
+/// One warning lamp.
 const Telltale = struct {
     code: []const u8,
     label: []const u8,
@@ -442,34 +468,68 @@ const Telltale = struct {
     press: ?Msg = null,
 };
 
-const telltale_x: f32 = 172;
+/// The lamp row ends here, hard against the live lamp and the DASH
+/// button, so the header reads as [wordmark] … [status cluster] however
+/// many lamps are showing. It grew leftward from a fixed origin before,
+/// which meant the gap between the wordmark and the lamps encoded
+/// nothing while the lamps themselves drifted.
+const telltale_end_x: f32 = 420;
 const telltale_pitch: f32 = 36;
 const telltale_w: f32 = 32;
 
+/// Printed-dark is the right automotive idiom — a lamp you have never
+/// seen lit is one you cannot read in a hurry — but SEVEN cryptic
+/// acronyms printed permanently made the row the second-loudest thing in
+/// the frame while meaning nothing 99% of the time.
+///
+/// So the row is split. Three lamps are printed always, because they are
+/// the ones that qualify what the rest of the panel is claiming: a
+/// projected wall (the product's whole reason to exist), a stale limit
+/// reading, a failing source. The rest appear only when they fire: the
+/// machine ones (LOAD, BAT) are already rendered as live meters in the
+/// telemetry strip below, and REDLINE is already shouted by the live lamp
+/// going red, the LED ring, and the halo pulse — printing a dark box for
+/// each of those bought a row of noise to say nothing.
+///
+/// Unlit lamps also lost their plate. The plate is what made them read as
+/// a row of buttons competing with the wordmark; the dim glyph alone
+/// still prints the lamp, and a lit one now gains BOTH ink and a tinted
+/// plate, which is a much louder step than ink alone ever was.
 fn telltales(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, glance: trayfmt.GlanceState, danger: bool) void {
     const alert_pending = alertPending(model);
-    const lamps = [_]Telltale{
-        .{ .code = "RED", .label = "redline", .lit = danger, .ink = theme.red },
-        .{ .code = "WALL", .label = "limit wall projected", .lit = glance.wall_at_ms != null, .ink = theme.amber },
-        .{ .code = "STL", .label = "stale limit reading", .lit = engine.oauthStaleMin(model) != null, .ink = theme.amber },
-        .{
-            .code = "ALRT",
-            .label = "unacknowledged alert",
-            .lit = alert_pending,
-            .ink = theme.amber,
-            .press = if (alert_pending) Msg.alert_ack else null,
-        },
-        .{ .code = "SRC", .label = "source error", .lit = model.status_error, .ink = theme.red },
-        .{ .code = "LOAD", .label = "machine load", .lit = loadWarn(model), .ink = theme.amber },
-        .{ .code = "BAT", .label = "battery low", .lit = batteryWarn(model), .ink = theme.red },
-    };
 
-    for (lamps, 0..) |lamp, i| {
-        const x = telltale_x + telltale_pitch * @as(f32, @floatFromInt(i));
+    var lamps: [7]Telltale = undefined;
+    var n: usize = 0;
+    lamps[n] = .{ .code = "WALL", .label = "limit wall projected", .lit = glance.wall_at_ms != null, .ink = theme.amber };
+    n += 1;
+    lamps[n] = .{ .code = "STL", .label = "stale limit reading", .lit = engine.oauthStaleMin(model) != null, .ink = theme.amber };
+    n += 1;
+    lamps[n] = .{ .code = "SRC", .label = "source error", .lit = model.status_error, .ink = theme.red };
+    n += 1;
+    if (danger) {
+        lamps[n] = .{ .code = "RED", .label = "redline", .lit = true, .ink = theme.red };
+        n += 1;
+    }
+    if (alert_pending) {
+        lamps[n] = .{ .code = "ALRT", .label = "unacknowledged alert", .lit = true, .ink = theme.amber, .press = Msg.alert_ack };
+        n += 1;
+    }
+    if (loadWarn(model)) {
+        lamps[n] = .{ .code = "LOAD", .label = "machine load", .lit = true, .ink = theme.amber };
+        n += 1;
+    }
+    if (batteryWarn(model)) {
+        lamps[n] = .{ .code = "BAT", .label = "battery low", .lit = true, .ink = theme.red };
+        n += 1;
+    }
+
+    const x0 = telltale_end_x - telltale_pitch * @as(f32, @floatFromInt(n)) + (telltale_pitch - telltale_w);
+    for (lamps[0..n], 0..) |lamp, i| {
+        const x = x0 + telltale_pitch * @as(f32, @floatFromInt(i));
         push(ui, nodes, ui.panel(.{
             .frame = rect(x, header_y + 3, telltale_w, 18),
             .style = .{
-                .background = if (lamp.lit) withAlpha(lamp.ink, 0.16) else theme.telltale_plate,
+                .background = if (lamp.lit) withAlpha(lamp.ink, 0.16) else theme.transparent,
                 .radius = 3,
                 .stroke_width = 0,
             },
@@ -579,40 +639,80 @@ fn gaugeCluster(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) vo
         }
     }
 
-    // Major graduations + numerals (thousands of tokens/min).
+    // Major graduations: a machined collar around the LED that already
+    // sits at that angle, not a dot of its own. Painting them near-white
+    // made six of the ring's fifty-six dots read as burnt-out bulbs among
+    // the phosphor — a collar says "graduation" without asserting
+    // anything about which LEDs are lit.
     for (0..major_count) |i| {
         const frac = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(major_count - 1));
         const deg = -engine.half_sweep_deg + 2 * engine.half_sweep_deg * frac;
-        const bright: Color = if (frac >= red_start) theme.red else Color.rgb8(208, 226, 218);
         const p = dialPoint(deg, tick_r);
         push(ui, nodes, ui.panel(.{
-            .frame = rect(p.x - 3.5, p.y - 3.5, 7, 7),
-            .style = .{ .background = bright, .radius = 3.5, .stroke_width = 0 },
+            .frame = rect(p.x - 4.5, p.y - 4.5, 9, 9),
+            .style = .{
+                .background = theme.transparent,
+                .border = theme.hub_ring,
+                .stroke_width = 1,
+                .radius = 4.5,
+            },
         }, .{}));
 
+        // The two EXTREME numerals are deliberately not printed — see the
+        // readout-window commentary above. Losing them costs the reader
+        // the scale endpoints, so `scaleLegend` prints both as words at
+        // the dial's foot, where the burn number can never be read as
+        // part of them.
+        if (i == 0 or i == major_count - 1) continue;
         const n = dialPoint(deg, numeral_r);
-        const thousands = scale / 5.0 * @as(f64, @floatFromInt(i)) / 1000.0;
+        // The graduation's ACTUAL rate, printed in the same unit the
+        // legend and the hero use.
+        //
+        // These numerals used to be bare thousands: at a 50k scale they
+        // read 10/20/30/40, which the retired "tok/min ×1000" caption
+        // used to explain. That caption is gone, and the legend at the
+        // dial's foot now says "0–50k tok/min" — so 40 against 50k was
+        // already a silent unit mismatch, and the moment the engine
+        // ratchets to a megatoken scale it became a shouted one: a face
+        // reading 1000/2000/3000/4000 under a legend reading "0–5M
+        // tok/min", off by a factor of a thousand with nothing on the
+        // instrument to reconcile them. `fmtTokens` is the one the
+        // legend, the hero and the HUD all speak, and the scale ladder
+        // (1/2/5 × decade) divides by five into round numbers — 1M, 400k,
+        // 10k — so this never produces a numeral wider than the 36pt box.
+        const numeral = fmtTokens(ui, @intFromFloat(@max(scale / 5.0 * @as(f64, @floatFromInt(i)), 0)));
         push(ui, nodes, ui.paragraph(.{
             .frame = rect(n.x - 18, n.y - 8, 36, 16),
             .text_alignment = .center,
-            .style = .{ .foreground = if (frac >= red_start) theme.red else Color.rgb8(196, 214, 205) },
+            .style = .{ .foreground = Color.rgb8(196, 214, 205) },
+            .semantics = .{ .label = ui.fmt("graduation {s} tokens per minute", .{numeral}) },
         }, &.{.{
-            .text = ui.fmt("{d}", .{@as(u64, @intFromFloat(thousands + 0.5))}),
+            .text = numeral,
             .monospace = true,
             .weight = .medium,
         }}));
     }
 
-    // Dial fine print at the foot, clear of the needle's sweep.
+    dialReadout(ui, nodes, model, glance, danger);
+    scaleLegend(ui, nodes, scale);
+    burnTrace(ui, nodes, model);
+}
+
+/// The dial's scale, spelled out at the foot of the face.
+///
+/// This replaces both the extreme numerals and the old "tok/min ×1000"
+/// unit line, and it is strictly more informative than either: it names
+/// the two endpoints a needle position is read against, in the unit the
+/// hero readout uses, so nobody has to multiply a "50" by a thousand in
+/// their head to know what full deflection means.
+fn scaleLegend(ui: *Ui, nodes: *std.ArrayList(Ui.Node), scale: f64) void {
     push(ui, nodes, ui.text(.{
-        .frame = rect(gauge_cx - 60, gauge_cy + 88, 120, 14),
+        .frame = rect(gauge_cx - 72, legend_y, 144, 13),
         .size = .sm,
         .text_alignment = .center,
         .style_tokens = .{ .foreground = .text_muted },
-    }, "tok/min ×1000"));
-
-    dialReadout(ui, nodes, model, glance, danger);
-    burnTrace(ui, nodes, model);
+        .semantics = .{ .label = "dial scale" },
+    }, ui.fmt("0–{s} tok/min", .{fmtTokens(ui, @intFromFloat(@max(scale, 0)))})));
 }
 
 /// The in-dial readout well: one big number, one supporting line, and
@@ -623,32 +723,78 @@ fn gaugeCluster(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) vo
 /// dashboard to answer "what has this cost me", which is the question
 /// people actually have at 4pm.
 fn dialReadout(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, glance: trayfmt.GlanceState, danger: bool) void {
-    const r = readout(ui, model, glance, danger);
+    // The window frame. The readout is an instrument INSIDE the dial, not
+    // dial print, and the frame is the thing that says so — it borrows
+    // the same `bezel_edge` hairline every other panel on the cluster
+    // carries, so the eye files it as "a panel" on sight.
+    push(ui, nodes, ui.panel(.{
+        .frame = rect(well_x, well_y, well_w, well_h),
+        .style = .{ .background = theme.transparent, .border = theme.bezel_edge, .stroke_width = 1, .radius = 9 },
+    }, .{}));
 
-    push(ui, nodes, ui.paragraph(.{
-        .frame = rect(gauge_cx - 70, gauge_cy + 18, 140, 36),
-        .text_alignment = .center,
-        .style = .{ .foreground = r.ink },
-        .semantics = .{ .label = r.semantics },
-    }, &.{.{ .text = r.value, .weight = .bold, .monospace = true, .scale = 2.2 }}));
+    if (model.catchup_active) {
+        scanningReadout(ui, nodes, model);
+    } else {
+        const r = readout(ui, model, glance, danger);
+        push(ui, nodes, ui.paragraph(.{
+            .frame = rect(gauge_cx - 80, hero_y, 160, hero_h),
+            .text_alignment = .center,
+            .style = .{ .foreground = r.ink },
+            .semantics = .{ .label = r.semantics },
+        }, &.{.{ .text = r.value, .weight = .bold, .monospace = true, .scale = hero_scale }}));
 
-    push(ui, nodes, ui.paragraph(.{
-        .frame = rect(gauge_cx - 80, gauge_cy + 54, 160, 16),
-        .text_alignment = .center,
-        .style = .{ .foreground = r.caption_ink },
-    }, &.{.{ .text = r.caption, .monospace = true, .scale = 0.9 }}));
+        push(ui, nodes, ui.paragraph(.{
+            .frame = rect(gauge_cx - 80, caption_y, 160, 15),
+            .text_alignment = .center,
+            .style = .{ .foreground = r.caption_ink },
+        }, &.{.{ .text = r.caption, .monospace = true, .scale = 0.9 }}));
+    }
 
-    hotAgentChip(ui, nodes, model);
-
-    // The press target sits above the type so the whole well is the
+    // The press target sits above the type so the whole window is the
     // control, not just the glyphs. Transparent: the readout IS the
     // affordance, and a wash over the dial would fight the vignette.
     push(ui, nodes, ui.panel(.{
-        .frame = rect(gauge_cx - 70, gauge_cy + 16, 140, 56),
-        .style = .{ .background = theme.transparent, .radius = 6, .stroke_width = 0 },
+        .frame = rect(well_x, well_y, well_w, well_h),
+        .style = .{ .background = theme.transparent, .radius = 9, .stroke_width = 0 },
         .on_press = .readout_cycle,
         .semantics = .{ .label = "cycle readout: rate, today, trip, eta" },
     }, .{}));
+}
+
+/// Catch-up is a STATE, not an absence of one.
+///
+/// The shipped panel collapsed the whole window to a muted em dash the
+/// size of a hyphen: at the exact moment the app has the least to say it
+/// looked broken rather than busy. A live spinner over a determinate
+/// progress bar says the same "not yet" deliberately, and the bar is the
+/// honest version — the engine knows exactly how many files are left, so
+/// showing a fraction beats an indefinite shrug.
+fn scanningReadout(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
+    const total = model.catchup_queue.len;
+    const done = @min(model.catchup_next, total);
+    const frac: f32 = if (total == 0) 0 else @as(f32, @floatFromInt(done)) / @as(f32, @floatFromInt(total));
+
+    push(ui, nodes, ui.el(.spinner, .{
+        .frame = rect(gauge_cx - 9, well_y + 8, 18, 18),
+    }, .{}));
+    push(ui, nodes, ui.paragraph(.{
+        .frame = rect(gauge_cx - 80, well_y + 30, 160, 14),
+        .text_alignment = .center,
+        .style = .{ .foreground = theme.cluster_colors.text_muted },
+        .semantics = .{ .label = "readout scanning history" },
+    }, &.{.{ .text = "scanning…", .weight = .bold, .monospace = true, .scale = 0.95 }}));
+
+    const track_x: f32 = gauge_cx - 50;
+    push(ui, nodes, ui.panel(.{
+        .frame = rect(track_x, well_y + 48, 100, 4),
+        .style = .{ .background = theme.track, .radius = 2, .stroke_width = 0 },
+    }, .{}));
+    if (frac > 0) {
+        push(ui, nodes, ui.panel(.{
+            .frame = rect(track_x, well_y + 48, @max(100 * frac, 3), 4),
+            .style = .{ .background = theme.green, .radius = 2, .stroke_width = 0 },
+        }, .{}));
+    }
 }
 
 const Readout = struct {
@@ -659,19 +805,10 @@ const Readout = struct {
     semantics: []const u8,
 };
 
+/// The settled readout. Catch-up never reaches here: while history is
+/// still being chewed the numbers aren't truth yet, and `scanningReadout`
+/// owns the window instead of this asserting a confident 0.
 fn readout(ui: *Ui, model: *const Model, glance: trayfmt.GlanceState, danger: bool) Readout {
-    // While history catch-up is chewing, the numbers aren't truth yet —
-    // dim the readout and say "scanning" instead of asserting a
-    // confident 0.
-    if (model.catchup_active) {
-        return .{
-            .value = "—",
-            .ink = theme.cluster_colors.text_muted,
-            .caption = "scanning…",
-            .caption_ink = theme.cluster_colors.text_muted,
-            .semantics = "readout scanning history",
-        };
-    }
     switch (model.ux.readout) {
         .rate => {
             const burn_text = if (glance.idle)
@@ -721,7 +858,14 @@ fn readout(ui: *Ui, model: *const Model, glance: trayfmt.GlanceState, danger: bo
             if (glance.next_reset_ms) |reset| {
                 if (reset > glance.now_ms) {
                     return .{
-                        .value = fmtCountdown(ui, reset - glance.now_ms),
+                        // Same rule as `etaLine`: `fmtReset`, not the tray's
+                        // `fmtCountdown`. This is the HERO glyph — a weekly
+                        // window would set "130h4m" at 2.35x inside the
+                        // readout window, six characters of arithmetic
+                        // homework where "5d10h" is five characters of
+                        // answer, and the limit rows 300pt away already say
+                        // it the second way.
+                        .value = fmtReset(ui, reset - glance.now_ms),
                         .ink = theme.cluster_colors.text,
                         .caption = "to window reset",
                         .caption_ink = theme.cluster_colors.text_muted,
@@ -740,34 +884,6 @@ fn readout(ui: *Ui, model: *const Model, glance: trayfmt.GlanceState, danger: bo
     }
 }
 
-/// "Which agent is burning right now", printed on the dial itself. The
-/// blended needle cannot answer it — that is the whole reason
-/// `AgentBurn` exists — and it is the first thing anyone asks when the
-/// needle is high.
-fn hotAgentChip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void {
-    const hot = model.agent_burn.hottest(model.now_ms) orelse {
-        push(ui, nodes, ui.text(.{
-            .frame = rect(gauge_cx - 60, gauge_cy + 72, 120, 14),
-            .size = .sm,
-            .text_alignment = .center,
-            .style = .{ .foreground = theme.text_faint },
-        }, "fleet idle"));
-        return;
-    };
-    const ink = agentInk(hot.agent);
-    push(ui, nodes, ui.panel(.{
-        .frame = rect(gauge_cx - 58, gauge_cy + 77, 5, 5),
-        .style = .{ .background = ink, .radius = 2.5, .stroke_width = 0 },
-    }, .{}));
-    push(ui, nodes, ui.paragraph(.{
-        .frame = rect(gauge_cx - 48, gauge_cy + 72, 110, 14),
-        .style = .{ .foreground = ink },
-    }, &.{
-        .{ .text = agentUpper(ui, hot.agent), .weight = .bold, .monospace = true, .scale = 0.8 },
-        .{ .text = ui.fmt("  {s}/m", .{fmtTokens(ui, @intFromFloat(@max(hot.tokens_per_min, 0)))}), .monospace = true, .scale = 0.8, .color = .text_muted },
-    }));
-}
-
 // ------------------------------------------------------- the burn trace
 
 /// Fleet burn at 10-second resolution across the last 20 minutes, at the
@@ -784,11 +900,27 @@ fn burnTrace(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void 
         .style = .{ .foreground = theme.text_faint },
     }, "BURN · 20 MIN"));
     push(ui, nodes, ui.text(.{
-        .frame = rect(166, 318, 110, 12),
+        .frame = rect(146, 318, 130, 12),
         .size = .sm,
         .text_alignment = .end,
         .style = .{ .foreground = theme.text_faint },
-    }, ui.fmt("peak {s}/m", .{fmtTokens(ui, @intFromFloat(@max(model.gauge_peak_tpm, 0)))})));
+    }, if (model.catchup_active)
+        "scanning…"
+    else
+        ui.fmt("peak {s}/m", .{fmtTokens(ui, @intFromFloat(@max(model.gauge_peak_tpm, 0)))})));
+
+    // Two fixes for the cold-start frame, which drew a hard flat rule
+    // across the middle of the band that read as a divider rather than as
+    // data. An all-zero series has no domain, so the derived y range
+    // collapsed and the line floated; pinning `y_max` puts zero where
+    // zero belongs — on the baseline. And a rule at the baseline still
+    // says "flat out" while it is inked in the burn accent, so with
+    // nothing recorded the lane goes muted and unfilled: an axis, not a
+    // reading.
+    const spark = burnSpark(ui, model);
+    var peak: f32 = 0;
+    for (spark) |value| peak = @max(peak, value);
+    const live = peak > 0;
 
     push(ui, nodes, ui.stack(.{
         .frame = rect(24, 330, 252, 18),
@@ -797,13 +929,24 @@ fn burnTrace(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void 
             .width = 252,
             .height = 18,
             .y_min = 0,
+            // 25% headroom over the peak, so a pegged trace tops out at
+            // four fifths of the lane instead of at its ceiling. The label
+            // row above (`BURN · 20 MIN` / `peak …/m`) is `.sm` text in a
+            // 12pt box and its glyphs overhang the box by a couple of
+            // points; with the trace drawn to the full height of a lane
+            // that starts immediately below, a sustained peak — which is
+            // exactly when someone looks at this lane — ran straight
+            // through the caption that names it. Headroom above the
+            // maximum is what a plot should have anyway; here it is also
+            // the clearance.
+            .y_max = @max(peak * 1.25, 1),
             .stroke_width = 1.5,
             .hover_details = true,
         }, &.{.{
             .kind = .line,
-            .values = burnSpark(ui, model),
-            .color = .accent,
-            .fill = true,
+            .values = spark,
+            .color = if (live) .accent else .text_muted,
+            .fill = live,
             .label = "burn",
         }}),
     }));
@@ -823,7 +966,13 @@ fn etaLine(ui: *Ui, glance: trayfmt.GlanceState, danger: bool) EtaLine {
     if (glance.next_reset_ms) |reset| {
         if (reset > glance.now_ms) {
             return .{
-                .text = ui.fmt("resets {s}", .{fmtCountdown(ui, reset - glance.now_ms)}),
+                // `fmtReset`, NOT `fmtCountdown`. When the nearest reset is
+                // a weekly window the tray's core form prints "130h4m" —
+                // and this line sits 40pt under a readout window whose
+                // sibling limit rows print the same quantity as "5d10h".
+                // One surface, one duration format; nobody divides 130 by
+                // 24 in their head to find out it means Saturday.
+                .text = ui.fmt("resets {s}", .{fmtReset(ui, reset - glance.now_ms)}),
                 .ink = theme.cluster_colors.text_muted,
             };
         }
@@ -1018,14 +1167,16 @@ fn windowRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), window: types.LimitWindow,
     // Stale readings render at half strength, no tip glow — the bar is
     // the last known value, not the current one.
     const ink = if (stale) withAlpha(theme.windowZone(pct / 100), 0.45) else theme.windowZone(pct / 100);
-    // Row budget inside `col_w` (142): label 0..28, track 30..70,
-    // percent 72..96, reset 100..142. The track gave up 8pt so the reset
-    // column could have 42 instead of 36 — at 36 a five-glyph countdown
-    // ("4h40m", "5d11h") elided to "4h4…", and the percent column ended
-    // at exactly the x the reset column started, so a full-width percent
-    // printed "41%5d11h" with no space between two unrelated numbers.
+    // Row budget inside `col_w` (142): label 0..28, track 30..66,
+    // percent 68..92, reset 94..142. The track gives up width so the
+    // reset column can have 48 — the countdowns are `sm` PROPORTIONAL
+    // text, so "5d11h" and "3h48m" are the same five glyphs but not the
+    // same width, and at 42 the ones ending in a wide 'm' printed
+    // "3h48…". The percent column also stops 2pt short of the reset
+    // column, because at a shared edge a full-width percent printed
+    // "41%5d11h" with no space between two unrelated numbers.
     const track_x: f32 = x + 30;
-    const track_w: f32 = 40;
+    const track_w: f32 = 36;
     push(ui, nodes, ui.panel(.{
         .frame = rect(track_x, y + 5, track_w, 6),
         .style = .{ .background = theme.track, .radius = 3, .stroke_width = 0 },
@@ -1046,14 +1197,14 @@ fn windowRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), window: types.LimitWindow,
     }
 
     push(ui, nodes, ui.paragraph(.{
-        .frame = rect(x + 72, y, 24, 14),
+        .frame = rect(x + 68, y, 24, 14),
         .text_alignment = .end,
         .style = .{ .foreground = ink },
     }, &.{.{ .text = ui.fmt("{d}%", .{@as(u64, @intFromFloat(pct))}), .monospace = true, .scale = 0.9 }}));
 
     if (window.resets_at_ms > now_ms) {
         push(ui, nodes, ui.text(.{
-            .frame = rect(x + col_w - 42, y, 42, 14),
+            .frame = rect(x + col_w - 48, y, 48, 14),
             .size = .sm,
             .text_alignment = .end,
             .style_tokens = .{ .foreground = .text_muted },
@@ -1160,6 +1311,16 @@ const FleetRow = struct {
     detail: []const u8,
     /// Global key for the activity pip, so `animations` can pulse it.
     pip_key: u64,
+    /// What the focus block expands when this row is the selected one.
+    focus: Focus,
+};
+
+/// The subject a focus block breaks down. Agent-grained rows expand into
+/// their live sessions; session-grained rows expand into the session's
+/// own facts, which is the one place in the popover a model name appears.
+const Focus = union(enum) {
+    agent: types.Agent,
+    session: *const sessions.Session,
 };
 
 fn agentsPage(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, frame: geometry.RectF) void {
@@ -1192,6 +1353,7 @@ fn agentsPage(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, fram
                     fmtCost(ui, view.totals.cost_usd),
                 }),
                 .pip_key = agentPipKey(agent),
+                .focus = .{ .agent = agent },
             };
             n += 1;
         }
@@ -1226,6 +1388,7 @@ fn sessionsPage(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, fr
                 fmtCost(ui, session.totals.cost_usd),
             }),
             .pip_key = sessionPipKey(i),
+            .focus = .{ .session = session },
         };
     }
     fleetRows(ui, nodes, model, frame, rows[0..live.len], "no live sessions");
@@ -1276,10 +1439,7 @@ fn fleetRows(
     }
 
     if (shown == 0) {
-        push(ui, nodes, ui.text(.{
-            .frame = rect(bars_x, frame.y + 40, bars_right - bars_x, 16),
-            .style_tokens = .{ .foreground = .text_muted },
-        }, empty_text));
+        emptyPage(ui, nodes, model, frame, empty_text);
         return;
     }
 
@@ -1308,7 +1468,192 @@ fn fleetRows(
             .text_alignment = .end,
             .style = .{ .foreground = theme.text_faint },
         }, ui.fmt("+{d} more", .{rows.len - shown})));
+        y += 15;
     }
+
+    // Whatever the roster did not need. With one agent burning — the
+    // COMMON case, not the four-agent case the panel was composed
+    // against — the roster used a fifth of the panel and left the rest
+    // black, and a panel that is mostly black on the common case is
+    // worse than a smaller panel. The leftover now breaks the selected
+    // row down: its live sessions (or, on the session page, the session's
+    // own facts, which is the only place a model name surfaces in the
+    // popover) over a wider trace than a 84pt row sparkline can carry.
+    // At four agents there is nothing left over and the block simply
+    // does not exist, which is the correct behaviour for a region whose
+    // height was never guaranteed.
+    const bottom = frame.y + frame.height - 10;
+    if (bottom - y >= focus_min_h) focusBlock(ui, nodes, model, rows[selected], y + 6, bottom - y - 6);
+}
+
+/// Below this there is not enough room for a rule, a label and one line,
+/// and a truncated breakdown is worse than none.
+///
+/// Sized to exactly what `focusBlock` needs to say something true: the
+/// 22pt heading band plus one 16pt line. It was 52, which is what the
+/// block wants when it also draws a trace — but the block already
+/// degrades to lines-only when a trace would be a smear, so the higher
+/// gate bought nothing and cost everything in the 38..51pt band. That
+/// band is not rare: at two or three burning agents the roster leaves
+/// almost exactly that much, so the common fleet size fell through the
+/// gate and rendered the void the block exists to prevent.
+const focus_min_h: f32 = 38;
+const focus_line_h: f32 = 16;
+
+/// One line of a focus breakdown. Session records lead with the subject
+/// (bright left, quiet right); key/value facts lead with the key (quiet
+/// left, bright right).
+const FocusLine = struct {
+    left: []const u8,
+    /// Quiet middle column. Session records put the model here so it
+    /// elides in a lane of its own instead of shoving the cost off the
+    /// end of one long mashed string.
+    mid: []const u8 = "",
+    right: []const u8,
+    /// True for key/value facts, where the VALUE is the payload.
+    value_right: bool = false,
+};
+
+fn focusBlock(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, row: FleetRow, y0: f32, h: f32) void {
+    push(ui, nodes, ui.panel(.{
+        .frame = rect(bars_x, y0, bars_right - bars_x, 1),
+        .style = .{ .background = theme.hairline, .radius = 0, .stroke_width = 0 },
+    }, .{}));
+
+    var buf: [4]FocusLine = undefined;
+    var session_slots: [sessions.max_sessions]*const sessions.Session = undefined;
+    var lines: []const FocusLine = &.{};
+    var heading: []const u8 = "";
+    var spark: []const f32 = &.{};
+    var span: []const u8 = "";
+
+    switch (row.focus) {
+        .agent => |agent| {
+            const live = model.roster.forAgent(agent, &session_slots, model.now_ms);
+            var n: usize = 0;
+            for (live) |session| {
+                if (n == buf.len) break;
+                const project = session.project();
+                buf[n] = .{
+                    .left = if (project.len > 0) project else session.sessionId(),
+                    .mid = if (session.modelName().len > 0) session.modelName() else "model unknown",
+                    .right = ui.fmt("{d}t · {s}", .{ session.turns(), fmtCost(ui, session.totals.cost_usd) }),
+                };
+                n += 1;
+            }
+            lines = buf[0..n];
+            // No count in the heading: `byAgent` (which writes the row's
+            // detail line) counts every session the roster still holds
+            // while `forAgent` lists only the ones that are not done, so
+            // a number here would sit under "2 sessions" saying "1" and
+            // read as a contradiction rather than as two time windows.
+            heading = "LIVE SESSIONS";
+            spark = agentSpark(ui, model, agent);
+            span = "15 MIN";
+        },
+        .session => |session| {
+            buf[0] = .{ .left = "model", .right = if (session.modelName().len > 0) session.modelName() else "unknown", .value_right = true };
+            buf[1] = .{ .left = "turns", .right = ui.fmt("{d}", .{session.turns()}), .value_right = true };
+            buf[2] = .{ .left = "tokens", .right = fmtTokens(ui, session.totals.totalTokens()), .value_right = true };
+            buf[3] = .{ .left = "path", .right = session.cwdPath(), .value_right = true };
+            lines = buf[0..4];
+            heading = "SESSION DETAIL";
+            spark = sessionSpark(ui, session);
+            span = "10 MIN";
+        },
+    }
+
+    push(ui, nodes, ui.text(.{
+        .frame = rect(bars_x, y0 + 6, 140, 12),
+        .size = .sm,
+        .style = .{ .foreground = theme.text_faint },
+    }, heading));
+
+    // Lines first, trace with whatever survives. A trace under 22pt is a
+    // smear, so the block spends its height on facts before pictures and
+    // only draws a lane when a real one fits.
+    var y = y0 + 22;
+    const want = h - 22 - focus_line_h * @as(f32, @floatFromInt(lines.len)) - 14;
+    const trace_h: f32 = if (want >= 22) @min(want, 46) else 0;
+    const line_floor = y0 + h - (if (trace_h > 0) trace_h + 14 else 0);
+    for (lines) |line| {
+        if (y + focus_line_h > line_floor) break;
+        push(ui, nodes, ui.text(.{
+            .frame = rect(bars_x, y, if (line.mid.len > 0) 110 else 116, 13),
+            .size = .sm,
+            .style_tokens = .{ .foreground = if (line.value_right) .text_muted else .text },
+        }, line.left));
+        if (line.mid.len > 0) {
+            push(ui, nodes, ui.text(.{
+                .frame = rect(bars_x + 114, y, 96, 13),
+                .size = .sm,
+                .style = .{ .foreground = theme.text_faint },
+            }, line.mid));
+        }
+        const value_x: f32 = if (line.mid.len > 0) bars_right - 86 else bars_x + 120;
+        push(ui, nodes, ui.text(.{
+            .frame = rect(value_x, y, bars_right - value_x, 13),
+            .size = .sm,
+            .text_alignment = .end,
+            .style_tokens = .{ .foreground = if (line.value_right) .text else .text_muted },
+        }, line.right));
+        y += focus_line_h;
+    }
+
+    if (trace_h > 0) {
+        push(ui, nodes, ui.text(.{
+            .frame = rect(bars_x, y0 + h - trace_h - 13, 120, 12),
+            .size = .sm,
+            .style = .{ .foreground = theme.text_faint },
+        }, ui.fmt("BURN · {s}", .{span})));
+        var peak: f32 = 0;
+        for (spark) |value| peak = @max(peak, value);
+        push(ui, nodes, ui.stack(.{
+            .frame = rect(bars_x, y0 + h - trace_h, bars_right - bars_x, trace_h),
+        }, .{
+            ui.chart(.{
+                .width = bars_right - bars_x,
+                .height = trace_h,
+                .y_min = 0,
+                .y_max = @max(peak, 1),
+                .stroke_width = 1.2,
+                .hover_details = true,
+            }, &.{.{
+                .kind = .line,
+                .values = spark,
+                .color = if (peak > 0) .accent else .text_muted,
+                .fill = peak > 0,
+                .label = row.name,
+            }}),
+        }));
+    }
+}
+
+/// Nothing to list. The shipped panel printed one muted line at the top
+/// of a 190pt black rectangle, which reads as a rendering failure rather
+/// than as a state. Centred, with the catch-up progress the engine
+/// already knows, it reads as the machine working.
+fn emptyPage(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, frame: geometry.RectF, empty_text: []const u8) void {
+    const mid = frame.y + 40 + (frame.y + frame.height - (frame.y + 40)) / 2;
+    // No spinner and no second progress bar here on purpose: the dial
+    // readout already carries the one live "working" signal for the
+    // whole frame, and duplicating it in the panel beside it would be
+    // exactly the padding this pass is removing everywhere else.
+    const scanning = model.catchup_active;
+    push(ui, nodes, ui.text(.{
+        .frame = rect(bars_x, mid - 18, bars_right - bars_x, 16),
+        .text_alignment = .center,
+        .style_tokens = .{ .foreground = .text_muted },
+    }, if (scanning) "reading history" else empty_text));
+    push(ui, nodes, ui.text(.{
+        .frame = rect(bars_x, mid + 2, bars_right - bars_x, 14),
+        .size = .sm,
+        .text_alignment = .center,
+        .style = .{ .foreground = theme.text_faint },
+    }, if (scanning)
+        ui.fmt("{d} of {d} files", .{ @min(model.catchup_next, model.catchup_queue.len), model.catchup_queue.len })
+    else
+        "rows appear the moment an agent burns a token"));
 }
 
 fn fleetRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), row: FleetRow, index: usize, selected: bool, y: f32) void {
@@ -1744,7 +2089,17 @@ fn systemStrip(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) voi
                 .y_min = 0,
                 .y_max = 100,
                 .stroke_width = 1,
-            }, &.{.{ .kind = .line, .values = cell.spark, .color = .text_muted, .fill = true, .label = cell.label }}),
+                // UNFILLED, and the pinned 0..100 domain is why. A filled area
+                // on a fixed scale degenerates the moment a channel is both
+                // HIGH and STEADY: memory parked at 71% and a volume parked at
+                // 83% draw as solid grey rectangles 14pt and 17pt tall, which
+                // carry no shape at all and are the two heaviest objects in a
+                // strip whose whole job is to stay quiet. Worse, the mass below
+                // the line is what the eye lands on, so the one thing the trace
+                // encodes — the height of its top edge — is the thing the fill
+                // buries. As bare strokes, all five cells read against the same
+                // 0..100 baseline and are comparable across the strip on sight.
+            }, &.{.{ .kind = .line, .values = cell.spark, .color = .text_muted, .fill = false, .label = cell.label }}),
         }));
 
         // A transparent hover-hit region over the whole cell, pushed
@@ -2287,16 +2642,34 @@ fn seriesSpark(ui: *Ui, series: *const engine.SystemHistory.Series, now_ms: i64,
     _ = series.snapshot(&raw);
     const period = engine.SystemHistory.period_ms;
     const offset = ringOffset(series.windowStartMs(), period, raw.len, out.len, @divFloor(now_ms, period));
-    var held: f32 = 0;
+    // Seeded NaN, not 0. Sample-and-hold is right AFTER the first
+    // reading — a 2s sampler into a 5-minute lane has real gaps and
+    // holding the last value across them is the honest fill. BEFORE it,
+    // there is nothing to hold, and seeding 0 drew a hard floor line
+    // across every bucket older than the process: memory that has been
+    // at 72% all morning rendered as twenty minutes of 0% and then a
+    // cliff, which is a claim about the machine, not about the app's
+    // uptime. NaN is the SDK's gap value (the dashboard's lanes already
+    // rely on it), so those buckets simply are not drawn.
+    var held: f32 = std.math.nan(f32);
+    var any = false;
     for (out, 0..) |*slot, i| {
         if (ringAt(?f32, &raw, offset, i) orelse null) |value| {
             held = switch (scaling) {
                 .fraction => std.math.clamp(value, 0, 1) * 100,
                 .raw => @max(value, 0),
             };
+            any = true;
         }
         slot.* = held;
     }
+    // The ring holds samples, but none of them land in THIS window — the
+    // sampler stalled, or the panel was reopened after a long sleep. That
+    // is the same statement as "never sampled", so it takes the same
+    // route: an empty series, which the chart reports as "<label> empty"
+    // and draws as nothing. The alternative the seeded zero produced was
+    // a confident flat line along 0% for a machine nobody has looked at.
+    if (!any) return &.{};
     return out;
 }
 
@@ -2377,15 +2750,12 @@ fn fmtClock(ui: *Ui, ts_ms: i64, tz_offset_min: i32) []const u8 {
     return w.buffered();
 }
 
-fn fmtCountdown(ui: *Ui, duration_ms: i64) []const u8 {
-    const buf = ui.arena.alloc(u8, 16) catch return "";
-    var w = std.Io.Writer.fixed(buf);
-    trayfmt.writeCountdown(&w, duration_ms) catch {};
-    return w.buffered();
-}
-
-/// Reset-column countdown: weekly windows run to days, where the core
-/// "89h16m" form wraps the column — roll hours past 48 into days.
+/// The ONE countdown form on this surface. `trayfmt.writeCountdown` is
+/// the menu-bar form and stays there: the tray has ~10 characters and no
+/// neighbours, the cluster has three places that print a time-to-reset
+/// within 300pt of each other. Weekly windows run past 48h, where the
+/// core "89h16m" form both wraps the reset column and reads as a number
+/// you have to divide by 24 — roll those hours into days.
 fn fmtReset(ui: *Ui, duration_ms: i64) []const u8 {
     const total_min = @max(@divFloor(duration_ms, 60_000), 0);
     const hours = @divFloor(total_min, 60);

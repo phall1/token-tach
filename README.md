@@ -8,9 +8,13 @@ no accounts, no telemetry — and turns them into an instrument.
 ⚡ 50.7k/m → wall 3:40p          ← the menu bar, all day
 ```
 
-One click -- and the needle does the full ignition sweep every time you open it:
+One click, and the needle does the full ignition sweep every time you open it:
 
-![ignition sweep](docs/assets/ignition.gif)
+![the instrument cluster](docs/assets/popover.png)
+
+The dial is burn rate. To its right, every agent that is actually running —
+sorted by what each one is burning right now, with the session it is in.
+Underneath, the machine itself on the same 30-minute clock.
 
 ## What it shows
 
