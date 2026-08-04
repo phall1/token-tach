@@ -11,6 +11,11 @@
 //! the FIRST `sample()` call already yields a Sample; null only means a
 //! mach/sysctl call failed. Pure math lives in standalone `pub fn`s so
 //! tests need no syscalls.
+//!
+//! Two of those readings are boot constants — the VM page size and
+//! installed physical memory — so they are probed once per `State` and
+//! cached. Only the VM statistics and the pressure level, both of which
+//! actually move, are re-read per tick.
 
 const std = @import("std");
 
@@ -97,18 +102,45 @@ pub const Sample = struct {
     pressure: Pressure,
 };
 
-/// Memory readings need no prior counters; the empty State keeps the
-/// sampler contract uniform across src/core/system.
+/// Memory readings need no prior counters; State exists to hold the two
+/// boot constants (page size, installed RAM) so they are not re-asked
+/// every tick, and to keep the sampler contract uniform across
+/// src/core/system.
 pub const State = struct {
+    /// Machine constants, both 0 until the first successful probe.
+    page_size: u64 = 0,
+    total_bytes: u64 = 0,
+    /// Counts real probes of the two constants above. The cache's whole
+    /// point is that this stops at 1; the tests assert it.
+    boot_probe_count: u32 = 0,
+
     pub fn init() State {
         return .{};
+    }
+
+    /// Probe page size and installed memory on first use and hold them.
+    /// Neither can change without a reboot, so this removes a mach call
+    /// and a sysctl from every tick — ~172,800 a day at 1 Hz. A failed
+    /// probe is not cached: it leaves the counter at 0 so a later call
+    /// retries rather than pinning a null reading for the process life.
+    fn constants(self: *State) ?struct { page_size: u64, total_bytes: u64 } {
+        if (self.boot_probe_count == 0) {
+            var page_size: std.c.vm_size_t = 0;
+            if (std.c._host_page_size(std.c.mach_host_self(), &page_size) != mach.KERN_SUCCESS)
+                return null;
+            const total = sysctlScalar(u64, "hw.memsize") orelse return null;
+            if (page_size == 0) return null;
+            self.page_size = page_size;
+            self.total_bytes = total;
+            self.boot_probe_count = 1;
+        }
+        return .{ .page_size = self.page_size, .total_bytes = self.total_bytes };
     }
 };
 
 /// Take one reading. Null only on mach/sysctl failure — no baseline call
 /// is needed.
 pub fn sample(state: *State) ?Sample {
-    _ = state;
     var stats: mach.VmStatistics64 = undefined;
     var count: u32 = mach.vm_info64_count;
     if (mach.host_statistics64(
@@ -118,22 +150,18 @@ pub fn sample(state: *State) ?Sample {
         &count,
     ) != mach.KERN_SUCCESS) return null;
 
-    var page_size: std.c.vm_size_t = 0;
-    if (std.c._host_page_size(std.c.mach_host_self(), &page_size) != mach.KERN_SUCCESS)
-        return null;
-
-    const total = sysctlScalar(u64, "hw.memsize") orelse return null;
+    const boot = state.constants() orelse return null;
     const used = usedBytes(
         stats.active_count,
         stats.wire_count,
         stats.compressor_page_count,
-        page_size,
+        boot.page_size,
     );
 
     return .{
         .used_bytes = used,
-        .total_bytes = total,
-        .used_frac = usedFraction(used, total),
+        .total_bytes = boot.total_bytes,
+        .used_frac = usedFraction(used, boot.total_bytes),
         .pressure = pressureFromRaw(sysctlScalar(u32, "kern.memorystatus_vm_pressure_level")),
     };
 }
@@ -199,6 +227,24 @@ test "pressure: raw levels decode, absence degrades to unknown" {
     try testing.expectEqual(Pressure.critical, pressureFromRaw(4));
     try testing.expectEqual(Pressure.unknown, pressureFromRaw(3));
     try testing.expectEqual(Pressure.unknown, pressureFromRaw(0));
+}
+
+test "boot constants: probed once, stable, and reused by every sample" {
+    var state = State.init();
+    const first = state.constants() orelse return error.NoConstants;
+    try testing.expectEqual(@as(u32, 1), state.boot_probe_count);
+    // Page size is a power of two (4 KiB on Intel, 16 KiB on Apple Silicon).
+    try testing.expect(std.math.isPowerOfTwo(first.page_size));
+    try testing.expect(first.total_bytes > 0);
+
+    for (0..1000) |_| {
+        const again = state.constants() orelse return error.NoConstants;
+        try testing.expectEqual(first.page_size, again.page_size);
+        try testing.expectEqual(first.total_bytes, again.total_bytes);
+    }
+    // A live sample must go through the same cache, not re-probe.
+    _ = sample(&state) orelse return error.NoSample;
+    try testing.expectEqual(@as(u32, 1), state.boot_probe_count);
 }
 
 test "live: two samples with sane ranges" {

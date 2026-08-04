@@ -12,8 +12,13 @@
 //! monotonic clock. The first call after `init()` returns totals but
 //! `null` rates — there is no baseline to difference yet. Callers render
 //! rates only when present.
+//!
+//! The interface-list buffer lives on `State` and is reused: the sysctl
+//! wants a scratch buffer of a few KiB, and allocating one per tick means
+//! an mmap/munmap pair every second for the life of the process.
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const c = @cImport({
     @cInclude("sys/types.h");
     @cInclude("sys/socket.h");
@@ -22,13 +27,6 @@ const c = @cImport({
     @cInclude("net/if_var.h");
     @cInclude("net/route.h");
 });
-
-// <mach/mach_time.h> declarations, hand-rolled: the header drags in
-// mach_msg types that translate-c cannot size. These are stable libSystem
-// symbols with fixed ABI.
-const MachTimebaseInfo = extern struct { numer: u32, denom: u32 };
-extern "c" fn mach_timebase_info(info: *MachTimebaseInfo) c_int;
-extern "c" fn mach_absolute_time() u64;
 
 /// One network observation. Totals are lifetime octet counters summed
 /// across non-loopback interfaces; rates are null until a second sample
@@ -44,14 +42,53 @@ pub const Sample = struct {
     out_bytes_per_sec: ?f64 = null,
 };
 
-/// Prior counters + monotonic timestamp for rate derivation.
+/// Prior counters + monotonic timestamp for rate derivation, plus the
+/// reused sysctl scratch buffer.
+///
+/// The buffer makes `State` an owning type: it must not be copied by value
+/// while live (two copies would each believe they own the same pages), and
+/// long-lived owners should `deinit` it. Every sampler in the tree holds
+/// its `State` in place and passes it by pointer.
 pub const State = struct {
     prev_bytes_in: u64 = 0,
     prev_bytes_out: u64 = 0,
     /// mach_absolute_time converted to nanoseconds at the previous sample.
     prev_ns: u64 = 0,
     has_prev: bool = false,
+    /// Interface-list scratch, grown to the high-water mark and kept.
+    /// After the first tick or two the list stops growing and the steady
+    /// state costs zero mmap/munmap pairs.
+    buf: []u8 = &.{},
+    /// Counts real allocations of `buf`. The reuse is the point, so the
+    /// tests assert this stops growing.
+    alloc_count: u32 = 0,
+
+    /// Release the scratch buffer. The app never calls this — its samplers
+    /// live as long as the process — but a test or a short-lived caller
+    /// can, and having it makes the ownership explicit.
+    pub fn deinit(self: *State) void {
+        if (self.buf.len != 0) buf_allocator.free(self.buf);
+        self.buf = &.{};
+    }
+
+    /// Ensure `buf` holds at least `needed` bytes. Grows only: the list
+    /// size barely moves once interfaces have settled, so shrinking would
+    /// just trade a smaller RSS for a fresh mmap on the next tick.
+    fn ensureBuf(self: *State, needed: usize) ?[]u8 {
+        if (self.buf.len >= needed) return self.buf;
+        const grown = buf_allocator.alloc(u8, needed) catch return null;
+        if (self.buf.len != 0) buf_allocator.free(self.buf);
+        self.buf = grown;
+        self.alloc_count += 1;
+        return grown;
+    }
 };
+
+/// The scratch buffer is page-sized-ish, lives for the process, and is
+/// touched once a second — the page allocator is exactly right and keeps
+/// `State` free of an allocator field it would otherwise have to be
+/// constructed with.
+const buf_allocator = std.heap.page_allocator;
 
 pub fn init() State {
     return .{};
@@ -60,14 +97,14 @@ pub fn init() State {
 /// Take one sample. Returns null when the sysctl fails or the interface
 /// list cannot be fetched (transient ENOMEM race included).
 pub fn sample(state: *State) ?Sample {
-    const totals = readIfTotals() orelse return null;
+    const totals = readIfTotals(state) orelse return null;
 
     var out = Sample{
         .total_bytes_in = totals.ibytes,
         .total_bytes_out = totals.obytes,
     };
 
-    if (monotonicNs()) |now_ns| {
+    if (clock.monotonicNs()) |now_ns| {
         if (state.has_prev and now_ns > state.prev_ns) {
             const elapsed = now_ns - state.prev_ns;
             out.in_bytes_per_sec = rateBytesPerSec(state.prev_bytes_in, totals.ibytes, elapsed);
@@ -131,18 +168,9 @@ pub fn sumIfList2(buf: []const u8) Totals {
 
 // ------------------------------------------------------- syscall wrappers
 
-/// Monotonic nanoseconds since boot from mach_absolute_time, timebase
-/// corrected (Apple Silicon ticks at 24 MHz, not 1 ns). Null only if the
-/// timebase query fails.
-fn monotonicNs() ?u64 {
-    var info: MachTimebaseInfo = .{ .numer = 0, .denom = 0 };
-    if (mach_timebase_info(&info) != 0 or info.denom == 0) return null;
-    const ticks: u128 = mach_absolute_time();
-    return @intCast(ticks * info.numer / info.denom);
-}
-
-/// Fetch the interface list via sysctl and sum its byte counters.
-fn readIfTotals() ?Totals {
+/// Fetch the interface list via sysctl and sum its byte counters, reusing
+/// the buffer on `state`.
+fn readIfTotals(state: *State) ?Totals {
     var mib = [6]c_int{ c.CTL_NET, c.PF_ROUTE, 0, 0, c.NET_RT_IFLIST2, 0 };
 
     var len: usize = 0;
@@ -151,13 +179,15 @@ fn readIfTotals() ?Totals {
 
     // Slack absorbs interfaces appearing between the size probe and the
     // fetch; on overflow the second call fails and we skip this tick.
-    len += 1024;
-    const allocator = std.heap.page_allocator;
-    const buf = allocator.alloc(u8, len) catch return null;
-    defer allocator.free(buf);
+    const buf = state.ensureBuf(len + 1024) orelse return null;
 
-    if (c.sysctl(&mib, mib.len, buf.ptr, &len, null, 0) != 0) return null;
-    return sumIfList2(buf[0..len]);
+    // In-out parameter: we offer the whole buffer and the kernel writes
+    // back how much of it it actually filled. Summing past that would walk
+    // whatever the previous tick left behind.
+    var filled: usize = buf.len;
+    if (c.sysctl(&mib, mib.len, buf.ptr, &filled, null, 0) != 0) return null;
+    if (filled > buf.len) return null;
+    return sumIfList2(buf[0..filled]);
 }
 
 // ------------------------------------------------------------------ tests
@@ -218,8 +248,48 @@ test "walk: zero-length and truncated records terminate cleanly" {
     try testing.expectEqual(@as(u64, 0), sumIfList2(&.{}).obytes);
 }
 
+test "buffer: grows to the high-water mark, never shrinks, allocates once" {
+    var state = init();
+    defer state.deinit();
+
+    const first = state.ensureBuf(4096) orelse return error.OutOfMemory;
+    try testing.expectEqual(@as(u32, 1), state.alloc_count);
+    try testing.expect(first.len >= 4096);
+
+    // A request that already fits hands back the same pages.
+    for (0..1000) |_| {
+        const again = state.ensureBuf(4096) orelse return error.OutOfMemory;
+        try testing.expectEqual(first.ptr, again.ptr);
+    }
+    try testing.expectEqual(@as(u32, 1), state.alloc_count);
+
+    // A smaller request must not shrink (that would mean re-mmapping on
+    // the very next tick).
+    const smaller = state.ensureBuf(16) orelse return error.OutOfMemory;
+    try testing.expectEqual(first.ptr, smaller.ptr);
+    try testing.expectEqual(@as(u32, 1), state.alloc_count);
+
+    // Growing past the mark reallocates exactly once.
+    const bigger = state.ensureBuf(first.len + 1) orelse return error.OutOfMemory;
+    try testing.expect(bigger.len > first.len);
+    try testing.expectEqual(@as(u32, 2), state.alloc_count);
+}
+
+test "live: repeated samples reuse one buffer" {
+    var state = init();
+    defer state.deinit();
+
+    _ = sample(&state) orelse return error.SysctlFailed;
+    const after_first = state.alloc_count;
+    try testing.expectEqual(@as(u32, 1), after_first);
+    for (0..200) |_| _ = sample(&state) orelse return error.SysctlFailed;
+    // Two hundred more ticks, zero more mmap/munmap pairs.
+    try testing.expectEqual(after_first, state.alloc_count);
+}
+
 test "live smoke: two samples produce sane totals and rates" {
     var state = init();
+    defer state.deinit();
 
     const first = sample(&state) orelse return error.SysctlFailed;
     // No baseline yet: rates must be null, never zero-filled.

@@ -14,10 +14,18 @@
 //! is no prior counter pair to difference yet. Callers render rates only
 //! when present (no zeros, no dashes).
 //!
-//! This runs on the poll cadence (~2 s) for days: every CF and IOKit object
-//! created here is released before returning.
+//! The two halves move on wildly different scales, so they are separately
+//! callable: `sampleIo` must run every tick (a rate is only as good as its
+//! interval) while `sampleCapacity` is a `statfs` of a number that changes
+//! on an hourly scale and runs on the aggregator's slow cadence. `sample`
+//! does both, for callers that just want a reading.
+//!
+//! This runs on the poll cadence for days: every CF and IOKit object created
+//! here is released before returning, except the cached statistics keys,
+//! which are immortal by design (see `cachedString`).
 
 const std = @import("std");
+const clock = @import("clock.zig");
 const c = @cImport({
     // IOKitLib.h pulls in <mach/message.h>, whose packed unions translate-c
     // renders opaque; the header's _Static_asserts on their sizes then fail
@@ -30,13 +38,6 @@ const c = @cImport({
     @cInclude("IOKit/IOKitLib.h");
     @cInclude("IOKit/storage/IOBlockStorageDriver.h");
 });
-
-// <mach/mach_time.h> declarations, hand-rolled: the header drags in
-// mach_msg types that translate-c cannot size. These are stable libSystem
-// symbols with fixed ABI.
-const MachTimebaseInfo = extern struct { numer: u32, denom: u32 };
-extern "c" fn mach_timebase_info(info: *MachTimebaseInfo) c_int;
-extern "c" fn mach_absolute_time() u64;
 
 /// One disk observation. Capacity fields are always valid; rate fields are
 /// null until a second sample provides a delta baseline.
@@ -67,39 +68,74 @@ pub fn init() State {
     return .{};
 }
 
-/// Take one sample. Returns null only when `statfs("/")` itself fails
-/// (capacity is the load-bearing half); IOKit trouble degrades to null
-/// rates instead.
+/// Root-volume capacity, the slow-moving half of a reading.
+pub const Capacity = struct {
+    total_bytes: u64,
+    free_bytes: u64,
+    used_fraction: f64,
+};
+
+/// Machine-wide throughput, the fast-moving half.
+pub const IoRates = struct {
+    read_bytes_per_sec: f64,
+    write_bytes_per_sec: f64,
+};
+
+/// Take one sample: capacity plus, once a baseline exists, I/O rates.
+/// Returns null only when `statfs("/")` itself fails (capacity is the
+/// load-bearing half); IOKit trouble degrades to null rates instead.
 pub fn sample(state: *State) ?Sample {
+    const cap = sampleCapacity() orelse return null;
+    const io = sampleIo(state);
+    return .{
+        .total_bytes = cap.total_bytes,
+        .free_bytes = cap.free_bytes,
+        .used_fraction = cap.used_fraction,
+        .read_bytes_per_sec = if (io) |r| r.read_bytes_per_sec else null,
+        .write_bytes_per_sec = if (io) |r| r.write_bytes_per_sec else null,
+    };
+}
+
+/// Root-volume capacity via a single `statfs("/")`. Null when that fails.
+/// Split out so the aggregator can ask for it on a slow cadence — a disk
+/// does not change size between two ticks of a 1 Hz clock.
+pub fn sampleCapacity() ?Capacity {
     var st: c.struct_statfs = undefined;
     if (c.statfs("/", &st) != 0) return null;
 
     const bsize: u64 = st.f_bsize;
-    const total = st.f_blocks * bsize;
     const avail = st.f_bavail * bsize;
     const used = (st.f_blocks -| st.f_bfree) * bsize;
-
-    var out = Sample{
-        .total_bytes = total,
+    return .{
+        .total_bytes = st.f_blocks * bsize,
         .free_bytes = avail,
         .used_fraction = usedFraction(used, avail),
     };
+}
 
-    if (readIoTotals()) |totals| {
-        if (monotonicNs()) |now_ns| {
-            if (state.has_prev and now_ns > state.prev_ns) {
-                const elapsed = now_ns - state.prev_ns;
-                out.read_bytes_per_sec =
-                    rateBytesPerSec(state.prev_read_bytes, totals.read, elapsed);
-                out.write_bytes_per_sec =
-                    rateBytesPerSec(state.prev_write_bytes, totals.write, elapsed);
-            }
-            state.prev_read_bytes = totals.read;
-            state.prev_write_bytes = totals.write;
-            state.prev_ns = now_ns;
-            state.has_prev = true;
-        }
+/// Advance the I/O counter baseline and return the rates over the interval
+/// since the previous call. Null on the first call (nothing to difference)
+/// or when IOKit statistics are unavailable.
+///
+/// Must be called every tick even when the caller ignores the result: the
+/// rate is measured against the time between calls, so skipping one widens
+/// the window and smears the reading.
+pub fn sampleIo(state: *State) ?IoRates {
+    const totals = readIoTotals() orelse return null;
+    const now_ns = clock.monotonicNs() orelse return null;
+
+    var out: ?IoRates = null;
+    if (state.has_prev and now_ns > state.prev_ns) {
+        const elapsed = now_ns - state.prev_ns;
+        out = .{
+            .read_bytes_per_sec = rateBytesPerSec(state.prev_read_bytes, totals.read, elapsed),
+            .write_bytes_per_sec = rateBytesPerSec(state.prev_write_bytes, totals.write, elapsed),
+        };
     }
+    state.prev_read_bytes = totals.read;
+    state.prev_write_bytes = totals.write;
+    state.prev_ns = now_ns;
+    state.has_prev = true;
     return out;
 }
 
@@ -125,27 +161,16 @@ pub fn usedFraction(used_bytes: u64, avail_bytes: u64) f64 {
 
 // ------------------------------------------------------- syscall wrappers
 
-/// Monotonic nanoseconds since boot from mach_absolute_time, timebase
-/// corrected (Apple Silicon ticks at 24 MHz, not 1 ns). Null only if the
-/// timebase query fails.
-fn monotonicNs() ?u64 {
-    var info: MachTimebaseInfo = .{ .numer = 0, .denom = 0 };
-    if (mach_timebase_info(&info) != 0 or info.denom == 0) return null;
-    const ticks: u128 = mach_absolute_time();
-    return @intCast(ticks * info.numer / info.denom);
-}
-
 const IoTotals = struct { read: u64, write: u64 };
 
 /// Sum lifetime read/write byte counters across every IOBlockStorageDriver.
 /// Null when IOKit matching fails or the key CFStrings cannot be built.
 fn readIoTotals() ?IoTotals {
-    const stats_key = cfStr(c.kIOBlockStorageDriverStatisticsKey) orelse return null;
-    defer c.CFRelease(stats_key);
-    const read_key = cfStr(c.kIOBlockStorageDriverStatisticsBytesReadKey) orelse return null;
-    defer c.CFRelease(read_key);
-    const write_key = cfStr(c.kIOBlockStorageDriverStatisticsBytesWrittenKey) orelse return null;
-    defer c.CFRelease(write_key);
+    // Cached keys: hoisted out of the loop AND out of the tick — none of
+    // these three is ours to release.
+    const stats_key = cachedString(.statistics) orelse return null;
+    const read_key = cachedString(.bytes_read) orelse return null;
+    const write_key = cachedString(.bytes_written) orelse return null;
 
     // IOServiceGetMatchingServices consumes one reference to `matching`
     // regardless of outcome — no release on our side.
@@ -175,11 +200,63 @@ fn readIoTotals() ?IoTotals {
     return totals;
 }
 
-/// Owned CFString from a NUL-terminated C string; caller releases.
-fn cfStr(bytes: [*c]const u8) ?c.CFStringRef {
-    const s = c.CFStringCreateWithCString(c.kCFAllocatorDefault, bytes, c.kCFStringEncodingUTF8);
-    if (s == null) return null;
-    return s;
+/// The `Statistics` dictionary keys this sampler names. An enum with one
+/// cache slot per value, rather than a cache keyed on the literal itself: a
+/// generic keyed on a `[*:0]const u8` comptime argument silently shares one
+/// instantiation across distinct literals, which would hand back the wrong
+/// string — and reading the write counter under the read key is exactly the
+/// kind of bug that looks plausible on a dashboard.
+const Key = enum {
+    statistics,
+    bytes_read,
+    bytes_written,
+
+    fn literal(self: Key) [*:0]const u8 {
+        return switch (self) {
+            .statistics => c.kIOBlockStorageDriverStatisticsKey,
+            .bytes_read => c.kIOBlockStorageDriverStatisticsBytesReadKey,
+            .bytes_written => c.kIOBlockStorageDriverStatisticsBytesWrittenKey,
+        };
+    }
+};
+
+/// Real `CFStringCreateWithCString` calls made by `cachedString`. One per
+/// `Key` for the life of the process; the tests assert it stops growing.
+var cf_string_creates: std.atomic.Value(usize) = .init(0);
+
+pub fn cfStringCreateCount() usize {
+    return cf_string_creates.load(.monotonic);
+}
+
+/// One immortal CFString per `Key`, 0 until first use.
+///
+/// Relaxed atomics rather than plain vars: the app samples from a dedicated
+/// producer thread while the loop thread keeps a fallback sampler. The
+/// create is idempotent, so the worst a race can do is build one duplicate
+/// immortal string — never hand back a dangling one.
+var key_cache: [@typeInfo(Key).@"enum".fields.len]std.atomic.Value(usize) = @splat(.init(0));
+
+/// The immortal CFString for `key`.
+///
+/// The keys were already hoisted out of the per-service loop; this hoists
+/// them out of the tick as well, which is the loop that actually runs
+/// 86,400 times a day.
+///
+/// OWNERSHIP: the returned reference is deliberately never released, and
+/// callers must NEVER `CFRelease` it or attach a `defer` to it. That is what
+/// makes reuse safe — nothing else holds a claim on the object, so it cannot
+/// be freed out from under the next sample. The cost is three small objects
+/// for the process lifetime.
+fn cachedString(key: Key) c.CFStringRef {
+    const slot = &key_cache[@intFromEnum(key)];
+    const cached = slot.load(.monotonic);
+    if (cached != 0) return @ptrFromInt(cached);
+
+    const created = c.CFStringCreateWithCString(c.kCFAllocatorDefault, key.literal(), c.kCFStringEncodingUTF8);
+    if (created == null) return null;
+    _ = cf_string_creates.fetchAdd(1, .monotonic);
+    slot.store(@intFromPtr(created), .monotonic);
+    return created;
 }
 
 /// Read a u64 counter out of a Statistics dictionary; 0 when the entry is
@@ -217,6 +294,43 @@ test "used fraction: df semantics and empty denominator" {
     try testing.expectApproxEqAbs(@as(f64, 0.75), usedFraction(300, 100), 1e-12);
     try testing.expectEqual(@as(f64, 0), usedFraction(0, 0));
     try testing.expectEqual(@as(f64, 1), usedFraction(500, 0));
+}
+
+test "cached statistics keys: one per key, built once, never re-created" {
+    var seen: [@typeInfo(Key).@"enum".fields.len]c.CFStringRef = undefined;
+    for (std.enums.values(Key), 0..) |key, i| {
+        seen[i] = cachedString(key) orelse return error.NoCfString;
+        try testing.expect(c.CFStringGetLength(seen[i]) == @as(c.CFIndex, @intCast(std.mem.len(key.literal()))));
+        for (seen[0..i]) |prior| try testing.expect(prior != seen[i]);
+    }
+
+    const after_priming = cfStringCreateCount();
+    for (0..100) |_| {
+        for (std.enums.values(Key), 0..) |key, i| {
+            try testing.expectEqual(seen[i], cachedString(key) orelse return error.NoCfString);
+        }
+    }
+    try testing.expectEqual(after_priming, cfStringCreateCount());
+}
+
+test "live: capacity alone needs no baseline and is stable across calls" {
+    const first = sampleCapacity() orelse return error.StatfsFailed;
+    try testing.expect(first.total_bytes > 0);
+    try testing.expect(first.free_bytes < first.total_bytes);
+    try testing.expect(first.used_fraction > 0 and first.used_fraction < 1);
+    // Slow-moving by nature: two back-to-back reads see the same volume.
+    const second = sampleCapacity() orelse return error.StatfsFailed;
+    try testing.expectEqual(first.total_bytes, second.total_bytes);
+}
+
+test "live: io rates need a baseline, then stand alone from capacity" {
+    var state = init();
+    // No baseline yet: null, never a zero-filled reading.
+    try testing.expectEqual(@as(?IoRates, null), sampleIo(&state));
+    _ = usleep(50 * std.time.us_per_ms);
+    const rates = sampleIo(&state) orelse return error.NoIoRates;
+    try testing.expect(rates.read_bytes_per_sec >= 0 and rates.read_bytes_per_sec < 100e9);
+    try testing.expect(rates.write_bytes_per_sec >= 0 and rates.write_bytes_per_sec < 100e9);
 }
 
 test "live smoke: two samples produce sane capacity and rates" {
