@@ -32,13 +32,26 @@ pub const Rates = struct {
 /// `models` + `arena` atomically under the app's single-threaded update
 /// loop, and drop the old arena. Callers only ever hold a `*Db`, so the
 /// swap is invisible to them; the embedded snapshot stays as the fallback
-/// when the fetch fails.
+/// when the fetch fails. Such a refresh must also reset `resolved` to
+/// `.empty` — its answers are derived from the old `models` table and its
+/// keys live in the old arena.
 pub const Db = struct {
-    /// Owns every string and table in `models` and `unknown`.
+    /// Owns every string and table in `models`, `unknown` and `resolved`.
     arena: std.heap.ArenaAllocator,
     models: std.StringArrayHashMapUnmanaged(Rates),
     /// Dedup'd model names that failed resolution, in first-seen order.
     unknown: std.StringArrayHashMapUnmanaged(void),
+    /// Memo of `resolveUncached`, negatives included. Without it every
+    /// non-exact model id — every unpriced fleet agent, every dated variant —
+    /// re-runs the fuzzy stage's substring search across all ~147 db keys on
+    /// every single usage event, and `cost` runs once per event (twice per
+    /// change in the engine). A months-deep cold-start backfill would spend a
+    /// large fraction of its CPU re-deriving answers it already had.
+    ///
+    /// Keys are duped into `arena` on insert, same discipline as `unknown`:
+    /// one ownership story, everything released by `deinit`. Bounded by the
+    /// number of distinct model ids a ledger mentions, like `unknown`.
+    resolved: std.StringHashMapUnmanaged(?Rates),
 
     /// Parse the embedded snapshot once. `allocator` backs the arena that
     /// owns all parsed data; call `deinit` to release it.
@@ -57,6 +70,7 @@ pub const Db = struct {
             .arena = arena,
             .models = parsed.map,
             .unknown = .empty,
+            .resolved = .empty,
         };
     }
 
@@ -96,11 +110,40 @@ pub const Db = struct {
         return self.unknown.keys();
     }
 
+    /// Memoized `resolveUncached`. Pure caching layer: for any given `model`
+    /// it returns exactly what the uncached path returns, so unknown-model
+    /// bookkeeping in `cost` is untouched — a cached null still records.
+    /// Takes `*Db` for the memo write, same reason `cost` does.
+    fn resolve(self: *Db, model: []const u8) ?Rates {
+        if (self.resolved.get(model)) |hit| return hit;
+
+        const answer = self.resolveUncached(model);
+
+        // Best-effort, like `recordUnknown`: an OOM here costs speed on the
+        // next lookup, never correctness, so return the computed answer
+        // regardless of whether it made it into the memo.
+        const alloc = self.arena.allocator();
+        const gop = self.resolved.getOrPut(alloc, model) catch return answer;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = alloc.dupe(u8, model) catch {
+                // The slot still points at the caller's borrowed slice, which
+                // may outlive the db; drop it rather than cache a dangling key.
+                _ = self.resolved.remove(model);
+                return answer;
+            };
+        }
+        gop.value_ptr.* = answer;
+        return answer;
+    }
+
     /// Rates lookup with three stages: exact key, normalized (provider
     /// prefix stripped, then lowercased), then fuzzy — the db key that is
     /// the longest substring of the model name, so dated variants like
     /// "claude-sonnet-5-20260203" resolve to "claude-sonnet-5".
-    fn resolve(self: *const Db, model: []const u8) ?Rates {
+    ///
+    /// The fuzzy stage is O(db keys * name length); call `resolve` instead
+    /// unless you specifically want to bypass the memo (the tests do).
+    fn resolveUncached(self: *const Db, model: []const u8) ?Rates {
         if (self.models.get(model)) |r| return r;
 
         // Strip provider prefix(es): "openrouter/anthropic/claude-x" → "claude-x".
@@ -245,4 +288,69 @@ test "unknown model returns null and is recorded once" {
     try testing.expectEqual(@as(usize, 2), misses.len);
     try testing.expectEqualStrings("totally-made-up-model-9000", misses[0]);
     try testing.expectEqualStrings("another-mystery", misses[1]);
+}
+
+test "memo agrees with the uncached path on exact, fuzzy and unknown names" {
+    var db = try Db.init(testing.allocator);
+    defer db.deinit();
+
+    const names = [_][]const u8{
+        "claude-sonnet-5", // exact key
+        "openrouter/anthropic/Claude-Fable-5", // prefix + case normalization
+        "claude-sonnet-5-20260203", // fuzzy: dated variant
+        "kimi-k2-thinking", // unknown
+    };
+    for (names) |name| {
+        const uncached = db.resolveUncached(name);
+        // Cold (populates the memo) and warm (serves from it) must both match.
+        try testing.expectEqual(uncached, db.resolve(name));
+        try testing.expectEqual(uncached, db.resolve(name));
+    }
+    // Every name, hit or miss, is memoized exactly once.
+    try testing.expectEqual(@as(u32, names.len), db.resolved.count());
+}
+
+test "memoized miss still records the unknown model exactly once" {
+    var db = try Db.init(testing.allocator);
+    defer db.deinit();
+    const ev = testEvent("", 100, 100, 0, 0);
+    // A cached null must keep behaving like a fresh null: cost returns null
+    // and recordUnknown runs, so the set dedups rather than growing per call.
+    for (0..64) |_| {
+        try testing.expectEqual(@as(?f64, null), db.cost("qwen3-coder-480b", ev));
+    }
+    try testing.expectEqual(@as(usize, 1), db.unknownModels().len);
+    try testing.expectEqualStrings("qwen3-coder-480b", db.unknownModels()[0]);
+    try testing.expectEqual(@as(u32, 1), db.resolved.count());
+}
+
+test "memo holds up across many distinct model names" {
+    var db = try Db.init(testing.allocator);
+    defer db.deinit();
+    const ev = testEvent("", 10, 10, 0, 0);
+
+    // Keys are borrowed slices at getOrPut time; if the memo failed to dupe
+    // them into the arena, this reused buffer would corrupt earlier entries.
+    var buf: [64]u8 = undefined;
+    for (0..500) |i| {
+        const name = try std.fmt.bufPrint(&buf, "fleet-agent-{d}", .{i});
+        try testing.expectEqual(@as(?f64, null), db.cost(name, ev));
+    }
+    try testing.expectEqual(@as(u32, 500), db.resolved.count());
+    try testing.expectEqual(@as(usize, 500), db.unknownModels().len);
+
+    // Second pass over the same names adds nothing and answers identically.
+    for (0..500) |i| {
+        const name = try std.fmt.bufPrint(&buf, "fleet-agent-{d}", .{i});
+        try testing.expectEqual(db.resolveUncached(name), db.resolve(name));
+    }
+    try testing.expectEqual(@as(u32, 500), db.resolved.count());
+    try testing.expectEqual(@as(usize, 500), db.unknownModels().len);
+
+    // A priced model interleaved among the misses is unaffected.
+    try testing.expectApproxEqAbs(
+        @as(f64, 0.011),
+        db.cost("claude-fable-5", testEvent("", 100, 200, 0, 0)).?,
+        1e-12,
+    );
 }

@@ -6,11 +6,19 @@
 //! Machines without a battery (desktops, most VMs) yield null and the UI
 //! hides the element entirely — no zeros, no dashes.
 //!
-//! Runs on the poll cadence (~2 s) for days: both Copy-rule objects (the
-//! blob and the list) are released every call. Power-source descriptions
-//! follow the Get rule — they belong to the blob and must NOT be released.
+//! Runs on the poll cadence for days: both Copy-rule objects (the blob and
+//! the list) are released every call. Power-source descriptions follow the
+//! Get rule — they belong to the blob and must NOT be released. The key and
+//! value strings the lookups need are cached and immortal (see
+//! `cachedString`).
+//!
+//! Charge moves on a ~30 s scale, so the aggregator samples this module on
+//! the slow cadence (see system.zig) and carries the last reading forward
+//! between refreshes — the power-sources blob is copied out of the kernel,
+//! and there is nothing to learn from copying it every second.
 
 const std = @import("std");
+const cfcache = @import("../cfcache.zig");
 
 const c = @cImport({
     // Apple's mach headers contain _Static_asserts over bitfield structs
@@ -63,24 +71,24 @@ pub fn sample(state: *State) ?Sample {
         // Get rule: the description is owned by `info`; do not release.
         const desc = c.IOPSGetPowerSourceDescription(info, ps);
         if (desc == null) continue;
-        if (!dictStringEquals(desc, c.kIOPSTypeKey, c.kIOPSInternalBatteryType)) continue;
+        if (!dictStringEquals(desc, .type, .internal_battery_type)) continue;
         // A battery bay can exist with no battery in it.
-        if (dictBool(desc, c.kIOPSIsPresentKey) == false) continue;
+        if (dictBool(desc, .is_present) == false) continue;
 
-        const current = dictInt(desc, c.kIOPSCurrentCapacityKey) orelse continue;
-        const max = dictInt(desc, c.kIOPSMaxCapacityKey) orelse continue;
-        const charging = dictBool(desc, c.kIOPSIsChargingKey) orelse false;
-        const on_ac = dictStringEquals(desc, c.kIOPSPowerSourceStateKey, c.kIOPSACPowerValue);
+        const current = dictInt(desc, .current_capacity) orelse continue;
+        const max = dictInt(desc, .max_capacity) orelse continue;
+        const charging = dictBool(desc, .is_charging) orelse false;
+        const on_ac = dictStringEquals(desc, .power_source_state, .ac_power_value);
         return .{
             .charge = chargeFraction(current, max),
             .charging = charging,
             .on_ac = on_ac,
             .minutes_to_empty = if (!on_ac)
-                minutesFromApi(dictInt(desc, c.kIOPSTimeToEmptyKey) orelse -1)
+                minutesFromApi(dictInt(desc, .time_to_empty) orelse -1)
             else
                 null,
             .minutes_to_full = if (charging)
-                minutesFromApi(dictInt(desc, c.kIOPSTimeToFullChargeKey) orelse -1)
+                minutesFromApi(dictInt(desc, .time_to_full_charge) orelse -1)
             else
                 null,
         };
@@ -106,23 +114,80 @@ pub fn minutesFromApi(minutes: i64) ?u32 {
 
 // --------------------------------------------------------- CF plumbing
 
+/// Every IOPS string this sampler names — dictionary keys and the two
+/// values it compares against. An enum with one cache slot per value,
+/// rather than a cache keyed on the literal itself — see cfcache.zig for why
+/// a `comptime literal` generic silently shares one instantiation across
+/// distinct literals and hands back the wrong string.
+const Key = enum {
+    type,
+    internal_battery_type,
+    is_present,
+    current_capacity,
+    max_capacity,
+    is_charging,
+    power_source_state,
+    ac_power_value,
+    time_to_empty,
+    time_to_full_charge,
+
+    /// `pub` because the shared cache in cfcache.zig calls it; that is the
+    /// whole contract a `Key` owes the cache.
+    pub fn literal(self: Key) [*:0]const u8 {
+        return switch (self) {
+            .type => c.kIOPSTypeKey,
+            .internal_battery_type => c.kIOPSInternalBatteryType,
+            .is_present => c.kIOPSIsPresentKey,
+            .current_capacity => c.kIOPSCurrentCapacityKey,
+            .max_capacity => c.kIOPSMaxCapacityKey,
+            .is_charging => c.kIOPSIsChargingKey,
+            .power_source_state => c.kIOPSPowerSourceStateKey,
+            .ac_power_value => c.kIOPSACPowerValue,
+            .time_to_empty => c.kIOPSTimeToEmptyKey,
+            .time_to_full_charge => c.kIOPSTimeToFullChargeKey,
+        };
+    }
+};
+
+/// This sampler's slice of the shared immortal-CFString cache.
+///
+/// A reading touches up to nine of these, and the old code rebuilt every
+/// one of them — allocating and copying — on every tick, forever, on a
+/// background thread. The strings are fixed, so each is built at most once
+/// and kept.
+///
+/// OWNERSHIP: the returned reference is deliberately never released, and
+/// callers must NEVER `CFRelease` it or attach a `defer` to it. That is what
+/// makes reuse safe — nothing else holds a claim on the object, so it cannot
+/// be freed out from under the next sample. The cost is one small object per
+/// key for the process lifetime.
+const key_strings = cfcache.Cache(Key, c.CFStringRef);
+
+/// The immortal CFString for `key`. Never release the result.
+const cachedString = key_strings.get;
+
+/// Real `CFStringCreateWithCString` calls made by `cachedString`. One per
+/// `Key` for the life of the process; the tests assert it stops growing.
+pub fn cfStringCreateCount() usize {
+    return key_strings.createCount();
+}
+
 /// True when `dict[key]` is a CFString equal to `expected`.
-fn dictStringEquals(dict: c.CFDictionaryRef, key: [*:0]const u8, expected: [*:0]const u8) bool {
+fn dictStringEquals(dict: c.CFDictionaryRef, key: Key, expected: Key) bool {
     const value = dictValue(dict, key) orelse return false;
     if (c.CFGetTypeID(value) != c.CFStringGetTypeID()) return false;
-    const expected_cf = c.CFStringCreateWithCString(null, expected, c.kCFStringEncodingUTF8);
-    if (expected_cf == null) return false;
-    defer c.CFRelease(expected_cf);
+    // Cached comparand: do not release.
+    const expected_cf = cachedString(expected) orelse return false;
     return c.CFEqual(value, expected_cf) != 0;
 }
 
-fn dictBool(dict: c.CFDictionaryRef, key: [*:0]const u8) ?bool {
+fn dictBool(dict: c.CFDictionaryRef, key: Key) ?bool {
     const value = dictValue(dict, key) orelse return null;
     if (c.CFGetTypeID(value) != c.CFBooleanGetTypeID()) return null;
     return c.CFBooleanGetValue(@ptrCast(value)) != 0;
 }
 
-fn dictInt(dict: c.CFDictionaryRef, key: [*:0]const u8) ?i64 {
+fn dictInt(dict: c.CFDictionaryRef, key: Key) ?i64 {
     const value = dictValue(dict, key) orelse return null;
     if (c.CFGetTypeID(value) != c.CFNumberGetTypeID()) return null;
     var out: i64 = 0;
@@ -130,11 +195,10 @@ fn dictInt(dict: c.CFDictionaryRef, key: [*:0]const u8) ?i64 {
     return out;
 }
 
-/// Get rule — nothing to release on the returned value.
-fn dictValue(dict: c.CFDictionaryRef, key: [*:0]const u8) ?*const anyopaque {
-    const cf_key = c.CFStringCreateWithCString(null, key, c.kCFStringEncodingUTF8);
-    if (cf_key == null) return null;
-    defer c.CFRelease(cf_key);
+/// Get rule — nothing to release on the returned value, and the cached key
+/// is not ours to release either.
+fn dictValue(dict: c.CFDictionaryRef, key: Key) ?*const anyopaque {
+    const cf_key = cachedString(key) orelse return null;
     return c.CFDictionaryGetValue(dict, cf_key);
 }
 
@@ -158,6 +222,26 @@ test "minutes from api: -1 means calculating" {
     try testing.expectEqual(@as(?u32, null), minutesFromApi(-99));
     try testing.expectEqual(@as(?u32, 0), minutesFromApi(0));
     try testing.expectEqual(@as(?u32, 137), minutesFromApi(137));
+}
+
+test "cached IOPS strings: one per key, built once, never re-created" {
+    // Prime every key, then assert the cache is closed: same pointers, no
+    // further allocations, and no two keys sharing a slot.
+    var seen: [@typeInfo(Key).@"enum".fields.len]c.CFStringRef = undefined;
+    for (std.enums.values(Key), 0..) |key, i| {
+        seen[i] = cachedString(key) orelse return error.NoCfString;
+        try testing.expect(c.CFStringGetLength(seen[i]) == @as(c.CFIndex, @intCast(std.mem.len(key.literal()))));
+        for (seen[0..i]) |prior| try testing.expect(prior != seen[i]);
+    }
+
+    const after_priming = cfStringCreateCount();
+    for (0..100) |_| {
+        for (std.enums.values(Key), 0..) |key, i| {
+            try testing.expectEqual(seen[i], cachedString(key) orelse return error.NoCfString);
+        }
+    }
+    // A hundred more sweeps' worth of lookups, zero more CFStrings.
+    try testing.expectEqual(after_priming, cfStringCreateCount());
 }
 
 test "live: battery sample is coherent when a battery exists" {

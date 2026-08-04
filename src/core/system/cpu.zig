@@ -11,6 +11,10 @@
 //! Delta-based: the FIRST `sample()` call only records a baseline and
 //! returns null. Pure tick math lives in standalone `pub fn`s so tests
 //! need no syscalls.
+//!
+//! The perflevel sysctls are boot constants — cores do not appear or
+//! vanish while the machine runs — so they are read once per `State` and
+//! cached; only the mach call and `getloadavg` repeat per tick.
 
 const std = @import("std");
 
@@ -68,14 +72,36 @@ pub const Sample = struct {
     e_cluster_frac: ?f64,
 };
 
-/// Prior cumulative tick counters, so the next call can take deltas.
+/// Prior cumulative tick counters, so the next call can take deltas, plus
+/// the cached boot constants.
 pub const State = struct {
     prev_ticks: [max_cpus][tick_states]u32 = @splat(@splat(0)),
     prev_ncpu: u32 = 0,
     has_baseline: bool = false,
+    /// hw.perflevel0.logicalcpu (performance cores) as first read; null
+    /// means the sysctl is absent, which is itself a stable answer on
+    /// Intel and must not be re-asked every tick.
+    perf_cores: ?u32 = null,
+    /// hw.perflevel1.logicalcpu (efficiency cores), same contract.
+    eff_cores: ?u32 = null,
+    /// Counts real sysctl probes of the two constants above. The cache's
+    /// whole point is that this stops at 1; the tests assert it.
+    boot_probe_count: u32 = 0,
 
     pub fn init() State {
         return .{};
+    }
+
+    /// Read the perflevel core counts on first use and hold them. Both
+    /// are fixed at boot, so a hit here removes two sysctls per tick —
+    /// 172,800 a day at the producer's 1 Hz cadence.
+    fn clusterCounts(self: *State) struct { perf: ?u32, eff: ?u32 } {
+        if (self.boot_probe_count == 0) {
+            self.perf_cores = sysctlScalar(u32, "hw.perflevel0.logicalcpu");
+            self.eff_cores = sysctlScalar(u32, "hw.perflevel1.logicalcpu");
+            self.boot_probe_count = 1;
+        }
+        return .{ .perf = self.perf_cores, .eff = self.eff_cores };
     }
 };
 
@@ -125,11 +151,8 @@ pub fn sample(state: *State) ?Sample {
 
     var e_frac: ?f64 = null;
     var p_frac: ?f64 = null;
-    if (clusterLayout(
-        ncpu,
-        sysctlScalar(u32, "hw.perflevel0.logicalcpu"),
-        sysctlScalar(u32, "hw.perflevel1.logicalcpu"),
-    )) |layout| {
+    const counts = state.clusterCounts();
+    if (clusterLayout(ncpu, counts.perf, counts.eff)) |layout| {
         const e: usize = layout.e_count;
         e_frac = groupFraction(busy[0..e], idle[0..e]);
         p_frac = groupFraction(busy[e..n], idle[e..n]);
@@ -242,6 +265,18 @@ test "cluster layout: requires both sysctls and an exact core sum" {
     const layout = clusterLayout(14, 10, 4).?;
     try testing.expectEqual(@as(u32, 4), layout.e_count);
     try testing.expectEqual(@as(u32, 10), layout.p_count);
+}
+
+test "cluster counts: probed once, then answered from cache forever" {
+    var state = State.init();
+    const first = state.clusterCounts();
+    try testing.expectEqual(@as(u32, 1), state.boot_probe_count);
+    for (0..1000) |_| {
+        const again = state.clusterCounts();
+        try testing.expectEqual(first.perf, again.perf);
+        try testing.expectEqual(first.eff, again.eff);
+    }
+    try testing.expectEqual(@as(u32, 1), state.boot_probe_count);
 }
 
 test "live: baseline then a sane second sample" {

@@ -53,6 +53,50 @@ pub const Agent = enum {
     pub fn hasLimitsPanel(self: Agent) bool {
         return self == .claude or self == .codex;
     }
+
+    /// Agent -> on-disk id, the durable-history counterpart of `label()`.
+    ///
+    /// These numbers ARE the persisted identity of an agent. They may be
+    /// appended to but MUST NEVER be reordered or reused: every record ever
+    /// written carries one of them, and renumbering silently re-attributes
+    /// years of history to a different tool with no error, no migration, and
+    /// no way to tell after the fact. The switch is exhaustive on purpose —
+    /// adding an `Agent` member fails to compile here until someone assigns
+    /// it a number, which is the only moment anyone will think about it.
+    ///
+    /// 0 is reserved (an unwritten byte must not name an agent) and 255 is
+    /// history.zig's synthetic marker, so ids start at 1.
+    pub fn storageId(self: Agent) u8 {
+        return switch (self) {
+            .claude => 1,
+            .codex => 2,
+            .opencode => 3,
+            .pi => 4,
+            .gemini => 5,
+            .qwen => 6,
+            .kimi => 7,
+            .goose => 8,
+            .kilo => 9,
+            .cline => 10,
+            .roo => 11,
+            .copilot => 12,
+            .continue_cli => 13,
+            .droid => 14,
+        };
+    }
+
+    /// On-disk id -> Agent, or null for an id this build has never heard of
+    /// (a record written by a NEWER build, or a removed agent). Callers must
+    /// keep such rows: an unrecognized producer is still real spend, and a
+    /// downgrade that dropped rows it could not name would silently shrink
+    /// the user's history.
+    pub fn fromStorageId(id: u8) ?Agent {
+        inline for (@typeInfo(Agent).@"enum".fields) |field| {
+            const agent: Agent = @enumFromInt(field.value);
+            if (agent.storageId() == id) return agent;
+        }
+        return null;
+    }
 };
 
 /// One priced unit of token consumption, normalized across agents.
@@ -98,6 +142,33 @@ pub const LimitSnapshot = struct {
     plan: []const u8 = "",
     windows: []const LimitWindow = &.{},
 };
+
+test "agent storage ids are a frozen wire format: stable, dense, unique" {
+    // Spot-checks on the endpoints. If reordering the `Agent` enum ever
+    // renumbers anything, these are the assertions that catch it before a
+    // release rewrites every user's history.
+    try std.testing.expectEqual(@as(u8, 1), Agent.claude.storageId());
+    try std.testing.expectEqual(@as(u8, 2), Agent.codex.storageId());
+    try std.testing.expectEqual(@as(u8, 3), Agent.opencode.storageId());
+    try std.testing.expectEqual(@as(u8, 14), Agent.droid.storageId());
+
+    var seen = std.AutoHashMap(u8, void).init(std.testing.allocator);
+    defer seen.deinit();
+    inline for (@typeInfo(Agent).@"enum".fields) |field| {
+        const agent: Agent = @enumFromInt(field.value);
+        const id = agent.storageId();
+        // 0 is "no agent written" and 255 is history.zig's synthetic
+        // marker; neither may collide with a real agent.
+        try std.testing.expect(id != 0 and id != 255);
+        try std.testing.expect(!seen.contains(id));
+        try seen.put(id, {});
+        try std.testing.expectEqual(agent, Agent.fromStorageId(id).?);
+    }
+
+    // An id from a newer build round-trips to null, not to a neighbor.
+    try std.testing.expectEqual(@as(?Agent, null), Agent.fromStorageId(0));
+    try std.testing.expectEqual(@as(?Agent, null), Agent.fromStorageId(200));
+}
 
 test {
     const ev = UsageEvent{

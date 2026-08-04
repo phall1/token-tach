@@ -13,6 +13,7 @@
     .macos = .{ .accessory = true },
     .commands = .{
         .{ .id = "tach.dashboard", .title = "Dashboard" },
+        .{ .id = "tach.hud", .title = "Desktop HUD" },
         .{ .id = "tach.quit", .title = "Quit Token Tach" },
         .{ .id = "tach.config", .title = "Settings (config file)" },
         .{ .id = "tach.check-updates", .title = "Check for Updates" },
@@ -22,8 +23,10 @@
             .{
                 .label = "main",
                 .title = "Token Tach",
-                .width = 560,
-                .height = 472,
+                // Kept in lockstep with view.window_width/height and
+                // main.zig's shell window — nothing enforces it.
+                .width = 640,
+                .height = 500,
                 .titlebar = "chromeless",
                 .resizable = false,
                 .restore_state = false,

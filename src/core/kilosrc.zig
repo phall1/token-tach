@@ -28,11 +28,13 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const dbgate = @import("dbgate.zig");
 const c = struct {
     pub const sqlite3 = opaque {};
     pub const sqlite3_stmt = opaque {};
     pub const SQLITE_OK: c_int = 0;
     pub const SQLITE_ROW: c_int = 100;
+    pub const SQLITE_DONE: c_int = 101;
     pub const SQLITE_OPEN_READONLY: c_int = 0x00000001;
     pub const SQLITE_OPEN_READWRITE: c_int = 0x00000002;
     pub const SQLITE_OPEN_CREATE: c_int = 0x00000004;
@@ -97,6 +99,16 @@ pub const Poller = struct {
     /// Ids already ingested (or classified non-usage) whose time_updated
     /// equals cursor_ms — the ">=" tail window revisits them each poll.
     tail: std.StringHashMapUnmanaged(void) = .empty,
+    /// Filesystem change gate — the shared one in dbgate.zig, which owns the
+    /// two ordering rules (stat before open, commit only on SQLITE_DONE).
+    gate: dbgate.Gate = .{},
+    /// NUL-terminated copy of the last polled path. `sqlite3_open_v2` needs
+    /// one and the path never changes in practice, so duping it on every
+    /// 2 s tick was pure churn on the long-lived allocator.
+    zpath: ?[:0]u8 = null,
+    /// Polls that passed the change gate and went on to touch SQLite. Read by
+    /// the tests to prove the gate fires; free for callers to read too.
+    scan_count: u64 = 0,
 
     pub fn init(allocator: Allocator, agent: types.Agent) Poller {
         return .{ .allocator = allocator, .agent = agent };
@@ -105,6 +117,21 @@ pub const Poller = struct {
     pub fn deinit(self: *Poller) void {
         self.clearTail();
         self.tail.deinit(self.allocator);
+        if (self.zpath) |z| self.allocator.free(z);
+        self.zpath = null;
+    }
+
+    /// Borrow a cached NUL-terminated copy of `path`, re-duping only when the
+    /// caller hands us a different database than last time.
+    fn zPathFor(self: *Poller, path: []const u8) ![:0]const u8 {
+        if (self.zpath) |cached| {
+            if (std.mem.eql(u8, cached, path)) return cached;
+            self.allocator.free(cached);
+            self.zpath = null;
+        }
+        const owned = try self.allocator.dupeZ(u8, path);
+        self.zpath = owned;
+        return owned;
     }
 
     /// Highest message.time_updated scanned so far — persist this in the
@@ -126,8 +153,12 @@ pub const Poller = struct {
     /// are owned by `event_allocator`; release with `freeEvents`.
     pub fn poll(self: *Poller, event_allocator: Allocator, path: []const u8, out: *std.ArrayList(types.UsageEvent)) !void {
         if (path.len == 0) return;
-        const zpath = try self.allocator.dupeZ(u8, path);
-        defer self.allocator.free(zpath);
+        // The `>=` cursor re-reads and re-parses the whole tail window every
+        // tick, JSON and all. An untouched file and WAL cannot have grown a
+        // row, so two stats replace the entire open/prepare/step/close.
+        const fingerprint = self.gate.beforeOpen(path) orelse return;
+        self.scan_count += 1;
+        const zpath = try self.zPathFor(path);
 
         var db: ?*c.sqlite3 = null;
         const flags = c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_URI | c.SQLITE_OPEN_NOMUTEX;
@@ -151,7 +182,10 @@ pub const Poller = struct {
         }
         var max_ms = self.cursor_ms;
 
-        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        var step_result: c_int = undefined;
+        while (true) {
+            step_result = c.sqlite3_step(stmt);
+            if (step_result != c.SQLITE_ROW) break;
             const id = columnText(stmt, 0) orelse continue;
             const time_updated = c.sqlite3_column_int64(stmt, 3);
             if (time_updated > max_ms) {
@@ -232,6 +266,14 @@ pub const Poller = struct {
             if (gop.found_existing) self.allocator.free(id);
         }
         self.cursor_ms = max_ms;
+
+        // Never cache a partial read. A busy/corrupt/interrupted scan leaves
+        // rows unseen and the file will not change again to un-stick us, so
+        // the gate has to let the next tick retry. The cursor and tail set
+        // above are committed either way — they are the dedup mechanism, and
+        // withholding them would re-emit the rows this scan already emitted.
+        if (step_result != c.SQLITE_DONE) return;
+        self.gate.commit(fingerprint);
     }
 
     fn clearTail(self: *Poller) void {
@@ -346,11 +388,39 @@ test "poll maps assistant rows, resolves model via session join, skips non-usage
     // High water covers user + malformed rows too.
     try testing.expectEqual(@as(i64, 1700000004000), poller.highWater());
 
-    // Re-poll: the boundary row (kmsg_bad) is revisited but suppressed.
+    // Re-poll on an untouched file: the change gate returns before SQLite is
+    // opened, so the boundary row is not even revisited.
     freeEvents(testing.allocator, events.items);
     events.clearRetainingCapacity();
+    try testing.expectEqual(@as(u64, 1), poller.scan_count);
     try poller.poll(testing.allocator, path, &events);
     try testing.expectEqual(@as(usize, 0), events.items.len);
+    try testing.expectEqual(@as(u64, 1), poller.scan_count);
+    try testing.expectEqual(@as(i64, 1700000004000), poller.highWater());
+}
+
+test "a scan that never completes is not cached as up to date" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Not a SQLite file: open_v2 defers, prepare fails, no row is ever
+    // stepped. If that outcome cached the fingerprint the poller would stay
+    // wedged until something wrote to the file again.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "kilo.db", .data = "KILO but not a database" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    const path = try std.fs.path.join(testing.allocator, &.{ base, "kilo.db" });
+    defer testing.allocator.free(path);
+
+    var poller = Poller.init(testing.allocator, .opencode);
+    defer poller.deinit();
+    var events: std.ArrayList(types.UsageEvent) = .empty;
+    defer events.deinit(testing.allocator);
+
+    try poller.poll(testing.allocator, path, &events);
+    try poller.poll(testing.allocator, path, &events);
+    try testing.expectEqual(@as(usize, 0), events.items.len);
+    try testing.expectEqual(@as(u64, 2), poller.scan_count);
+    try testing.expectEqual(@as(i64, 0), poller.highWater());
 }
 
 test "incremental poll picks up new rows including same-millisecond inserts" {
@@ -388,6 +458,8 @@ test "incremental poll picks up new rows including same-millisecond inserts" {
     try testing.expectEqual(@as(usize, 1), events.items.len);
     try testing.expectEqual(@as(u64, 9), events.items[0].input_tokens);
     try testing.expectEqual(@as(i64, 1700000005000), poller.highWater());
+    // The insert moved the fingerprint, so exactly one more scan happened.
+    try testing.expectEqual(@as(u64, 2), poller.scan_count);
     freeEvents(testing.allocator, events.items);
     events.clearRetainingCapacity();
 

@@ -18,6 +18,7 @@ const geometry = native_sdk.geometry;
 const engine = @import("engine.zig");
 const view = @import("view.zig");
 const dashboard = @import("dashboard.zig");
+const hud = @import("hud.zig");
 const cli = @import("cli.zig");
 const theme = @import("theme.zig");
 const trayfmt = @import("core/trayfmt.zig");
@@ -72,7 +73,24 @@ const TachApp = native_sdk.UiApp(Model, Msg);
 /// from the model after every dispatch; the runtime patches only what
 /// changed.
 fn statusItem(model: *const Model, scratch: *TachApp.StatusItemScratch) TachApp.StatusItemState {
-    const title = trayfmt.render(&scratch.title_buffer, model.cfg.tray_format, engine.glanceState(model));
+    // The engine already rendered this exact template into `glance_text`
+    // on the refresh that produced the model we are looking at, so
+    // re-rendering it here would repeat a `ledger.today` lookup, a
+    // `nearestWall` scan and a `maxUtilization` scan for a string we
+    // already have. Returned slices may point at the model (the SDK
+    // copies what it keeps).
+    //
+    // The length guard is not decoration: the runtime REJECTS a tray
+    // title over `max_tray_title_bytes`, and rendering into the scratch
+    // buffer was what silently clamped a long `tray-format` to that
+    // bound. `glance_buf` is wider (the popover shows the same line
+    // untruncated), so a long template falls back to the scratch render
+    // and gets exactly the truncation it always got. The other branch is
+    // the pre-first-refresh window, where `glance_text` is still empty.
+    const title = if (model.glance_text.len > 0 and model.glance_text.len <= scratch.title_buffer.len)
+        model.glance_text
+    else
+        trayfmt.render(&scratch.title_buffer, model.cfg.tray_format, engine.glanceState(model));
     scratch.items[0] = .{ .id = 1, .label = model.claude_text, .enabled = false };
     scratch.items[1] = .{ .id = 2, .label = model.codex_text, .enabled = false };
     scratch.items[2] = .{ .id = 3, .label = model.opencode_text, .enabled = false };
@@ -82,16 +100,20 @@ fn statusItem(model: *const Model, scratch: *TachApp.StatusItemScratch) TachApp.
     // menu item opens the popover cluster without any app wiring.
     scratch.items[5] = .{ .id = 6, .label = "Open Tach", .command = "native-sdk.tray.toggle-popover" };
     scratch.items[6] = .{ .id = 7, .label = "Dashboard", .command = "tach.dashboard" };
-    scratch.items[7] = .{ .id = 8, .label = "Settings (config file)", .command = "tach.config" };
-    scratch.items[8] = .{ .id = 9, .separator = true };
-    var count: usize = 9;
+    // The HUD is click-through, so this item is not merely the nicest
+    // way to dismiss it — it is the ONLY one. The label carries the
+    // direction because TrayMenuItem has no checked state.
+    scratch.items[7] = .{ .id = 8, .label = hud.menuLabel(model), .command = "tach.hud" };
+    scratch.items[8] = .{ .id = 9, .label = "Settings (config file)", .command = "tach.config" };
+    scratch.items[9] = .{ .id = 10, .separator = true };
+    var count: usize = 10;
     if (updater_options.enabled) {
-        scratch.items[count] = .{ .id = 10, .label = "Check for Updates...", .command = "tach.check-updates" };
+        scratch.items[count] = .{ .id = 11, .label = "Check for Updates...", .command = "tach.check-updates" };
         count += 1;
     }
-    scratch.items[count] = .{ .id = 11, .label = "Token Tach v" ++ app_version, .enabled = false };
+    scratch.items[count] = .{ .id = 12, .label = "Token Tach v" ++ app_version, .enabled = false };
     count += 1;
-    scratch.items[count] = .{ .id = 12, .label = "Quit", .command = "tach.quit" };
+    scratch.items[count] = .{ .id = 13, .label = "Quit", .command = "tach.quit" };
     count += 1;
     return .{ .title = title, .items = scratch.items[0..count] };
 }
@@ -107,6 +129,10 @@ fn onCommand(name: []const u8) ?Msg {
     }
     if (std.mem.eql(u8, name, "tray.popover_opened")) return .popover_opened;
     if (std.mem.eql(u8, name, "tach.dashboard")) return .open_dashboard;
+    // One command, both directions: `hud_toggle` closes the panel it is
+    // already showing, which is what makes a single tray item a working
+    // dismissal for a window that cannot be clicked.
+    if (std.mem.eql(u8, name, "tach.hud")) return .{ .hud_toggle = hud.panel };
     if (std.mem.eql(u8, name, "tach.config")) return .open_config;
     if (std.mem.eql(u8, name, "tach.quit")) return .quit;
     return null;
@@ -128,6 +154,13 @@ fn tachWindows(model: *const Model, scratch: *TachApp.WindowsScratch) []const Ta
         };
         count += 1;
     }
+    // The desktop overlay: transparent, floating, click-through and
+    // non-activating (see hud.describe). Presence here IS visibility, so
+    // the tray toggle that flips `ux.hud` is the whole open/close path.
+    if (hud.open(model)) {
+        scratch.windows[count] = hud.describe(TachApp.WindowDescriptor);
+        count += 1;
+    }
     return scratch.windows[0..count];
 }
 
@@ -135,11 +168,10 @@ fn tachWindowView(ui: *AppUi, model: *const Model, window_label: []const u8) App
     if (std.mem.eql(u8, window_label, dashboard.window_label)) {
         return dashboard.rootView(ui, model);
     }
+    if (std.mem.eql(u8, window_label, hud.window_label)) {
+        return hud.rootView(ui, model);
+    }
     return ui.panel(.{}, .{});
-}
-
-pub fn initialModel() Model {
-    return .{};
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -172,6 +204,10 @@ pub fn main(init: std.process.Init) !void {
         .on_command = onCommand,
     });
     defer app_state.destroy();
+    // Runs before `destroy` (defers unwind LIFO): flush the history store
+    // and release its flock on every way out of here EXCEPT the tray Quit
+    // item, which exits the process from inside `update` and does its own.
+    defer engine.deinit(&app_state.model);
 
     engine.setup(&app_state.model, app_allocator, .{
         .home = init.environ_map.get("HOME") orelse "",
@@ -212,4 +248,47 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("tests.zig");
+}
+
+// The HUD's ONLY dismissal, exercised end to end without a display.
+//
+// `click_through` removes the overlay from pointer hit testing, so the
+// tray item is not a convenience — it is the whole open/close path, and
+// a break anywhere along it (command name, Msg mapping, panel identity,
+// descriptor declaration) leaves an undismissable window on the user's
+// desktop. This walks the real seam: tray command name → `onCommand` →
+// `update` → `windows_fn`.
+test "the tray item both opens and closes the desktop HUD" {
+    const testing = std.testing;
+    var model: Model = .{};
+    var scratch: TachApp.WindowsScratch = .{};
+
+    try testing.expectEqual(@as(usize, 0), tachWindows(&model, &scratch).len);
+
+    const toggle = onCommand("tach.hud").?;
+    engine.applyUxMsg(&model, toggle);
+    const shown = tachWindows(&model, &scratch);
+    try testing.expectEqual(@as(usize, 1), shown.len);
+    try testing.expectEqualStrings(hud.window_label, shown[0].label);
+    try testing.expect(shown[0].click_through);
+    try testing.expect(shown[0].transparent);
+
+    // Same command, opposite direction — the label is what tells the
+    // user which one they are about to get.
+    engine.applyUxMsg(&model, onCommand("tach.hud").?);
+    try testing.expectEqual(@as(usize, 0), tachWindows(&model, &scratch).len);
+}
+
+test "the dashboard and the HUD are independent windows" {
+    const testing = std.testing;
+    var model: Model = .{};
+    var scratch: TachApp.WindowsScratch = .{};
+
+    model.dashboard_open = true;
+    engine.applyUxMsg(&model, onCommand("tach.hud").?);
+    const shown = tachWindows(&model, &scratch);
+    // Both declared at once, and inside `max_ui_app_windows`.
+    try testing.expectEqual(@as(usize, 2), shown.len);
+    try testing.expect(shown.len <= TachApp.max_ui_windows);
+    try testing.expect(!std.mem.eql(u8, shown[0].canvas_label, shown[1].canvas_label));
 }

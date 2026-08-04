@@ -19,8 +19,14 @@
 //! millisecond-timestamp collision), the later one replaces the earlier via
 //! a replace Change — the net ledger effect is the last record's numbers.
 //!
-//! Steady-state cost is ~zero: each poll stats every matching file and
-//! re-reads/re-parses only files whose mtime OR size moved.
+//! Steady-state cost is ~zero: each poll re-reads/re-parses only files
+//! whose mtime OR size moved, and `sweep` does not even look at most files
+//! most of the time — it walks the tree on a schedule and otherwise stats
+//! only a handful of fingerprints (see `sweepIncremental`). That gate is
+//! not a micro-optimization: these roots are VS Code globalStorage task
+//! trees with ONE DIRECTORY PER TASK, so an ungated recursive walk every
+//! two seconds costs a heavy user tens of thousands of syscalls a minute
+//! per poller — for three pollers that usually have nothing new.
 //!
 //! Ownership: emitted Change events are duped with the allocator passed to
 //! scanFile/sweep (free with `freeChanges`; arenas make it free). Internal
@@ -31,6 +37,31 @@
 const std = @import("std");
 const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
+
+/// How long a sweep may go without a full tree re-walk. The safety net for
+/// every change the cheap fingerprints cannot see: a file REWRITTEN in
+/// place does not move its parent directory's mtime (that is what these
+/// sources do on every mutation), so a cold task the hot list has evicted
+/// is invisible until this fires. 30s of latency on a stale task, against
+/// a walk of thousands of directories every 2s, is the right trade.
+pub const full_walk_interval_ms: i64 = 30_000;
+
+/// How many recently-modified files the fast path stats every tick.
+/// Deliberately larger than tailsource's 8: one Cline/Roo user commonly
+/// has several tasks warm at once (multiple VS Code windows, a task plus
+/// its subagent transcripts), and a file that falls off this list goes
+/// unnoticed for up to `full_walk_interval_ms`. 32 stats per tick is
+/// noise next to the walk this whole mechanism exists to avoid.
+pub const hot_files_max = 32;
+
+/// How many subdirectories carry an mtime fingerprint between full walks.
+/// Directory mtimes are how a NEW task's file gets noticed promptly, but
+/// the roots already catch new task directories with one stat each — the
+/// per-task entries only add "a second file appeared inside an existing
+/// task directory". Tracking every task directory would put the per-tick
+/// cost back in the thousands, so only the most recently modified ones
+/// hold a slot; the rest fall to the full-walk safety net.
+pub const tracked_dirs_max = 64;
 
 /// One ledger mutation. `previous == null` means add; otherwise the ledger
 /// must replace `previous`'s contribution with `current`'s.
@@ -87,6 +118,43 @@ pub const Poller = struct {
     agent: types.Agent,
     adapter: Adapter,
     snapshots: std.StringHashMapUnmanaged(FileSnapshot) = .empty,
+    inc: Incremental = .{},
+    stats: Stats = .{},
+
+    /// Sweep telemetry. Cheap counters, and the only way to answer "is this
+    /// poller actually quiet on a tree with thousands of tasks?" without a
+    /// syscall trace — `full_walks` should stay near `elapsed /
+    /// full_walk_interval_ms` while a session is merely being appended to.
+    pub const Stats = struct {
+        /// Full recursive walks performed (the expensive tier).
+        full_walks: u64 = 0,
+        /// Ticks that skipped the walk and only stat'd fingerprints.
+        fast_ticks: u64 = 0,
+        /// Files that got past the mtime/size gate and were re-parsed.
+        files_scanned: u64 = 0,
+    };
+
+    /// Change-detection state for `sweepIncremental`: root + directory
+    /// mtimes catch files appearing, the hot list catches rewrites of the
+    /// files someone is actively using, and the clock catches everything
+    /// else. Same three tiers as tailsource.Tailer.Incremental, with the
+    /// directory tier capped (see `tracked_dirs_max`).
+    const Incremental = struct {
+        /// Sweep roots. Always fingerprinted, never evicted: a brand-new
+        /// task directory moves its root's mtime and nothing else's.
+        roots: std.ArrayList(Fingerprint) = .empty,
+        /// Most recently modified subdirectories, capped.
+        dirs: std.ArrayList(Fingerprint) = .empty,
+        /// Most recently modified matching files, capped.
+        hot: std.ArrayList(Fingerprint) = .empty,
+        last_full_walk_ms: ?i64 = null,
+
+        fn deinit(self: *Incremental, gpa: Allocator) void {
+            freeFingerprints(gpa, &self.roots);
+            freeFingerprints(gpa, &self.dirs);
+            freeFingerprints(gpa, &self.hot);
+        }
+    };
 
     const FileSnapshot = struct {
         mtime_ns: i96 = 0,
@@ -116,6 +184,7 @@ pub const Poller = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.snapshots.deinit(self.allocator);
+        self.inc.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -271,10 +340,13 @@ pub const Poller = struct {
         // Disappeared keys stay in the snapshot on purpose (see module doc).
         snap.mtime_ns = stat.mtime.nanoseconds;
         snap.size = stat.size;
+        self.stats.files_scanned += 1;
     }
 
-    /// Recursively find every file matching the adapter's suffix under each
-    /// root and scanFile it. Unreadable roots and files are skipped, not
+    /// Find every file matching the adapter's suffix under each root and
+    /// scanFile it — but only walk the tree when the cheap fingerprints say
+    /// it is worth walking (see `sweepIncremental`, which this defers to
+    /// with a monotonic clock). Unreadable roots and files are skipped, not
     /// errors: polls race live writers. `event_allocator` doubles as walk
     /// scratch (arena-friendly).
     pub fn sweep(
@@ -284,21 +356,136 @@ pub const Poller = struct {
         roots: []const []const u8,
         out: *std.ArrayList(Change),
     ) !void {
+        // `.awake` and not wall time: an NTP step or a manual clock change
+        // must not strand the full-walk safety net minutes into the future.
+        const now_ms = std.Io.Clock.now(.awake, io).toMilliseconds();
+        _ = try self.sweepIncremental(event_allocator, io, roots, out, now_ms);
+    }
+
+    /// Cheap steady-state sweep, three tiers — same strategy as
+    /// tailsource's twin. Full-walk on the first call, whenever a tracked
+    /// directory's mtime moved (a file appeared or vanished), and at least
+    /// every `full_walk_interval_ms`; otherwise stat only the root and
+    /// directory fingerprints plus the `hot_files_max` most recently
+    /// modified files. Returns true when any file was re-parsed.
+    ///
+    /// Exposed with an explicit `now_ms` so callers with a clock of their
+    /// own (and tests) can drive the schedule deterministically.
+    pub fn sweepIncremental(
+        self: *Poller,
+        event_allocator: Allocator,
+        io: std.Io,
+        roots: []const []const u8,
+        out: *std.ArrayList(Change),
+        now_ms: i64,
+    ) !bool {
+        const due = if (self.inc.last_full_walk_ms) |last|
+            now_ms - last >= full_walk_interval_ms
+        else
+            true;
+        if (due or self.dirsChanged(io)) {
+            self.stats.full_walks += 1;
+            return self.fullWalk(event_allocator, io, roots, out, now_ms);
+        }
+        self.stats.fast_ticks += 1;
+        return self.hotPass(event_allocator, io, out);
+    }
+
+    /// Did any tracked directory's mtime move since the last full walk?
+    /// A vanished (or newly appeared, hence unstattable-before) directory
+    /// counts as changed — the walk re-derives the truth either way.
+    fn dirsChanged(self: *Poller, io: std.Io) bool {
+        var cwd = std.Io.Dir.cwd();
+        for ([_][]const Fingerprint{ self.inc.roots.items, self.inc.dirs.items }) |list| {
+            for (list) |f| {
+                const stat = cwd.statFile(io, f.path, .{}) catch return true;
+                if (stat.mtime.nanoseconds != f.mtime_ns) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Stat only the hot files and re-parse the ones whose mtime or size
+    /// moved. Unreadable files are skipped rather than dropped from the
+    /// list: a file being rewritten non-atomically is momentarily absent,
+    /// and it must stay hot so the next tick sees it again.
+    fn hotPass(
+        self: *Poller,
+        event_allocator: Allocator,
+        io: std.Io,
+        out: *std.ArrayList(Change),
+    ) !bool {
+        var changed = false;
+        var cwd = std.Io.Dir.cwd();
+        for (self.inc.hot.items) |*h| {
+            const stat = cwd.statFile(io, h.path, .{}) catch continue;
+            if (self.snapshots.getPtr(h.path)) |snap| {
+                if (snap.mtime_ns == stat.mtime.nanoseconds and snap.size == stat.size) continue;
+            }
+            self.scanFile(event_allocator, io, h.path, out) catch continue;
+            h.mtime_ns = stat.mtime.nanoseconds;
+            changed = true;
+        }
+        return changed;
+    }
+
+    /// Walk everything: stat each matching file (the mtime is needed for
+    /// the hot list anyway, and it spares scanFile's open on the ~all of
+    /// them that did not move), re-parse the changed ones, and rebuild the
+    /// fingerprints the fast path runs on.
+    fn fullWalk(
+        self: *Poller,
+        event_allocator: Allocator,
+        io: std.Io,
+        roots: []const []const u8,
+        out: *std.ArrayList(Change),
+        now_ms: i64,
+    ) !bool {
+        var next: Incremental = .{ .last_full_walk_ms = now_ms };
+        errdefer next.deinit(self.allocator);
+        var changed = false;
+
         var cwd = std.Io.Dir.cwd();
         for (roots) |root| {
+            if (cwd.statFile(io, root, .{})) |stat| {
+                try appendFingerprint(self.allocator, &next.roots, root, stat.mtime.nanoseconds);
+            } else |_| continue;
             var dir = cwd.openDir(io, root, .{ .iterate = true }) catch continue;
             defer dir.close(io);
             var walker = try dir.walk(event_allocator);
             defer walker.deinit();
             while (true) {
                 const entry = (walker.next(io) catch break) orelse break;
-                if (entry.kind != .file) continue;
-                if (!std.mem.endsWith(u8, entry.path, self.adapter.file_suffix)) continue;
-                const path = try std.fs.path.join(event_allocator, &.{ root, entry.path });
-                defer event_allocator.free(path);
-                self.scanFile(event_allocator, io, path, out) catch continue;
+                switch (entry.kind) {
+                    .directory => {
+                        const stat = dir.statFile(io, entry.path, .{}) catch continue;
+                        const path = try std.fs.path.join(event_allocator, &.{ root, entry.path });
+                        defer event_allocator.free(path);
+                        try insertRecent(self.allocator, &next.dirs, path, stat.mtime.nanoseconds, tracked_dirs_max);
+                    },
+                    .file => {
+                        if (!std.mem.endsWith(u8, entry.path, self.adapter.file_suffix)) continue;
+                        const stat = dir.statFile(io, entry.path, .{}) catch continue;
+                        const path = try std.fs.path.join(event_allocator, &.{ root, entry.path });
+                        defer event_allocator.free(path);
+                        const fresh = if (self.snapshots.getPtr(path)) |snap|
+                            snap.mtime_ns != stat.mtime.nanoseconds or snap.size != stat.size
+                        else
+                            true;
+                        if (fresh) {
+                            self.scanFile(event_allocator, io, path, out) catch {};
+                            changed = true;
+                        }
+                        try insertRecent(self.allocator, &next.hot, path, stat.mtime.nanoseconds, hot_files_max);
+                    },
+                    else => {},
+                }
             }
         }
+
+        self.inc.deinit(self.allocator);
+        self.inc = next;
+        return changed;
     }
 
     // -----------------------------------------------------------------------
@@ -330,6 +517,57 @@ pub const Poller = struct {
         try snap.records.put(self.allocator, owned_key, owned_event);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Fingerprint helpers (incremental sweep)
+// ---------------------------------------------------------------------------
+
+/// An owned path plus the mtime it had at the last full walk.
+const Fingerprint = struct { path: []u8, mtime_ns: i96 };
+
+fn appendFingerprint(
+    gpa: Allocator,
+    list: *std.ArrayList(Fingerprint),
+    path: []const u8,
+    mtime_ns: i96,
+) !void {
+    const owned = try gpa.dupe(u8, path);
+    errdefer gpa.free(owned);
+    try list.append(gpa, .{ .path = owned, .mtime_ns = mtime_ns });
+}
+
+/// Keep a bounded list of the most recently modified paths, newest first.
+/// Anything older than the whole list when it is already full is dropped
+/// without allocating — the walk hands these in directory order, not time
+/// order, so most candidates lose.
+fn insertRecent(
+    gpa: Allocator,
+    list: *std.ArrayList(Fingerprint),
+    path: []const u8,
+    mtime_ns: i96,
+    max: usize,
+) !void {
+    var at: usize = list.items.len;
+    for (list.items, 0..) |f, i| {
+        if (mtime_ns > f.mtime_ns) {
+            at = i;
+            break;
+        }
+    }
+    if (at >= max) return;
+    const owned = try gpa.dupe(u8, path);
+    errdefer gpa.free(owned);
+    try list.insert(gpa, at, .{ .path = owned, .mtime_ns = mtime_ns });
+    if (list.items.len > max) {
+        const evicted = list.pop().?;
+        gpa.free(evicted.path);
+    }
+}
+
+fn freeFingerprints(gpa: Allocator, list: *std.ArrayList(Fingerprint)) void {
+    for (list.items) |f| gpa.free(f.path);
+    list.deinit(gpa);
+}
 
 // ---------------------------------------------------------------------------
 // Event helpers
@@ -569,6 +807,116 @@ test "sweep walks roots, matches the suffix, and skips other files" {
     // Quiet second sweep: nothing re-emitted.
     try poller.sweep(testing.allocator, io, &roots, &out);
     try testing.expectEqual(@as(usize, 2), out.items.len);
+}
+
+test "sweepIncremental: quiet ticks skip the walk, hot rewrites and new dirs do not" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "sessions/aa");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sessions/aa/s1.snap", .data = "k1 1000 10 1 m sess-a\n" });
+
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "{s}/sessions", .{base});
+    const roots = [_][]const u8{root};
+
+    var poller = Poller.init(testing.allocator, test_agent, test_adapter);
+    defer poller.deinit();
+    var out: std.ArrayList(Change) = .empty;
+    defer {
+        freeChanges(testing.allocator, out.items);
+        out.deinit(testing.allocator);
+    }
+
+    // First tick always walks: history parsed, fingerprints built.
+    var now: i64 = 1_000_000;
+    try testing.expect(try poller.sweepIncremental(testing.allocator, io, &roots, &out, now));
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqual(@as(u64, 1), poller.stats.full_walks);
+    try testing.expectEqual(@as(u64, 1), poller.stats.files_scanned);
+    try testing.expectEqual(@as(usize, 1), poller.inc.roots.items.len);
+    try testing.expectEqual(@as(usize, 1), poller.inc.dirs.items.len); // sessions/aa
+    try testing.expectEqual(@as(usize, 1), poller.inc.hot.items.len);
+
+    // Quiet tick: no walk at all, and the per-file gate holds too.
+    now += 2_000;
+    try testing.expect(!try poller.sweepIncremental(testing.allocator, io, &roots, &out, now));
+    try testing.expectEqual(@as(u64, 1), poller.stats.full_walks);
+    try testing.expectEqual(@as(u64, 1), poller.stats.fast_ticks);
+    try testing.expectEqual(@as(u64, 1), poller.stats.files_scanned);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+
+    // The active task's file is rewritten in place: caught on a fast tick,
+    // still without walking (this is the steady state we are optimizing).
+    try tmp.dir.writeFile(io, .{ .sub_path = "sessions/aa/s1.snap", .data = "k1 1000 100 12 m sess-a\n" });
+    now += 2_000;
+    try testing.expect(try poller.sweepIncremental(testing.allocator, io, &roots, &out, now));
+    try testing.expectEqual(@as(u64, 1), poller.stats.full_walks);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    try testing.expect(out.items[1].previous != null);
+    try testing.expectEqual(@as(u64, 10), out.items[1].previous.?.input_tokens);
+    try testing.expectEqual(@as(u64, 100), out.items[1].current.input_tokens);
+
+    // A NEW task directory moves the root's mtime -> walk this tick.
+    try tmp.dir.createDirPath(io, "sessions/bb");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sessions/bb/s2.snap", .data = "k1 2000 20 2 m sess-b\n" });
+    now += 2_000;
+    try testing.expect(try poller.sweepIncremental(testing.allocator, io, &roots, &out, now));
+    try testing.expectEqual(@as(u64, 2), poller.stats.full_walks);
+    try testing.expectEqual(@as(usize, 3), out.items.len);
+    try testing.expect(out.items[2].previous == null);
+    try testing.expectEqualStrings("sess-b", out.items[2].current.session_id);
+    try testing.expectEqual(@as(usize, 2), poller.inc.hot.items.len);
+}
+
+test "sweepIncremental: the full-walk interval rescues a file that fell off the hot list" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "sessions/aa");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sessions/aa/s1.snap", .data = "k1 1000 10 1 m sess-a\n" });
+
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "{s}/sessions", .{base});
+    const roots = [_][]const u8{root};
+
+    var poller = Poller.init(testing.allocator, test_agent, test_adapter);
+    defer poller.deinit();
+    var out: std.ArrayList(Change) = .empty;
+    defer {
+        freeChanges(testing.allocator, out.items);
+        out.deinit(testing.allocator);
+    }
+
+    var now: i64 = 1_000_000;
+    try testing.expect(try poller.sweepIncremental(testing.allocator, io, &roots, &out, now));
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+
+    // Stand in for a heavy tree evicting this task from the hot list, then
+    // rewrite the file in place: rewriting does NOT move the directory's
+    // mtime, so both cheap tiers are blind to it by construction.
+    for (poller.inc.hot.items) |h| testing.allocator.free(h.path);
+    poller.inc.hot.clearRetainingCapacity();
+    try tmp.dir.writeFile(io, .{ .sub_path = "sessions/aa/s1.snap", .data = "k1 1000 100 12 m sess-a\n" });
+
+    now += 2_000;
+    try testing.expect(!try poller.sweepIncremental(testing.allocator, io, &roots, &out, now));
+    try testing.expectEqual(@as(u64, 1), poller.stats.full_walks);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+
+    // The safety net fires and the spend lands, at most one interval late.
+    now += full_walk_interval_ms;
+    try testing.expect(try poller.sweepIncremental(testing.allocator, io, &roots, &out, now));
+    try testing.expectEqual(@as(u64, 2), poller.stats.full_walks);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    try testing.expectEqual(@as(u64, 100), out.items[1].current.input_tokens);
+    try testing.expectEqual(@as(usize, 1), poller.inc.hot.items.len); // rebuilt
 }
 
 test "seed restores snapshots: no re-emission, replaces carry the seeded previous" {

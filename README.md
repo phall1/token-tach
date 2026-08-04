@@ -8,9 +8,13 @@ no accounts, no telemetry — and turns them into an instrument.
 ⚡ 50.7k/m → wall 3:40p          ← the menu bar, all day
 ```
 
-One click -- and the needle does the full ignition sweep every time you open it:
+One click, and the needle does the full ignition sweep every time you open it:
 
-![ignition sweep](docs/assets/ignition.gif)
+![the instrument cluster](docs/assets/popover.png)
+
+The dial is burn rate. To its right, every agent that is actually running —
+sorted by what each one is burning right now, with the session it is in.
+Underneath, the machine itself on the same 30-minute clock.
 
 ## What it shows
 
@@ -20,15 +24,24 @@ One click -- and the needle does the full ignition sweep every time you open it:
 - **Predicted wall** — "at this pace you hit a limit at 3:40 PM", projected
   from the *slope of the vendors' own utilization numbers*, not guessed
   token capacities.
+- **Who's burning it** — burn split per agent, so "50.7k/m" resolves into
+  *which* of the agents on this machine is spending it right now.
 - **Window utilization** — Claude 5-hour / weekly (server truth) and Codex
   5-hour / weekly (embedded in its own logs), with reset countdowns and
   threshold coloring.
 - **Today's spend** — API-equivalent dollars for all tracked usage, priced
   against LiteLLM's model database, on a mechanical odometer. OpenCode usage
   contributes API-equivalent value; it is not claimed as subscription-covered.
-- **History dashboard** — a second native window with this month's spend,
-  subscription-value multiple, 30-day cost bars, and top model/project
-  attribution:
+- **A live session roster** — one row per agent session actually running on
+  this machine: which agent, which project, which model, turns, tokens,
+  cost, and its own burn sparkline. The interesting signal is **mid-turn**:
+  a usage event proves a turn *finished*, but a transcript that grew and
+  produced no event means an agent is thinking or running tools *at this
+  instant*. Those are tracked as two separate observations and never
+  conflated.
+- **History dashboard** — a second native window for the long view: this
+  month, subscription value, day-by-day cost, and per-model/per-project
+  attribution.
 
 ![the dashboard](docs/assets/dashboard.png)
 - **System telemetry** — a quiet strip of micro-meters under the odometer:
@@ -37,10 +50,52 @@ One click -- and the needle does the full ignition sweep every time you open it:
   subprocesses, no root, microseconds per reading. Cells only exist for
   hardware that exists (a desktop shows no battery cell), and any reading
   can be put in the menu bar via `tray-format` tokens
-  (`{cpu} {gpu} {mem} {disk} {net} {batt}`).
+  (`{cpu} {gpu} {mem} {disk} {net} {batt}`). Thirty minutes of each series
+  is kept on a wall clock, so the strip has a time axis and not just a bar
+  of *now*.
+- **A trip odometer** — what *this launch* has burned, on its own clock,
+  resettable. The counterpart to the all-time and per-day totals.
 - **Alerts and CLI** — hysteresis notifications at configured thresholds,
-  plus `--json` / `--statusline` for scripting and Claude Code statuslines.
-  `--json` includes the live system telemetry.
+  plus `--json` / `--statusline` for scripting and Claude Code statuslines,
+  and six query verbs over the durable history (below). `--json` includes
+  the live system telemetry.
+
+## What it remembers
+
+Until now the app persisted the *identity* of every event forever (dedup
+keys) and the *content* of none finer than a blended calendar day. "How
+many tokens did project X burn in June" was not a question it answered
+badly — it was a question it could not answer at all, because the
+dimension cross-product was never on disk. `per_model` and `per_project`
+were all-time cumulative with no time axis to slice.
+
+There is now a durable time series underneath it: three tiers (a 48-hour
+minute ring, plus hour and day logs that keep forever), keyed by bucket ×
+agent × model × project × session. That makes per-project-per-month, and
+every other cross-section, a real query:
+
+```sh
+# the query that was structurally impossible before
+token-tach top --dim project --since 2026-06-01 --until 2026-07-01
+
+token-tach history --since 30d --group project,agent
+token-tach sessions --since 7d --project ~/workspace/token-tach
+token-tach burn --window 15m
+token-tach export --format csv --since 90d > usage.csv
+token-tach doctor --history
+```
+
+Names are matched exactly, and a project is its full working directory —
+asking for one the store has never seen is a hard stop with an
+explanatory note, not a filter that quietly matches nothing.
+
+Records are **additive** — multiple records sharing a key sum — which is
+what makes a late-arriving transcript, a six-month backfill, and a crash
+mid-write all the same cheap operation, and a crash a *smaller* answer
+rather than a wrong one. Minute and hour buckets are UTC so a timezone
+move can't retroactively re-key them; day buckets are local, because "what
+did I spend today" is a local question, and every query prints which basis
+it used. See [docs/CLI.md](docs/CLI.md).
 
 ## Why it's fast
 
@@ -61,9 +116,11 @@ pixel through Metal.
 
 - **The popover is a patched framework.** Native SDK had a tray API but no
   `NSPopover`, no dock-less mode, no launch-at-login — so this repo vendors
-  [a fork](https://github.com/phall1/native/tree/token-tach-patches) that
-  adds all three to its Objective-C AppKit host, with the popover reparenting
-  the app's Metal surface in and out of an `NSViewController`.
+  [a fork](https://github.com/phall1/native/tree/token-tach-patches-v0.8.0)
+  of upstream v0.8.0 that adds all three to its Objective-C AppKit host,
+  with the popover reparenting the app's Metal surface in and out of an
+  `NSViewController`. A fourth patch anchors render animations to the
+  presenting frame rather than the declarer's stale clock.
 - **The needle is real geometry.** The widget grammar rasterizes rects
   axis-aligned, so the blade is a tapered vector path drawn through the
   chrome display-list seam — the one primitive that stays true under the
@@ -79,10 +136,11 @@ pixel through Metal.
   the UI updates when the machine changes, on its own cadence, replay-safe,
   with no shared mutable state. Hover any cell and the footer reveals its full
   precision via the SDK's `on_hover_enter`/`on_hover_leave` Msg bindings.
-- **Everything is fixture-tested.** ~100 tests over the UI-free core
-  (tailers, pricing, prediction, ledger, config, state), and `scripts/verify`
-  launches the real app headlessly, toggles the actual popover, walks the
-  accessibility tree, and screenshots it — locally and in CI.
+- **Everything is fixture-tested.** ~370 tests, ~300 of them over the
+  UI-free core (tailers, pricing, prediction, ledger, sessions, history,
+  config, state), and `scripts/verify` launches the real app headlessly,
+  toggles the actual popover, walks the accessibility tree, and screenshots
+  it — locally and in CI.
 
 ## Where the data comes from (the trust story)
 
@@ -106,11 +164,34 @@ pixel through Metal.
 Every collector is zero-config (auto-discovered if the harness's data
 exists, silent if not), read-only, and exact — token counts come from the
 harnesses' own logs, never estimated. `token-tach --json` reports per-source
-coverage (enabled / detected / events) so you can see exactly what is and
-isn't being counted. Harnesses that don't persist exact local token data
+coverage — enabled, detected, events, and the span the history store has
+seen it over — so you can see exactly what is and isn't being counted.
+Harnesses that don't persist exact local token data
 (Cursor, Windsurf, Grok Build, Amazon Q, ...) are deliberately excluded —
 the full matrix, including honest gaps, lives in
 [docs/COVERAGE.md](docs/COVERAGE.md).
+
+**What it writes (all local, all yours):** two things under
+`$XDG_STATE_HOME/token-tach/` — `~/.local/state/token-tach/` when that
+variable is unset — mode 0600 inside a 0700 directory:
+
+| Path | What | Notes |
+|---|---|---|
+| `tailers.json` | tailer byte offsets + ledger rollups | a cache. Delete it and the next launch re-derives everything from the transcripts. |
+| `history/` | the durable time series (`dict.log`, `hot.ring`, `hours.log`, `days.log`) | **not** a cache — the agents rotate and delete their own transcripts, so this is the only copy. |
+
+The history store is the one genuinely new write behavior, so, concretely:
+64-byte fixed records, one per (bucket × agent × model × project ×
+session); the minute ring is capped at 4 MiB and the hour/day logs grow.
+Single-digit megabytes a year is the shape of it for typical use — heavier
+before the store compacts itself, which it does at most once per launch
+when duplicate keys exceed a quarter of the records or a tier passes
+32 MB. A single writer holds `history/.lock` via `flock`; a second
+instance logs once and runs inert rather than corrupting anything. Files
+that fail their header check are *quarantined* to `<name>.bad.<ms>`, never
+deleted, because a corrupt tail may be surrounded by months of readable
+history worth recovering by hand. Nothing here leaves the machine, and
+`token-tach doctor --history` will tell you exactly what is in it.
 
 **Opt-in (`claude-oauth = true`):** Claude's server-truth utilization via
 `GET https://api.anthropic.com/api/oauth/usage` with your existing Claude
@@ -183,15 +264,24 @@ the vendored-fork rebase procedure.
 
 ```
 src/core/       UI-free engine: tailers, pricing, ledger, prediction, oauth, state
+src/core/history.zig   the durable time series (three tiers, additive records)
+src/core/sessions.zig  the live agent-session roster (incl. the mid-turn signal)
 src/engine.zig  the TEA loop: timers → sweep → ledger/burn/walls → display
 src/view.zig    the instrument cluster (canvas + vector chrome)
 src/dashboard.zig history dashboard window
-src/cli.zig     --json / --statusline local snapshot mode
+src/hud.zig     the always-on-top HUD window
+src/cli.zig     --json / --statusline / --bench + the six query verbs
 src/main.zig    shell: scene, status item, popover, runtime entry
 ```
 
 ## Status
 
+v0.9 (in flight): a durable local time series, so per-project-per-month
+and every other cross-section is answerable for the first time; a live
+agent-session roster with a mid-turn signal; per-agent burn; 30 minutes of
+system telemetry on a wall clock; a trip odometer; six CLI query verbs
+(`history`, `burn`, `top`, `sessions`, `export`, `doctor`); vendored SDK
+rebased onto upstream v0.8.0.
 v0.8: pushed system telemetry via a Native SDK external-source channel;
 hover-reveal detail on every strip cell.
 v0.7: rebased onto Native SDK v0.6; dashboard accuracy pass (honest

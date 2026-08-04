@@ -23,6 +23,9 @@ const pricing = @import("core/pricing.zig");
 const ledger_mod = @import("core/ledger.zig");
 const statefile = @import("core/statefile.zig");
 const predict = @import("core/predict.zig");
+const sessions = @import("core/sessions.zig");
+const history_mod = @import("core/history.zig");
+const ring = @import("core/ring.zig");
 const alerts = @import("core/alerts.zig");
 const oauth = @import("core/oauth.zig");
 const keychain = @import("core/keychain.zig");
@@ -53,9 +56,18 @@ pub const sweep_interval_ms: u32 = 2_000;
 pub const oauth_gate_interval_ms: u32 = 30_000;
 /// Historical catch-up cadence: fast enough to feel instant, spaced
 /// enough that render frames land between chunks.
-pub const catchup_interval_ms: u32 = 30;
-/// Per-chunk byte budget for catch-up file parsing (~a few ms of work).
-pub const catchup_chunk_bytes: u64 = 3 * 1024 * 1024;
+///
+/// 120 ms, not 30: every catch-up chunk ends in a Msg dispatch, and the
+/// SDK rebuilds the ENTIRE view tree on every Msg. At 30 ms that is a
+/// 33 Hz full rebuild for the whole duration of a cold start — the most
+/// expensive thing the app ever does, spent re-deriving a progress
+/// counter. The chunk budget below scales with it, so the parse rate in
+/// bytes/second is unchanged; only the redraws are 4x cheaper.
+pub const catchup_interval_ms: u32 = 120;
+/// Per-chunk byte budget for catch-up file parsing. Sized against
+/// `catchup_interval_ms` to hold the same bytes/second as the old
+/// 3 MiB @ 30 ms pairing.
+pub const catchup_chunk_bytes: u64 = 12 * 1024 * 1024;
 
 pub const Msg = union(enum) {
     tick: native_sdk.EffectTimer,
@@ -92,11 +104,111 @@ pub const Msg = union(enum) {
     /// Pointer left the hovered cell (SDK on_hover_leave) — footer
     /// returns to the status line.
     hover_clear,
+
+    // ---------------------------------------------------------- UI wave
+    // Declared HERE, ahead of the UI that sends them, so the view wave
+    // binds widgets without editing this file at all. Every arm below
+    // touches `Model.ux` and nothing else: no I/O, no effects, no
+    // instrument state — which is what makes them safe to land early.
+
+    /// Select a page of the multi-function display.
+    mfd_page: MfdPage,
+    /// Select the time span charts and tables cover.
+    time_range: TimeRange,
+    /// Restrict the fleet views to one agent; null shows everything.
+    filter_agent: ?types.Agent,
+    /// Sort a table by a column. Re-sending the current column flips the
+    /// direction, which is what every table in the world does.
+    sort_by: SortColumn,
+    /// Step the big readout to its next mode (rate → today → trip → eta).
+    readout_cycle,
+    /// Focus a pane of the dashboard window.
+    dashboard_focus: DashboardPane,
+    /// The user acknowledged the current alerts; silence them until
+    /// something changes.
+    alert_ack,
+    /// Toggle a HUD overlay. Sending the open panel closes it.
+    hud_toggle: HudPanel,
+    /// A HUD overlay dismissed itself (escape, click-away). Ignored
+    /// unless that panel is the one actually open, so a stale dismissal
+    /// cannot close a panel the user just opened.
+    hud_closed: HudPanel,
+    /// Pointer is over a chart sample; null clears the readout.
+    chart_hover: ?ChartHover,
+    /// A table row was pressed (row index within the rendered list).
+    row_press: u16,
+    /// Zero the trip odometer and restart its clock.
+    trip_reset,
 };
 
 /// A hover-revealable element of the instrument. Scalar payload so the
 /// SDK can capture the paired leave (a single-item pointer can't be).
 pub const HoverTarget = enum { cpu, gpu, mem, disk, net, battery };
+
+// --------------------------------------------------------- UI wave state
+// The types below exist so the view wave adds its state to `Ux` — its
+// own struct — instead of growing `Model`. They are pure display: no
+// engine code reads them, so a bad value can make the UI wrong and can
+// never make the numbers wrong.
+
+/// Which page the multi-function display shows.
+pub const MfdPage = enum { burn, sessions, windows, telemetry, ledger };
+
+/// The span a chart or table covers. `.live` is the instrument's own
+/// short window (the burn rings); the rest are history queries.
+pub const TimeRange = enum { live, hour, day, week, month, all };
+
+/// Sort key for the agent / session / model / project tables.
+pub const SortColumn = enum { cost, tokens, activity, name };
+
+/// What the large numeric readout shows.
+pub const ReadoutMode = enum { rate, today, trip, eta };
+
+/// A transient overlay panel. `.none` is "no HUD", so the open panel is
+/// one value rather than a set of bools that can disagree.
+pub const HudPanel = enum { none, alerts, sessions, help, config };
+
+/// Which pane of the dashboard window has focus.
+pub const DashboardPane = enum { overview, agents, projects, models, sessions };
+
+/// A hovered chart sample. `chart` identifies the chart (the view owns
+/// the numbering), `sample` indexes the snapshot it was drawn from —
+/// never a wall clock, because the snapshot is what the user is looking
+/// at and it scrolls between frames.
+pub const ChartHover = struct { chart: u8 = 0, sample: u16 = 0 };
+
+/// Pure-display UI state, kept in one sub-struct on the Model.
+///
+/// Wave 3 adds fields HERE. The point is that the UI can grow its own
+/// state without touching the Model's engine fields, so a UI change can
+/// never accidentally alter what gets journaled, persisted or measured.
+pub const Ux = struct {
+    mfd_page: MfdPage = .burn,
+    time_range: TimeRange = .live,
+    filter_agent: ?types.Agent = null,
+    sort_by: SortColumn = .cost,
+    /// Descending is the useful default for every column here: the
+    /// biggest spender, the newest activity, the hottest burn.
+    sort_desc: bool = true,
+    readout: ReadoutMode = .rate,
+    hover: ?ChartHover = null,
+    hud: HudPanel = .none,
+    dashboard_focus: DashboardPane = .overview,
+    /// Journaled clock of the last `alert_ack`, so "acknowledged" is a
+    /// point in time an alert can be newer than.
+    alerts_acked_ms: i64 = 0,
+    selected_row: u16 = 0,
+};
+
+/// Next readout in the cycle. A wrapping successor rather than a stored
+/// index so adding a mode to `ReadoutMode` needs no edit here.
+pub fn nextReadout(mode: ReadoutMode) ReadoutMode {
+    const values = std.enums.values(ReadoutMode);
+    // Widen before incrementing: the enum's tag type is exactly wide
+    // enough to hold its members, so `last + 1` overflows in it.
+    const idx: usize = @intFromEnum(mode);
+    return values[(idx + 1) % values.len];
+}
 
 /// One queued history file awaiting its catch-up parse.
 pub const CatchupFile = struct {
@@ -106,6 +218,78 @@ pub const CatchupFile = struct {
 };
 
 const text_buf_len = 192;
+
+/// A time axis for the telemetry strip.
+///
+/// `Model.system_snap` is a single instant, so every system meter draws
+/// a bar of NOW and nothing on the panel can answer "was the machine
+/// like this a minute ago" — the strip is a gauge cluster with no
+/// tachometer. These are the same readings on a wall clock.
+///
+/// Sizing, deliberately: 5 s buckets x 360 = exactly 30 minutes, seven
+/// series. One `ring.Series(f32, 360)` is 360 values + 360 filled flags
+/// + a small clock ~= 1.8 KB, so the whole history costs ~12.5 KB of the
+/// Model — an order of magnitude under the roster, and fixed. The
+/// producer posts at 1 Hz, so a bucket keeps the LAST of five readings
+/// rather than their mean: averaging a level series hides exactly the
+/// spikes someone is looking at a telemetry chart to find.
+///
+/// Only enabled modules are recorded (the snapshot is masked before it
+/// gets here), so turning a module off leaves a GAP rather than a run of
+/// zeros — `Series` distinguishes the two and a chart must too.
+pub const SystemHistory = struct {
+    pub const period_ms: i64 = 5_000;
+    pub const buckets: usize = 360;
+    pub const span_ms: i64 = period_ms * @as(i64, @intCast(buckets));
+    pub const Series = ring.Series(f32, buckets);
+
+    /// Whole-machine busy fraction, 0..1.
+    cpu: Series = .init(period_ms),
+    /// Accelerator device utilization, 0..1.
+    gpu: Series = .init(period_ms),
+    /// Memory used fraction, 0..1.
+    mem: Series = .init(period_ms),
+    /// Root volume used fraction, 0..1.
+    disk: Series = .init(period_ms),
+    /// Receive throughput in BYTES PER SECOND, not the meter fraction:
+    /// the meter's denominator is a ratcheted peak that moves on its own,
+    /// so a stored fraction would encode the meter's history instead of
+    /// the network's.
+    net_rx: Series = .init(period_ms),
+    /// Transmit throughput, bytes/sec.
+    net_tx: Series = .init(period_ms),
+    /// Battery charge, 0..1.
+    battery: Series = .init(period_ms),
+
+    /// Roll every series forward on wall time so a stalled sampler
+    /// scrolls its trace away instead of pinning the last reading under
+    /// the head. Safe at any cadence.
+    pub fn advanceTo(self: *SystemHistory, now_ms: i64) void {
+        inline for (@typeInfo(SystemHistory).@"struct".fields) |field| {
+            @field(self, field.name).advanceTo(now_ms);
+        }
+    }
+
+    /// Record one (already config-masked) reading at `now_ms`.
+    pub fn record(self: *SystemHistory, now_ms: i64, snap: system.Snapshot) void {
+        if (snap.cpu) |s| self.cpu.record(now_ms, @floatCast(s.total_frac));
+        if (snap.gpu) |s| self.gpu.record(now_ms, @floatCast(s.device_utilization));
+        if (snap.mem) |s| self.mem.record(now_ms, @floatCast(s.used_frac));
+        if (snap.disk) |s| self.disk.record(now_ms, @floatCast(s.used_fraction));
+        if (snap.net) |s| {
+            if (s.in_bytes_per_sec) |v| self.net_rx.record(now_ms, @floatCast(v));
+            if (s.out_bytes_per_sec) |v| self.net_tx.record(now_ms, @floatCast(v));
+        }
+        if (snap.battery) |s| self.battery.record(now_ms, @floatCast(s.charge));
+    }
+
+    /// Wall-clock start of the oldest bucket every series covers — the
+    /// shared x-axis origin (they advance together, so one answers for
+    /// all of them).
+    pub fn windowStartMs(self: *const SystemHistory) i64 {
+        return self.cpu.windowStartMs();
+    }
+};
 
 pub const Model = struct {
     allocator: std.mem.Allocator = undefined,
@@ -133,9 +317,46 @@ pub const Model = struct {
 
     prices: pricing.Db = undefined,
     ledger: ledger_mod.Ledger = undefined,
+    /// LEGACY blended burn ring. `agent_burn` is the instrument; this one
+    /// survives for exactly one reason: `view.zig`'s `burnSpark` indexes
+    /// `model.burn.buckets` / `model.burn.head` by raw slot, and view.zig
+    /// belongs to the UI wave. Both rings are fed from the same two call
+    /// sites and a test below pins them bit-for-bit, so they cannot drift
+    /// while this lasts. Deleting the field is a one-line change here the
+    /// moment `burnSpark` moves to `AgentBurn`.
     burn: predict.BurnRate = .{},
+    /// Burn split by agent, plus the fleet's 10-second scope trace.
+    /// `totalPerMin` is the needle and is bit-exact against `burn`.
+    agent_burn: predict.AgentBurn = .{},
     walls: predict.WallTracker = .{},
     alerts: alerts.AlertEngine = .{},
+
+    /// Live agent sessions — the INSTANT tier. Never persisted: it answers
+    /// "who is running right now", and a restored answer to that is a
+    /// wrong answer. (`ledger.per_session` is the process-lifetime rollup,
+    /// `history`'s session dimension is the durable record; the three are
+    /// separate on purpose.)
+    roster: sessions.Roster = .{},
+
+    /// Durable analytical time series — the FOREVER tier. Null when the
+    /// store could not be opened (another instance holds the lock, or the
+    /// state directory is unusable); every call site tolerates that,
+    /// because telemetry must never be able to break collection.
+    history: ?history_mod.Writer = null,
+    /// Events staged into the history writer since the last flush. Its OWN
+    /// counter, deliberately not `state_dirty`: `ingest` records history
+    /// without ever setting `state_dirty` (only `ingestChange` does), so a
+    /// flush gated on that flag would never fire for the claude/codex
+    /// tailers — i.e. for almost everything.
+    history_dirty: u32 = 0,
+    history_flush_countdown: u32 = history_flush_ticks,
+    /// The persisted history backfill gate. Round-tripped through the
+    /// statefile so a seeded durable store is seeded exactly once: the
+    /// plain `save`/`restore` entry points default it, which would rewrite
+    /// `backfilled = false` every minute and re-run the backfill on every
+    /// boot. Held on the Model so the save path has something truthful to
+    /// write back.
+    backfill: statefile.Backfill = .{},
 
     /// Latest limit snapshots for display (windows slices owned by us).
     claude_limits: ?types.LimitSnapshot = null,
@@ -146,6 +367,9 @@ pub const Model = struct {
     /// design — never persisted).
     system_sampler: system.Sampler = system.Sampler.init(),
     system_snap: system.Snapshot = .{},
+    /// The same readings on a wall clock (30 minutes at 5 s resolution).
+    /// Fed from the 1 Hz producer arm; see `SystemHistory`.
+    system_history: SystemHistory = .{},
     /// True when the sampler channel is unavailable (open refused, spawn
     /// failed, or the channel closed) and the 2 s sweep must sample
     /// system telemetry itself. False in the normal push path AND under
@@ -239,6 +463,31 @@ pub const Model = struct {
     /// runtime reconciles model-declared windows against this after
     /// every dispatch — presence IS visibility.
     dashboard_open: bool = false,
+
+    // Derived-state cache. `glanceState` and `dangerState` are pure
+    // functions of journaled state, and the view called them 5x and 7x
+    // per rebuild — each one a `ledger.today` hash lookup plus, for
+    // danger, `nearestWall` + `maxUtilization` over every tracked window.
+    // The refresh journals them once per clock tick.
+    //
+    // Validity is `derived_cache_ms == now_ms`, not a bool: a Model whose
+    // clock moved without a refresh (a hand-built test model, an update
+    // arm that only bumped `now_ms`) MISSES and recomputes, so the cache
+    // can make the app faster and cannot make it stale. -1 is a clock no
+    // journaled `now_ms` can hold.
+    glance_cache: trayfmt.GlanceState = .{ .now_ms = 0 },
+    danger_cache: bool = false,
+    derived_cache_ms: i64 = -1,
+
+    /// Wave-3 UI state. Additions go in `Ux`, not here.
+    ux: Ux = .{},
+
+    /// Trip odometer: what this launch has burned, the counterpart to the
+    /// ledger's all-time and per-day totals. `trip_start_ms` is both the
+    /// clock the $/hr rate divides by and the cut-off that keeps a cold
+    /// start's six months of backfill out of the trip (see `tripAdd`).
+    trip_start_ms: i64 = 0,
+    trip: ledger_mod.Totals = .{},
 };
 
 pub const IgnitionPhase = enum { off, up, settle };
@@ -253,6 +502,16 @@ pub const half_sweep_deg: f32 = 120;
 
 /// Ratchet decay per 2 s sweep: the peak halves in roughly 30 minutes,
 /// so the dial re-ranges down slowly instead of flapping.
+///
+/// "Per sweep" is load-bearing and used to be a lie: the decay lived in
+/// `refreshDisplay`, which four different cadences called — the 2 s
+/// sweep, the 1 Hz telemetry arm, the config-reload branch, and the
+/// 30 ms catch-up chunk. Steady state decayed ~3x too fast and a cold
+/// start ~66x too fast, which is why the dial visibly re-ranged while
+/// you watched it. It now applies only in `advanceInstrument`, whose
+/// callers are exactly the sweep boundaries: `boot`, `sweepOnce`, and
+/// the catch-up branch of the 2 s tick (which stands the usage sweep
+/// down but is still the 2 s tick).
 const peak_decay_per_sweep: f64 = 0.99923;
 
 /// Smallest 1-2-5 ladder scale (tokens/min) that clears the recent
@@ -277,7 +536,16 @@ pub fn needleDeg(tpm: f64, scale_tpm: f64) f32 {
 
 /// Redline truth: a wall projected within 45 minutes, or any limit
 /// window past 80% utilization.
+///
+/// Served from the refresh's cache when it is current for `now_ms` — the
+/// view asks seven times per rebuild and the answer cannot change
+/// between those asks.
 pub fn dangerState(model: *const Model) bool {
+    if (model.derived_cache_ms == model.now_ms) return model.danger_cache;
+    return computeDangerState(model);
+}
+
+fn computeDangerState(model: *const Model) bool {
     if (model.walls.maxUtilization()) |hot| {
         if (hot.used_percent > 80) return true;
     }
@@ -365,6 +633,34 @@ fn fleetPtr(model: *Model) ?*fleet.Fleet {
 /// Persist tailer+ledger state every N sweep ticks (N × 2 s ≈ 60 s).
 pub const state_save_ticks: u32 = 30;
 
+/// Flush staged history every N sweep ticks (N × 2 s ≈ 30 s). Half the
+/// statefile's cadence because the two protect different things: losing
+/// a statefile costs a re-parse, losing history costs data that the
+/// source transcripts may already have rotated away.
+pub const history_flush_ticks: u32 = 15;
+
+/// A wall clock for `setup`, which runs before the SDK's journaled one
+/// exists. libc, not a subprocess — the same synchronous read
+/// `localTzOffsetMin` makes, and for the same reason: the history store
+/// stamps its file headers and dictionary generation with the creation
+/// time, and a store created at epoch 0 would be permanently confusing.
+/// Never assigned to `Model.now_ms`; `boot` owns that field.
+fn setupWallMs() i64 {
+    return @as(i64, c.time(null)) * 1000;
+}
+
+/// The `std.Io` handed to the history writer.
+///
+/// Every other call site in this file builds a `std.Io.Threaded` on the
+/// stack and lets it die with the function. The writer is the one
+/// component that STORES its `std.Io` for the life of the process, and
+/// `Threaded.io()` points at the `Threaded` it was called on — so a
+/// stack-local one would dangle the instant `setup` returned.
+/// `global_single_threaded` is the instance with static lifetime.
+fn historyIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 /// Build the engine state: config, roots, tailers, pricing. Called once
 /// on the heap-allocated model before the runtime starts.
 pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
@@ -416,7 +712,7 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
     // never re-parsed. Any doubt about the file -> pristine full catch-up.
     model.state_path = statefile.defaultPath(allocator, env.xdg_state_home, home) catch "";
     if (model.state_path.len > 0) {
-        const outcome = statefile.restore(
+        const outcome = statefile.restoreWith(
             allocator,
             io,
             model.state_path,
@@ -425,6 +721,7 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
             &model.opencode_poller,
             fleetPtr(model),
             &model.ledger,
+            &model.backfill,
         ) catch .invalid; // OOM: hydration may be partial — reset below.
         switch (outcome) {
             .restored => model.state_saved_events = model.ledger.all.events,
@@ -444,7 +741,42 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
             },
         }
     }
+
+    openHistory(model, env);
     model.ready = true;
+}
+
+/// Open the durable time series beside the statefile. A store we cannot
+/// open (second instance holding the flock, unusable state directory)
+/// leaves `model.history` null and the app runs exactly as it did before
+/// history existed — the module's failure policy, honored at the seam.
+fn openHistory(model: *Model, env: Env) void {
+    const dir = history_mod.defaultDir(model.allocator, env.xdg_state_home, env.home) catch |err| {
+        std.log.warn("history: no directory ({s})", .{@errorName(err)});
+        return;
+    };
+    defer model.allocator.free(dir);
+    const writer = history_mod.Writer.open(model.allocator, historyIo(), dir, .{
+        .tz_offset_min = model.tz_offset_min,
+        .now_ms = setupWallMs(),
+    }) catch |err| {
+        std.log.warn("history: not opened ({s})", .{@errorName(err)});
+        return;
+    };
+    model.history = writer;
+}
+
+/// Release what the Model owns outright. Called on the tray Quit path
+/// (which exits the process immediately afterwards) and from main's
+/// teardown. Deliberately narrow: the ledger, tailers, config arena and
+/// resolved paths live until the process does and are reclaimed by it —
+/// the two members here are the ones with an OS-visible obligation, a
+/// history flock plus staged records, and a sysctl scratch buffer.
+pub fn deinit(model: *Model) void {
+    if (model.history) |*writer| writer.deinit(); // flushes, then unlocks
+    model.history = null;
+    model.history_dirty = 0;
+    model.system_sampler.deinit();
 }
 
 /// config `claude-config-dir` entries are config roots; the transcripts
@@ -518,6 +850,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // and chew through it on the fast catch-up timer. The window shows
     // live scanning progress instead of freezing behind the parse.
     model.now_ms = fx.wallMs();
+    model.trip_start_ms = model.now_ms;
     if (model.ready) startCatchup(model, model.cfg.sources, fx);
     fx.startTimer(.{
         .key = sweep_timer_key,
@@ -538,7 +871,11 @@ pub fn boot(model: *Model, fx: *Effects) void {
         .on_exit = Effects.exitMsg(.tz_done),
     });
     openSystemChannel(model, fx);
-    refreshDisplay(model);
+    // One instrument advance so the needle has a pose to sweep from, then
+    // the strings. Boot is a sweep boundary; every later refresh on this
+    // path is strings-only.
+    advanceInstrument(model);
+    refreshStrings(model);
     startIgnition(model, fx);
 }
 
@@ -712,8 +1049,8 @@ fn enumerateHistory(model: *Model, only: config.Sources) !void {
 }
 
 /// Parse queued history files until the byte budget is spent. Runs on
-/// the 30 ms catch-up timer; each chunk is a few ms of work, so frames
-/// land in between and the needle stays alive.
+/// the `catchup_interval_ms` timer (120 ms); each chunk is a few ms of
+/// work, so frames land in between and the needle stays alive.
 fn processCatchupChunk(model: *Model, fx: *Effects) void {
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
@@ -727,9 +1064,15 @@ fn processCatchupChunk(model: *Model, fx: *Effects) void {
         const file = model.catchup_queue[model.catchup_next];
         switch (file.agent) {
             .claude => {
-                var sink = claude.ListSink.init(model.allocator);
-                defer sink.deinit();
-                model.claude_tailer.scanFile(arena, io, file.path, sink.sink()) catch {};
+                // Arena for BOTH the sink and the event strings, so the
+                // chunk's whole allocation footprint dies with the arena
+                // instead of charging the GPA a dupe-and-free pair for
+                // every string in millions of backfilled lines. The two
+                // halves move together or not at all: a ListSink on the
+                // GPA plus a `...With` call would hand arena memory to
+                // `ListSink.deinit`'s GPA frees.
+                var sink = claude.ListSink.init(arena);
+                model.claude_tailer.scanFileWith(arena, arena, io, file.path, sink.sink()) catch {};
                 for (sink.events.items) |ev| ingest(model, ev);
             },
             .codex => {
@@ -754,11 +1097,29 @@ fn processCatchupChunk(model: *Model, fx: *Effects) void {
         model.allocator.free(model.catchup_queue);
         model.catchup_queue = &.{};
         model.catchup_next = 0;
+        // This pass IS the history backfill: the same walk that rebuilds
+        // the ledger from the agents' own transcripts ran with the writer
+        // attached, so the durable store now reaches as far back as those
+        // files do. Close the gate BEFORE `saveStateNow` so it persists in
+        // the same write — otherwise every boot re-seeds the store, and
+        // because records are additive that double-counts rather than
+        // deduping. Only claimable when a writer was actually open.
+        if (model.history != null) {
+            model.backfill = .{
+                .backfilled = true,
+                .backfill_watermark_ms = model.now_ms,
+                .dict_generation = model.history.?.dictGeneration(),
+            };
+        }
         // Limits + a full display pass now that the ledger is complete.
         sweepOnce(model);
         saveStateNow(model);
+        flushHistory(model);
     }
-    refreshDisplay(model);
+    // Strings only. A catch-up chunk is not a sweep: decaying the gauge
+    // peak here (as the single old refresh did) burned ~66 sweeps' worth
+    // of decay per second and re-ranged the dial mid-backfill.
+    refreshStrings(model);
 }
 
 /// The OAuth cadence: `poll-interval` from config (seconds), floored at
@@ -833,12 +1194,37 @@ fn saveStateNow(model: *Model) void {
     if (model.state_path.len == 0) return;
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
-    statefile.save(model.allocator, io, model.state_path, &model.claude_tailer, &model.codex_tailer, &model.opencode_poller, fleetPtr(model), &model.ledger) catch |err| {
+    statefile.saveWith(model.allocator, io, model.state_path, &model.claude_tailer, &model.codex_tailer, &model.opencode_poller, fleetPtr(model), &model.ledger, model.backfill) catch |err| {
         std.log.warn("state save failed: {s}", .{@errorName(err)});
         return;
     };
     model.state_saved_events = model.ledger.all.events;
     model.state_dirty = false;
+}
+
+/// Push staged history to disk every `history_flush_ticks` sweeps, and
+/// only when something is staged.
+///
+/// The gate keys off `history_dirty`, NOT `state_dirty`: `ingest` (the
+/// claude/codex/fleet path — nearly every event) records history and
+/// never sets `state_dirty`; only `ingestChange` does. Reusing that flag
+/// would leave the store flushing on nothing but the writer's own minute
+/// rollovers.
+fn maybeFlushHistory(model: *Model) void {
+    if (model.history_flush_countdown > 1) {
+        model.history_flush_countdown -= 1;
+        return;
+    }
+    model.history_flush_countdown = history_flush_ticks;
+    if (model.history_dirty == 0) return;
+    flushHistory(model);
+}
+
+/// Flush now. Cheap and always safe — an early flush of an additive
+/// store only writes more records, never different ones.
+fn flushHistory(model: *Model) void {
+    if (model.history) |*writer| writer.flush();
+    model.history_dirty = 0;
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -852,7 +1238,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 if (newly_enabled.any() and !model.catchup_active) {
                     startCatchup(model, newly_enabled, fx);
                 }
-                refreshDisplay(model);
+                refreshStrings(model);
             }
             applyLaunchAtLogin(model, fx);
             // System telemetry normally arrives PUSHED through the
@@ -861,8 +1247,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (model.system_tick_fallback) sampleSystem(model);
             // While catch-up owns the tailers, the steady usage sweep
             // stands down (offsets make overlap safe, but it's wasted
-            // work); refreshDisplay still runs so the new system sample
-            // reaches the strip.
+            // work); the instrument and the strings still advance so the
+            // new system sample reaches the strip.
             if (!model.catchup_active) {
                 const sweep_start_ns = native_sdk.monotonicNanoseconds();
                 sweepOnce(model);
@@ -870,8 +1256,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 std.log.debug("sweep: {d} us", .{sweep_us});
                 dispatchAlerts(model, fx);
                 maybeSaveState(model);
+                maybeFlushHistory(model);
             } else {
-                refreshDisplay(model);
+                // Catch-up owns the tailers, but this tick is still the
+                // 2 s boundary the decay constant is written for — the
+                // dial should keep ranging while months of history parse,
+                // just not once per 120 ms chunk.
+                advanceInstrument(model);
+                refreshStrings(model);
             }
             // First OAuth poll shouldn't wait for the 30 s gate.
             if (!model.first_sweep_done) maybeOauthPoll(model, fx);
@@ -893,7 +1285,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.now_ms = fx.wallMs();
             handleOauthResponse(model, resp);
             dispatchAlerts(model, fx);
-            refreshDisplay(model);
+            refreshStrings(model);
         },
         .tz_done => |exit| {
             // The offset is already resolved synchronously in setup; this
@@ -925,7 +1317,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                         const full = std.mem.bytesToValue(system.Snapshot, event.bytes[0..@sizeOf(system.Snapshot)]);
                         model.system_snap = maskSystemSnapshot(full, model.cfg.system_stats);
                         model.system_drops = event.dropped_total;
-                        refreshDisplay(model);
+                        model.system_history.record(model.now_ms, model.system_snap);
+                        // Glance only. This arm fires at 1 Hz and changes
+                        // nothing but the telemetry tokens in the tray
+                        // template — re-deriving three agent lines, the
+                        // odometer and the status footer for it was pure
+                        // waste, and journaling a needle pose here zeroed
+                        // the sweep animation's delta between sweeps.
+                        refreshGlance(model);
                     }
                 },
                 // The channel ended (teardown) or the open was refused —
@@ -943,9 +1342,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .hover_clear => model.hovered_system = null,
         .quit => {
             // Accessory app: the tray Quit item is the only exit
-            // affordance. Flush state, then leave — the runtime has no
+            // affordance. Flush state and history (deinit flushes, then
+            // drops the store's flock so the next launch is not locked
+            // out by our corpse), then leave — the runtime has no
             // graceful-shutdown API to hand back to.
             saveStateNow(model);
+            deinit(model);
             std.process.exit(0);
         },
         .open_dashboard => {
@@ -970,6 +1372,66 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .settle, .off => model.ignition_phase = .off,
             }
         },
+
+        // ------------------------------------------------------ UI wave
+        // Every one of these is pure display state, so they share one
+        // effect-free handler — which is also what makes them testable
+        // without standing up an effects channel.
+        .mfd_page,
+        .time_range,
+        .filter_agent,
+        .sort_by,
+        .readout_cycle,
+        .dashboard_focus,
+        .alert_ack,
+        .hud_toggle,
+        .hud_closed,
+        .chart_hover,
+        .row_press,
+        .trip_reset,
+        => applyUxMsg(model, msg),
+    }
+}
+
+/// The UI wave's messages: writes to `Model.ux` (plus the trip odometer,
+/// which the UI owns the reset button for) and nothing else.
+///
+/// No effects and deliberately no refresh — the runtime rebuilds the view
+/// after every dispatch, so a page flip is on screen by the time this
+/// returns, and re-deriving display strings for a click would put tailer
+/// work on the input path.
+pub fn applyUxMsg(model: *Model, msg: Msg) void {
+    switch (msg) {
+        .mfd_page => |page| model.ux.mfd_page = page,
+        .time_range => |range| model.ux.time_range = range,
+        .filter_agent => |agent| model.ux.filter_agent = agent,
+        // Re-sending the live column flips the direction; a new column
+        // starts descending, which is the useful end of every column here.
+        .sort_by => |column| {
+            if (model.ux.sort_by == column) {
+                model.ux.sort_desc = !model.ux.sort_desc;
+            } else {
+                model.ux.sort_by = column;
+                model.ux.sort_desc = true;
+            }
+        },
+        .readout_cycle => model.ux.readout = nextReadout(model.ux.readout),
+        .dashboard_focus => |pane| model.ux.dashboard_focus = pane,
+        .alert_ack => model.ux.alerts_acked_ms = model.now_ms,
+        .hud_toggle => |panel| model.ux.hud = if (model.ux.hud == panel) .none else panel,
+        // A dismissal names the panel it came from, so a late one cannot
+        // close whatever the user opened in the meantime.
+        .hud_closed => |panel| {
+            if (model.ux.hud == panel) model.ux.hud = .none;
+        },
+        .chart_hover => |sample| model.ux.hover = sample,
+        .row_press => |row| model.ux.selected_row = row,
+        .trip_reset => {
+            model.trip = .{};
+            model.trip_start_ms = model.now_ms;
+        },
+        // Everything else is the engine's; this handler never sees them.
+        else => {},
     }
 }
 
@@ -1005,23 +1467,36 @@ fn sweepOnce(model: *Model) void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // Liveness ordering, documented in sessions.zig: report GROWTH first
+    // and ingest EVENTS second. Growth means "a turn is in flight"; a
+    // parsed event means "a turn landed" — the stronger, later
+    // observation, and it must be the one that wins within a sweep.
     if (model.cfg.sources.enabled(.claude)) {
-        var sink = claude.ListSink.init(model.allocator);
-        defer sink.deinit();
-        _ = model.claude_tailer.sweepIncremental(arena, io, model.claude_roots, sink.sink(), model.now_ms) catch |err| blk: {
+        // Arena for the sink AND the event strings — both die with the
+        // sweep, so there is no `sink.deinit()` to own and no per-event
+        // GPA dupe/free churn. Splitting the pair is the dangerous edit:
+        // a ListSink on the GPA plus a `...With` call would hand arena
+        // memory to `ListSink.deinit`'s GPA frees.
+        var sink = claude.ListSink.init(arena);
+        const grew = model.claude_tailer.sweepIncrementalWith(arena, arena, io, model.claude_roots, sink.sink(), model.now_ms) catch |err| blk: {
             std.log.warn("claude sweep failed: {s}", .{@errorName(err)});
             break :blk false;
         };
+        // The mid-turn signal, previously computed and thrown away: new
+        // transcript bytes with no completed turn behind them is an agent
+        // thinking RIGHT NOW.
+        if (grew) model.roster.noteActivity(.claude, model.now_ms);
         for (sink.events.items) |ev| ingest(model, ev);
     }
 
     if (model.cfg.sources.enabled(.codex)) {
         var events: std.ArrayList(types.UsageEvent) = .empty;
         defer events.deinit(arena);
-        _ = model.codex_tailer.sweepIncremental(io, arena, model.codex_roots, &events, model.now_ms) catch |err| blk: {
+        const grew = model.codex_tailer.sweepIncremental(io, arena, model.codex_roots, &events, model.now_ms) catch |err| blk: {
             std.log.warn("codex sweep failed: {s}", .{@errorName(err)});
             break :blk false;
         };
+        if (grew) model.roster.noteActivity(.codex, model.now_ms);
         for (events.items) |ev| ingest(model, ev);
 
         // Limits ride the tailer now (captured off token_count lines during
@@ -1063,7 +1538,10 @@ fn sweepOnce(model: *Model) void {
         for (changes.items) |change| ingestChange(model, change.previous, change.current);
     }
 
-    refreshDisplay(model);
+    // A sweep is an instrument boundary: peak decay and needle-pose
+    // journaling happen here, never on the interleaved refreshes.
+    advanceInstrument(model);
+    refreshStrings(model);
 }
 
 /// System telemetry: microseconds of syscalls, no subprocesses. Sampled
@@ -1074,6 +1552,9 @@ fn sweepOnce(model: *Model) void {
 fn sampleSystem(model: *Model) void {
     if (model.cfg.system_stats.any()) {
         model.system_snap = model.system_sampler.sample(systemEnabled(model.cfg.system_stats));
+        // The fallback path feeds the time axis too, so losing the
+        // producer costs resolution (2 s instead of 1 s), not the chart.
+        model.system_history.record(model.now_ms, model.system_snap);
     } else {
         model.system_snap = .{};
     }
@@ -1085,10 +1566,51 @@ fn systemEnabled(s: config.SystemStats) system.Enabled {
     return .{ .cpu = s.cpu, .gpu = s.gpu, .mem = s.mem, .disk = s.disk, .net = s.net, .battery = s.battery };
 }
 
+/// One priced event reaches every consumer here: the accounting ledger,
+/// both burn rings, the live roster, the durable series, and the trip.
+///
+/// Note what this path does NOT do: set `state_dirty`. The tailers'
+/// restored offsets already make the statefile's save cadence sufficient,
+/// which is exactly why the history flush has its own dirty counter.
 fn ingest(model: *Model, ev: types.UsageEvent) void {
     const cost = model.prices.costOf(ev);
     model.ledger.add(ev, cost) catch return;
     model.burn.addTokens(ev.timestamp_ms, predict.limitWeightedTokens(ev));
+    model.agent_burn.addEvent(ev);
+    model.roster.record(ev, cost);
+    recordHistory(model, ev, .{ .cost_usd = cost, .now_ms = model.now_ms });
+    tripAdd(model, ev, cost);
+}
+
+/// Stage one row into the durable series. Never fails: `Writer.record`
+/// swallows its own I/O errors by contract, and a store that never opened
+/// is simply absent.
+fn recordHistory(model: *Model, ev: types.UsageEvent, opts: history_mod.RecordOptions) void {
+    if (model.history) |*writer| {
+        writer.record(ev, opts);
+        model.history_dirty +|= 1;
+    }
+}
+
+/// Fold an event into the trip odometer.
+///
+/// The timestamp gate is the whole point: a cold start replays months of
+/// transcripts through `ingest`, and a trip meter that counted them would
+/// read as the fleet's lifetime spend under a "this session" label — the
+/// single most misleading number the panel could show.
+fn tripAdd(model: *Model, ev: types.UsageEvent, cost: ?f64) void {
+    if (ev.timestamp_ms < model.trip_start_ms) return;
+    model.trip.add(ev, cost);
+}
+
+/// Spend per hour since the trip started. Null before a minute has
+/// elapsed: dividing a burst by twenty seconds yields a four-figure
+/// hourly rate that is arithmetically correct and completely useless.
+pub fn tripCostPerHour(model: *const Model) ?f64 {
+    if (model.trip_start_ms <= 0) return null;
+    const elapsed_ms = model.now_ms - model.trip_start_ms;
+    if (elapsed_ms < 60_000) return null;
+    return model.trip.cost_usd * 3_600_000.0 / @as(f64, @floatFromInt(elapsed_ms));
 }
 
 fn ingestOpenCodeChange(model: *Model, change: opencode.Change) void {
@@ -1102,7 +1624,8 @@ fn ingestOpenCodeChange(model: *Model, change: opencode.Change) void {
 fn ingestChange(model: *Model, previous: ?types.UsageEvent, current: types.UsageEvent) void {
     const new_cost = model.prices.costOf(current);
     if (previous) |old| {
-        model.ledger.replace(old, model.prices.costOf(old), current, new_cost) catch return;
+        const old_cost = model.prices.costOf(old);
+        model.ledger.replace(old, old_cost, current, new_cost) catch return;
         const delta = types.UsageEvent{
             .agent = current.agent,
             .timestamp_ms = current.timestamp_ms,
@@ -1111,13 +1634,42 @@ fn ingestChange(model: *Model, previous: ?types.UsageEvent, current: types.Usage
             .output_tokens = current.output_tokens -| old.output_tokens,
             .cache_creation_tokens = current.cache_creation_tokens -| old.cache_creation_tokens,
             .cache_read_tokens = current.cache_read_tokens -| old.cache_read_tokens,
+            .session_id = current.session_id,
+            .cwd = current.cwd,
         };
         model.burn.addTokens(delta.timestamp_ms, predict.limitWeightedTokens(delta));
+        model.agent_burn.addEvent(delta);
+        // The roster and the trip take the DELTA for the same reason the
+        // burn gauge does — a re-read row that grew by 300 tokens is 300
+        // tokens of work, not a fresh copy of the whole row. The turn
+        // count is still +1: for row-shaped sources an observed change IS
+        // the session's next completed exchange.
+        model.roster.record(delta, subCost(new_cost, old_cost));
+        // History is additive, so a correction is just another record;
+        // `delta` marks it as one and permits the negative cost.
+        recordHistory(model, delta, .{
+            .cost_usd = subCost(new_cost, old_cost),
+            .delta = true,
+            .now_ms = model.now_ms,
+        });
+        tripAdd(model, delta, subCost(new_cost, old_cost));
     } else {
         model.ledger.add(current, new_cost) catch return;
         model.burn.addTokens(current.timestamp_ms, predict.limitWeightedTokens(current));
+        model.agent_burn.addEvent(current);
+        model.roster.record(current, new_cost);
+        recordHistory(model, current, .{ .cost_usd = new_cost, .now_ms = model.now_ms });
+        tripAdd(model, current, new_cost);
     }
     model.state_dirty = true;
+}
+
+/// Cost difference for a replaced row. Null only when NEITHER side had a
+/// price — an unpriced model stays unpriced rather than being recorded as
+/// a free correction.
+fn subCost(new_cost: ?f64, old_cost: ?f64) ?f64 {
+    if (new_cost == null and old_cost == null) return null;
+    return (new_cost orelse 0) - (old_cost orelse 0);
 }
 
 /// Keep our own copy of a limit snapshot (arena-born snapshots die with
@@ -1281,15 +1833,26 @@ fn setErrorStatus(model: *Model, comptime fmt: []const u8, args: anytype) void {
     model.status_error = true;
 }
 
+/// The tray/panel glance, served from the refresh's cache when it is
+/// current for `now_ms` (see `Model.glance_cache`). The view asks five
+/// times per rebuild; the answer cannot change between those asks.
 pub fn glanceState(model: *const Model) trayfmt.GlanceState {
+    if (model.derived_cache_ms == model.now_ms) return model.glance_cache;
+    return computeGlanceState(model);
+}
+
+fn computeGlanceState(model: *const Model) trayfmt.GlanceState {
     const today = model.ledger.today(model.now_ms);
     const wall = model.walls.nearestWall(model.now_ms);
     const hot = model.walls.maxUtilization();
     return .{
         .now_ms = model.now_ms,
         .tz_offset_min = model.tz_offset_min,
-        .burn_tokens_per_min = model.burn.tokensPerMin(model.now_ms),
-        .idle = model.burn.isIdle(model.now_ms),
+        // Per-agent rings, blended. Bit-exact against the single ring
+        // this used to read — same anchor, same weights, same order, with
+        // each bucket summed as u64 before it becomes a float.
+        .burn_tokens_per_min = model.agent_burn.totalPerMin(model.now_ms),
+        .idle = model.agent_burn.isIdle(model.now_ms),
         .wall_at_ms = if (wall) |w| w.at_ms else null,
         .hot_percent = if (hot) |h| h.used_percent else null,
         .next_reset_ms = nextReset(model),
@@ -1319,36 +1882,108 @@ fn nextReset(model: *const Model) ?i64 {
     return best;
 }
 
-fn refreshDisplay(model: *Model) void {
-    // Instrument state first: ratchet the peak, re-range the dial,
-    // journal the needle sweep (from = the pose the user last saw).
-    const tpm = model.burn.tokensPerMin(model.now_ms);
-    model.gauge_peak_tpm = @max(tpm, model.gauge_peak_tpm * peak_decay_per_sweep);
-    model.needle_from_deg = model.needle_to_deg;
-    model.needle_to_deg = needleDeg(tpm, gaugeScaleTpm(model.gauge_peak_tpm));
+// The refresh used to be ONE function called from four cadences — the
+// 2 s sweep, the 1 Hz telemetry arm, the config-reload branch and the
+// 30 ms catch-up chunk — while two of the things it did are only correct
+// once per sweep. It is now three pieces with explicit contracts:
+//
+//   advanceClocks   — wall-clock only. Correct at ANY cadence, and the
+//                     more often the better.
+//   refreshGlance   — advance + derive + the tray line. Any cadence.
+//   refreshStrings  — refreshGlance + the panel's other strings. Any
+//                     cadence, just wasteful at high ones.
+//   advanceInstrument — peak decay + needle pose. SWEEP BOUNDARIES ONLY
+//                     (`boot`, `sweepOnce`, and the catch-up branch of
+//                     the 2 s tick). Calling it anywhere else is the bug
+//                     this split exists to make unrepresentable.
 
-    model.glance_text = trayfmt.render(&model.glance_buf, model.cfg.tray_format, glanceState(model));
+/// Roll every wall-clock-anchored ring forward to `now_ms`.
+///
+/// Advancing on the wall clock is always correct: it is what makes an
+/// idle ring read zero instead of pinning its last burst under the write
+/// head. `walls` in particular has been recording into its 6-hour
+/// utilization history on every poll since Wave 1 with nothing ever
+/// advancing it — this is the call that makes its gap detection true.
+fn advanceClocks(model: *Model) void {
+    model.burn.advanceTo(model.now_ms);
+    model.agent_burn.advanceTo(model.now_ms);
+    model.walls.advanceTo(model.now_ms);
+    model.roster.advanceTo(model.now_ms);
+    model.system_history.advanceTo(model.now_ms);
+}
+
+/// Journal the derived state the view asks for repeatedly.
+fn refreshDerived(model: *Model) void {
+    model.glance_cache = computeGlanceState(model);
+    model.danger_cache = computeDangerState(model);
+    model.derived_cache_ms = model.now_ms;
+}
+
+/// Advance, derive, and render the tray glance. The cheap refresh: what
+/// a 1 Hz telemetry reading actually changes.
+fn refreshGlance(model: *Model) void {
+    advanceClocks(model);
+    refreshDerived(model);
+    model.glance_text = trayfmt.render(&model.glance_buf, model.cfg.tray_format, model.glance_cache);
+}
+
+/// Every display string. Safe at any cadence — nothing here is a
+/// per-sweep quantity.
+fn refreshStrings(model: *Model) void {
+    refreshGlance(model);
+
     model.claude_text = agentLine(&model.claude_buf, model, .claude, model.claude_limits);
     model.codex_text = agentLine(&model.codex_buf, model, .codex, model.codex_limits);
     model.opencode_text = agentLine(&model.opencode_buf, model, .opencode, null);
 
-    const today = model.ledger.today(model.now_ms);
+    // Today's rollup rides the glance cache rather than a second
+    // `ledger.today()` hash lookup for the same numbers.
     {
         var w = std.Io.Writer.fixed(&model.today_buf);
         w.writeAll("today ") catch {};
-        trayfmt.writeCost(&w, today.cost_usd) catch {};
+        trayfmt.writeCost(&w, model.glance_cache.today_cost_usd) catch {};
         w.writeAll(" · ") catch {};
-        trayfmt.writeHumanTokens(&w, today.totalTokens()) catch {};
+        trayfmt.writeHumanTokens(&w, model.glance_cache.today_tokens) catch {};
         w.writeAll(" tok") catch {};
         model.today_text = w.buffered();
     }
+
     if (model.catchup_active) {
         setStatus(model, "scanning history… {d}/{d} files", .{ model.catchup_next, model.catchup_queue.len });
     } else if (!model.status_error) {
         if (model.ready) {
-            setStatus(model, "{d} events · {d} models priced", .{ model.ledger.all.events, model.ledger.per_model.count() });
+            // Dropped telemetry posts reach the footer. `system_drops`
+            // was recorded and never rendered, which broke its own
+            // promise that a stalled strip is honest rather than silent.
+            if (model.system_drops > 0) {
+                setStatus(model, "{d} events · {d} models priced · {d} telemetry drops", .{
+                    model.ledger.all.events,
+                    model.ledger.per_model.count(),
+                    model.system_drops,
+                });
+            } else {
+                setStatus(model, "{d} events · {d} models priced", .{ model.ledger.all.events, model.ledger.per_model.count() });
+            }
         }
     }
+}
+
+/// Per-sweep instrument bookkeeping: ratchet/decay the auto-range peak
+/// and journal the needle sweep (`from` = the pose the user last saw).
+///
+/// The only callers are the three sweep boundaries — `boot`, `sweepOnce`,
+/// and the catch-up branch of the 2 s tick (which stands the usage sweep
+/// down but is still the 2 s tick the decay constant is written for).
+/// That restriction is the fix. Both quantities
+/// here are per-sweep by construction: the decay constant is documented
+/// per 2 s sweep, and `needle_from_deg` is the input to the view's 850 ms
+/// sweep animation — an interleaved refresh setting `from = to` zeroes
+/// the animation's delta and the needle snaps instead of sweeping.
+fn advanceInstrument(model: *Model) void {
+    const tpm = model.agent_burn.totalPerMin(model.now_ms);
+    model.gauge_peak_tpm = @max(tpm, model.gauge_peak_tpm * peak_decay_per_sweep);
+    model.needle_from_deg = model.needle_to_deg;
+    model.needle_to_deg = needleDeg(tpm, gaugeScaleTpm(model.gauge_peak_tpm));
 }
 
 fn agentLine(buf: []u8, model: *const Model, agent: types.Agent, limits: ?types.LimitSnapshot) []const u8 {
@@ -1854,17 +2489,402 @@ test "glance state reflects ledger and burn" {
     defer model.ledger.deinit();
     model.now_ms = 10 * 60_000;
 
-    try model.ledger.add(.{
+    const ev = types.UsageEvent{
         .agent = .claude,
         .timestamp_ms = model.now_ms - 60_000,
         .model = "claude-fable-5",
         .output_tokens = 5000,
-    }, 1.25);
-    model.burn.addTokens(model.now_ms - 60_000, 5000);
+    };
+    try model.ledger.add(ev, 1.25);
+    model.burn.addTokens(ev.timestamp_ms, predict.limitWeightedTokens(ev));
+    model.agent_burn.addEvent(ev);
 
     const glance = glanceState(&model);
     try testing.expect(!glance.idle);
     try testing.expectEqual(@as(u64, 5000), glance.today_tokens);
     try testing.expectEqual(@as(f64, 1.25), glance.today_cost_usd);
     try testing.expect(glance.burn_tokens_per_min > 0);
+}
+
+// ---------------------------------------------------- wave-2 activation
+
+/// A Model wired far enough to run the refresh path: a real ledger and a
+/// real price db, no tailers (nothing below sweeps files).
+fn testModel() !Model {
+    var model = Model{ .allocator = testing.allocator };
+    model.ledger = ledger_mod.Ledger.init(testing.allocator, 0);
+    model.prices = try pricing.Db.init(testing.allocator);
+    model.ready = true;
+    return model;
+}
+
+fn testModelDeinit(model: *Model) void {
+    model.ledger.deinit();
+    model.prices.deinit();
+}
+
+test "the gauge peak decays once per sweep, not once per refresh" {
+    var model = try testModel();
+    defer testModelDeinit(&model);
+    model.now_ms = 100 * 60_000;
+    model.gauge_peak_tpm = 100_000;
+
+    // A sweep boundary is one decay step.
+    advanceInstrument(&model);
+    const after_one_sweep = model.gauge_peak_tpm;
+    try testing.expectApproxEqAbs(100_000 * peak_decay_per_sweep, after_one_sweep, 1e-9);
+
+    // THE BUG: peak decay used to live in the single `refreshDisplay`,
+    // which the 1 Hz telemetry arm, the config-reload branch and the
+    // 30 ms catch-up chunk all called too. A hundred string refreshes
+    // between sweeps must move the dial's auto-range by exactly nothing.
+    for (0..50) |_| refreshStrings(&model);
+    for (0..50) |_| refreshGlance(&model);
+    try testing.expectEqual(after_one_sweep, model.gauge_peak_tpm);
+
+    // The next real sweep decays once more, not a hundred times.
+    advanceInstrument(&model);
+    try testing.expectApproxEqAbs(after_one_sweep * peak_decay_per_sweep, model.gauge_peak_tpm, 1e-9);
+}
+
+test "a string refresh never journals a needle pose" {
+    var model = try testModel();
+    defer testModelDeinit(&model);
+    model.now_ms = 100 * 60_000;
+
+    // `needle_from_deg` is the input to view.zig's 850 ms sweep
+    // animation. Interleaved refreshes setting from = to collapsed the
+    // animation delta to zero between sweeps, so the needle snapped.
+    model.needle_from_deg = -120;
+    model.needle_to_deg = -20;
+    for (0..10) |_| refreshStrings(&model);
+    try testing.expectEqual(@as(f32, -120), model.needle_from_deg);
+    try testing.expectEqual(@as(f32, -20), model.needle_to_deg);
+
+    // Only a sweep advances the pose, and it carries the old target
+    // forward as the new origin.
+    advanceInstrument(&model);
+    try testing.expectEqual(@as(f32, -20), model.needle_from_deg);
+}
+
+test "the refresh advances every wall-clock ring, the wall tracker included" {
+    var model = try testModel();
+    defer testModelDeinit(&model);
+
+    const t0: i64 = 1_000 * 60_000;
+    model.now_ms = t0;
+
+    model.walls.observe(.{ .agent = .claude, .read_at_ms = t0, .windows = &.{
+        .{ .kind = .five_hour, .used_percent = 40 },
+    } });
+    model.burn.addTokens(t0, 50_000);
+    model.agent_burn.addTokens(.claude, t0, 50_000);
+    model.roster.record(.{
+        .agent = .claude,
+        .timestamp_ms = t0,
+        .model = "claude-fable-5",
+        .session_id = "s1",
+        .output_tokens = 50_000,
+    }, 1.0);
+    model.system_history.record(t0, .{ .cpu = .{
+        .total_frac = 0.5,
+        .core_count = 8,
+        .load_avg_1m = 1,
+        .p_cluster_frac = null,
+        .e_cluster_frac = null,
+    } });
+
+    var curve: [predict.WindowPace.history_buckets]?f32 = undefined;
+    try testing.expectEqual(
+        @as(?f32, 40),
+        model.walls.paceFor(.claude, .five_hour).?.utilizationHistory(&curve)[predict.WindowPace.history_buckets - 1],
+    );
+
+    // Ten hours later with nothing observed. `walls.observe` has been
+    // feeding predict's 6 h utilization history since Wave 1 with NOTHING
+    // ever advancing it, so a ten-hour-old reading sat under the write
+    // head reading as current.
+    model.now_ms = t0 + 10 * 60 * 60_000;
+    refreshStrings(&model);
+
+    for (model.walls.paceFor(.claude, .five_hour).?.utilizationHistory(&curve)) |v| {
+        try testing.expectEqual(@as(?f32, null), v);
+    }
+    try testing.expectEqual(@as(f64, 0), model.burn.tokensPerMin(model.now_ms));
+    try testing.expectEqual(@as(f64, 0), model.agent_burn.totalPerMin(model.now_ms));
+    try testing.expectEqual(@as(f64, 0), model.roster.find(.claude, "s1").?.tokensPerMin());
+    try testing.expect(model.system_history.cpu.isEmpty());
+
+    // Advancing must not fabricate activity: the session is still there,
+    // still costed, just no longer burning.
+    try testing.expectEqual(@as(u64, 1), model.roster.find(.claude, "s1").?.turns());
+}
+
+test "per-agent burn drives the needle at exactly the legacy blended value" {
+    var model = try testModel();
+    defer testModelDeinit(&model);
+
+    const t0: i64 = 2_000 * 60_000;
+    const stream = [_]types.UsageEvent{
+        .{ .agent = .claude, .timestamp_ms = t0, .model = "claude-fable-5", .output_tokens = 1_200 },
+        .{ .agent = .codex, .timestamp_ms = t0 + 30_000, .model = "gpt-5.2-codex", .input_tokens = 4_000 },
+        .{ .agent = .claude, .timestamp_ms = t0 + 90_000, .model = "claude-fable-5", .cache_read_tokens = 90_000 },
+        .{ .agent = .gemini, .timestamp_ms = t0 + 200_000, .model = "gemini-3-pro", .output_tokens = 777 },
+    };
+    for (stream) |ev| ingest(&model, ev);
+
+    model.now_ms = t0 + 240_000;
+    refreshStrings(&model);
+
+    // Bit-exact, not approximately equal. Swapping the Model's single
+    // blended ring for per-agent rings must not move the needle by a
+    // token — same anchor, same weights, same order, each bucket summed
+    // as u64 before the float divide.
+    const legacy = model.burn.tokensPerMin(model.now_ms);
+    try testing.expectEqual(legacy, model.agent_burn.totalPerMin(model.now_ms));
+    try testing.expectEqual(legacy, glanceState(&model).burn_tokens_per_min);
+    try testing.expectEqual(model.burn.isIdle(model.now_ms), model.agent_burn.isIdle(model.now_ms));
+
+    // And the split the blended ring could never answer.
+    try testing.expectEqual(types.Agent.claude, model.agent_burn.hottest(model.now_ms).?.agent);
+    try testing.expect(model.agent_burn.tokensPerMin(.codex, model.now_ms) > 0);
+    try testing.expectEqual(@as(f64, 0), model.agent_burn.tokensPerMin(.kimi, model.now_ms));
+
+    // Still exact after the rings have been rolled forward on wall time.
+    model.now_ms = t0 + 8 * 60_000;
+    refreshStrings(&model);
+    try testing.expectEqual(model.burn.tokensPerMin(model.now_ms), model.agent_burn.totalPerMin(model.now_ms));
+}
+
+test "ingest reaches the roster, and a landed turn beats reported growth" {
+    var model = try testModel();
+    defer testModelDeinit(&model);
+
+    const t0: i64 = 3_000 * 60_000;
+    model.now_ms = t0;
+
+    // Growth first, events second — the order sweepOnce uses.
+    model.roster.noteActivity(.claude, t0);
+    try testing.expect(model.roster.activity(t0) == .running);
+
+    ingest(&model, .{
+        .agent = .claude,
+        .timestamp_ms = t0,
+        .model = "claude-fable-5",
+        .session_id = "sess-a",
+        .cwd = "/Users/me/workspace/token-tach",
+        .output_tokens = 2_000,
+    });
+    ingest(&model, .{
+        .agent = .codex,
+        .timestamp_ms = t0,
+        .model = "gpt-5.2-codex",
+        .session_id = "sess-b",
+        .output_tokens = 500,
+    });
+
+    const claude_row = model.roster.find(.claude, "sess-a").?;
+    try testing.expectEqual(@as(u64, 1), claude_row.turns());
+    try testing.expectEqualStrings("token-tach", claude_row.project());
+    try testing.expect(claude_row.isRunning(t0));
+    // A parsed event is the stronger, later observation: the turn LANDED,
+    // so the mid-turn flag growth set must be cleared.
+    try testing.expect(!claude_row.mid_turn);
+    try testing.expectEqual(@as(usize, 2), model.roster.activeCount(t0));
+
+    // Growth reported after the event puts the row back in flight.
+    model.roster.noteActivity(.claude, t0 + 1_000);
+    try testing.expect(model.roster.find(.claude, "sess-a").?.mid_turn);
+
+    // And the trip odometer counted both events, since both landed after
+    // the trip started.
+    model.trip_start_ms = t0 - 1;
+    try testing.expectEqual(@as(u64, 2), model.trip.events);
+}
+
+test "the trip odometer ignores backfill and only rates a real interval" {
+    var model = try testModel();
+    defer testModelDeinit(&model);
+
+    const launch: i64 = 4_000 * 60_000;
+    model.trip_start_ms = launch;
+    model.now_ms = launch;
+
+    // A cold start replays months of transcripts through the same
+    // `ingest`. None of it belongs to this trip.
+    ingest(&model, .{
+        .agent = .claude,
+        .timestamp_ms = launch - 90 * 24 * 60 * 60_000,
+        .model = "claude-fable-5",
+        .output_tokens = 5_000_000,
+    });
+    try testing.expectEqual(@as(u64, 0), model.trip.events);
+    try testing.expectEqual(@as(u64, 0), model.trip.totalTokens());
+    // Under a minute in, an hourly rate is arithmetic, not information.
+    model.now_ms = launch + 30_000;
+    try testing.expectEqual(@as(?f64, null), tripCostPerHour(&model));
+
+    // Live traffic does count.
+    ingest(&model, .{
+        .agent = .claude,
+        .timestamp_ms = launch + 10_000,
+        .model = "claude-fable-5",
+        .output_tokens = 1_000,
+    });
+    try testing.expectEqual(@as(u64, 1), model.trip.events);
+
+    model.now_ms = launch + 30 * 60_000;
+    model.trip.cost_usd = 3.0;
+    try testing.expectApproxEqAbs(@as(f64, 6.0), tripCostPerHour(&model).?, 1e-9);
+}
+
+test "derived state is cached per journaled clock, never across one" {
+    var model = try testModel();
+    defer testModelDeinit(&model);
+    model.now_ms = 500 * 60_000;
+
+    try model.ledger.add(.{
+        .agent = .claude,
+        .timestamp_ms = model.now_ms,
+        .model = "claude-fable-5",
+        .output_tokens = 1_000,
+    }, 2.50);
+    refreshStrings(&model);
+    try testing.expectEqual(@as(f64, 2.50), glanceState(&model).today_cost_usd);
+
+    // A ledger write behind the cache's back within the same tick is
+    // deliberately not seen — the refresh is the journaling point.
+    try model.ledger.add(.{
+        .agent = .codex,
+        .timestamp_ms = model.now_ms,
+        .model = "gpt-5.2-codex",
+        .output_tokens = 1,
+    }, 1.00);
+    try testing.expectEqual(@as(f64, 2.50), glanceState(&model).today_cost_usd);
+
+    // Moving the clock invalidates it, so a Model whose clock advanced
+    // without a refresh (a hand-built one, an update arm that only
+    // bumped now_ms) recomputes rather than serving a stale answer.
+    model.now_ms += 1;
+    try testing.expectEqual(@as(f64, 3.50), glanceState(&model).today_cost_usd);
+    refreshStrings(&model);
+    try testing.expectEqual(@as(f64, 3.50), model.glance_cache.today_cost_usd);
+}
+
+test "dropped telemetry posts reach the status line" {
+    var model = try testModel();
+    defer testModelDeinit(&model);
+    model.now_ms = 600 * 60_000;
+
+    refreshStrings(&model);
+    try testing.expect(std.mem.indexOf(u8, model.status_text, "models priced") != null);
+    try testing.expect(std.mem.indexOf(u8, model.status_text, "drops") == null);
+
+    // A stalled strip must say so; `system_drops` was recorded and never
+    // rendered, which broke its own doc comment's promise.
+    model.system_drops = 7;
+    refreshStrings(&model);
+    try testing.expect(std.mem.indexOf(u8, model.status_text, "7 telemetry drops") != null);
+    // scripts/verify greps the status line for this substring.
+    try testing.expect(std.mem.indexOf(u8, model.status_text, "models priced") != null);
+}
+
+test "system telemetry gets a time axis, with gaps for disabled modules" {
+    var model = try testModel();
+    defer testModelDeinit(&model);
+
+    const t0: i64 = 700 * 60_000;
+    var i: i64 = 0;
+    while (i < 12) : (i += 1) {
+        const ts = t0 + i * SystemHistory.period_ms;
+        model.system_history.record(ts, .{
+            .cpu = .{ .total_frac = 0.1 * @as(f64, @floatFromInt(i)), .core_count = 8, .load_avg_1m = 1, .p_cluster_frac = null, .e_cluster_frac = null },
+        });
+    }
+
+    var curve: [SystemHistory.buckets]?f32 = undefined;
+    const cpu_curve = model.system_history.cpu.snapshot(&curve);
+    try testing.expectEqual(SystemHistory.buckets, cpu_curve.len);
+    try testing.expectApproxEqAbs(@as(f32, 1.1), cpu_curve[cpu_curve.len - 1].?, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), cpu_curve[cpu_curve.len - 12].?, 1e-6);
+    // Before the sampler was running is a GAP, not 0% — a chart must be
+    // able to tell "idle machine" from "we were not looking".
+    try testing.expectEqual(@as(?f32, null), cpu_curve[cpu_curve.len - 13]);
+    // GPU was never enabled in these readings: no series at all.
+    try testing.expect(model.system_history.gpu.isEmpty());
+    try testing.expectEqual(SystemHistory.span_ms, 30 * 60_000);
+}
+
+test "the history flush gate keys off its own dirty counter, not state_dirty" {
+    var model = try testModel();
+    defer testModelDeinit(&model);
+    model.now_ms = 800 * 60_000;
+
+    // No writer opened: the whole path must be inert, never a crash and
+    // never a stuck dirty counter.
+    model.history_dirty = 0;
+    model.history_flush_countdown = 1;
+    maybeFlushHistory(&model);
+    try testing.expectEqual(history_flush_ticks, model.history_flush_countdown);
+
+    // `ingest` — the claude/codex/fleet path, i.e. nearly every event —
+    // records history and deliberately never sets `state_dirty`. A flush
+    // gated on that flag would essentially never fire.
+    ingest(&model, .{
+        .agent = .claude,
+        .timestamp_ms = model.now_ms,
+        .model = "claude-fable-5",
+        .output_tokens = 10,
+    });
+    try testing.expect(!model.state_dirty);
+
+    // The countdown spends `history_flush_ticks` sweeps before firing.
+    model.history_dirty = 5;
+    model.history_flush_countdown = history_flush_ticks;
+    for (0..history_flush_ticks - 1) |_| maybeFlushHistory(&model);
+    try testing.expectEqual(@as(u32, 5), model.history_dirty);
+    maybeFlushHistory(&model);
+    try testing.expectEqual(@as(u32, 0), model.history_dirty);
+    try testing.expectEqual(history_flush_ticks, model.history_flush_countdown);
+}
+
+test "UI-wave messages move only the ux sub-struct" {
+    var model = try testModel();
+    defer testModelDeinit(&model);
+    model.now_ms = 900 * 60_000;
+
+    // Re-sending the current sort column flips direction; a new column
+    // resets to descending.
+    try testing.expect(model.ux.sort_desc);
+    applyUxMsg(&model, .{ .sort_by = .cost });
+    try testing.expect(!model.ux.sort_desc);
+    applyUxMsg(&model, .{ .sort_by = .name });
+    try testing.expectEqual(SortColumn.name, model.ux.sort_by);
+    try testing.expect(model.ux.sort_desc);
+
+    // A HUD toggle is idempotent-to-closed; a dismissal that names a
+    // different panel cannot close the one the user just opened.
+    applyUxMsg(&model, .{ .hud_toggle = .alerts });
+    try testing.expectEqual(HudPanel.alerts, model.ux.hud);
+    applyUxMsg(&model, .{ .hud_closed = .help });
+    try testing.expectEqual(HudPanel.alerts, model.ux.hud);
+    applyUxMsg(&model, .{ .hud_toggle = .alerts });
+    try testing.expectEqual(HudPanel.none, model.ux.hud);
+
+    applyUxMsg(&model, .{ .mfd_page = .sessions });
+    try testing.expectEqual(MfdPage.sessions, model.ux.mfd_page);
+    applyUxMsg(&model, .{ .chart_hover = .{ .chart = 2, .sample = 41 } });
+    try testing.expectEqual(@as(u16, 41), model.ux.hover.?.sample);
+    applyUxMsg(&model, .{ .chart_hover = null });
+    try testing.expectEqual(@as(?ChartHover, null), model.ux.hover);
+
+    // The readout cycles rather than storing an index, so a new mode
+    // needs no edit in the update arm.
+    const first = model.ux.readout;
+    for (0..std.enums.values(ReadoutMode).len) |_| applyUxMsg(&model, .readout_cycle);
+    try testing.expectEqual(first, model.ux.readout);
+
+    // And none of it touched the instrument.
+    try testing.expectEqual(@as(f64, 0), model.gauge_peak_tpm);
+    try testing.expectEqual(@as(u64, 0), model.ledger.all.events);
 }

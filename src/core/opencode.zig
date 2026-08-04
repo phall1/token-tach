@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const dbgate = @import("dbgate.zig");
 const c = struct {
     pub const sqlite3 = opaque {};
     pub const sqlite3_stmt = opaque {};
@@ -47,48 +48,14 @@ pub const Stored = struct {
     event: types.UsageEvent,
 };
 
-const FileStamp = struct {
-    mtime_ns: i96,
-    size: u64,
-
-    fn eql(self: FileStamp, other: FileStamp) bool {
-        return self.mtime_ns == other.mtime_ns and self.size == other.size;
-    }
-};
-
-const DbFingerprint = struct {
-    main: FileStamp,
-    wal: ?FileStamp,
-
-    fn eql(self: DbFingerprint, other: DbFingerprint) bool {
-        if (!self.main.eql(other.main)) return false;
-        if (self.wal == null or other.wal == null) return self.wal == null and other.wal == null;
-        return self.wal.?.eql(other.wal.?);
-    }
-};
-
-fn databaseFingerprint(path: []const u8) ?DbFingerprint {
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    const io = threaded.io();
-    var cwd = std.Io.Dir.cwd();
-    const main = cwd.statFile(io, path, .{}) catch return null;
-    var wal_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const wal_path = std.fmt.bufPrint(&wal_buf, "{s}-wal", .{path}) catch return null;
-    const wal = if (cwd.statFile(io, wal_path, .{})) |stat|
-        FileStamp{ .mtime_ns = stat.mtime.nanoseconds, .size = stat.size }
-    else |_|
-        null;
-    return .{
-        .main = .{ .mtime_ns = main.mtime.nanoseconds, .size = main.size },
-        .wal = wal,
-    };
-}
-
 pub const Poller = struct {
     allocator: Allocator,
     seen: std.StringHashMapUnmanaged(Stored) = .empty,
     cursor_updated_ms: i64 = 0,
-    last_fingerprint: ?DbFingerprint = null,
+    /// Filesystem change gate — see dbgate.zig for the two ordering rules
+    /// (stat before open, commit only on SQLITE_DONE) that keep it from
+    /// dropping rows.
+    gate: dbgate.Gate = .{},
     query_count: u64 = 0,
 
     pub fn init(allocator: Allocator) Poller {
@@ -114,10 +81,7 @@ pub const Poller = struct {
         // OpenCode's usage projection is not indexed by time_updated on
         // currently deployed schemas. Avoid paying that full scan + sort
         // every 2 s when neither the database nor its WAL changed.
-        const fingerprint = databaseFingerprint(path) orelse return;
-        if (self.last_fingerprint) |last| {
-            if (fingerprint.eql(last)) return;
-        }
+        const fingerprint = self.gate.beforeOpen(path) orelse return;
         const zpath = try self.allocator.dupeZ(u8, path);
         defer self.allocator.free(zpath);
 
@@ -193,7 +157,7 @@ pub const Poller = struct {
         // Query with >= so rows sharing the cursor timestamp are revisited and
         // suppressed by the persisted identity+snapshot map.
         self.cursor_updated_ms = max_updated;
-        self.last_fingerprint = fingerprint;
+        self.gate.commit(fingerprint);
     }
 
     fn putStored(self: *Poller, id: []const u8, updated_ms: i64, event: types.UsageEvent) !void {
@@ -427,14 +391,14 @@ test "schema probe failure is not cached as a V1 decision" {
         changes.deinit(testing.allocator);
     }
     try poller.poll(testing.allocator, path, &changes);
-    try testing.expectEqual(@as(?DbFingerprint, null), poller.last_fingerprint);
+    try testing.expectEqual(@as(?dbgate.Fingerprint, null), poller.gate.last);
     try testing.expectEqual(@as(u64, 0), poller.query_count);
     try testing.expectEqual(@as(usize, 0), changes.items.len);
 
     try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(writer, "ROLLBACK".ptr, null, null, null));
     _ = c.sqlite3_close(writer);
     try poller.poll(testing.allocator, path, &changes);
-    try testing.expect(poller.last_fingerprint != null);
+    try testing.expect(poller.gate.last != null);
     try testing.expectEqual(@as(u64, 1), poller.query_count);
     try testing.expectEqual(@as(usize, 1), changes.items.len);
 }

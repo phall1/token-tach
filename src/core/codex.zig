@@ -36,6 +36,32 @@ const Allocator = std.mem.Allocator;
 pub const default_model = "codex";
 
 // ---------------------------------------------------------------------------
+// Line prefilter
+// ---------------------------------------------------------------------------
+
+/// Substrings that make a rollout line worth a full `std.json.Value` parse.
+///
+/// Codex logs one `response_item` line per message — whole assistant turns,
+/// tool outputs, reasoning blocks — and those dwarf the handful of lines this
+/// module reads. Building a DOM (an ObjectMap per nested object) for every one
+/// of them and then discarding it on the `type` check is the dominant cost of
+/// a cold backfill, so reject on a substring scan first (claude.zig does the
+/// same for its `assistant` marker).
+///
+/// The markers are the bare payload values, not `"type":"session_meta"`: that
+/// stays correct under any whitespace or key ordering a future codex release
+/// might emit. A false positive costs one wasted parse and changes nothing; a
+/// false negative would silently drop usage. Loose on purpose.
+const line_markers = [_][]const u8{ "token_count", "session_meta", "turn_context" };
+
+fn lineMayMatter(line: []const u8) bool {
+    for (line_markers) |marker| {
+        if (std.mem.indexOf(u8, line, marker) != null) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Session roots
 // ---------------------------------------------------------------------------
 
@@ -122,6 +148,9 @@ pub const Tailer = struct {
     /// (plan owned by the tailer allocator). Kept current by feed/poll/
     /// sweep so the caller never has to re-read rollout files for limits.
     limits: ?Limits = null,
+    /// Lines that survived `lineMayMatter` and paid for a DOM parse. Kept so
+    /// a test can prove the prefilter actually fires; free to read.
+    dom_parses: u64 = 0,
 
     pub const Limits = struct {
         read_at_ms: i64,
@@ -480,6 +509,8 @@ pub const Tailer = struct {
     ) Allocator.Error!void {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) return;
+        if (!lineMayMatter(trimmed)) return;
+        self.dom_parses += 1;
         const root = std.json.parseFromSliceLeaky(std.json.Value, arena, trimmed, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return,
@@ -620,6 +651,10 @@ fn limitsFromFile(allocator: Allocator, io: std.Io, path: []const u8) !?types.Li
     while (it.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
+        // Narrower than `lineMayMatter`: this scan wants token_count lines
+        // only, and it runs over whole files (no offset), so the rejection
+        // has to be cheap for every response_item body in the rollout.
+        if (std.mem.indexOf(u8, line, "token_count") == null) continue;
         defer _ = arena_state.reset(.retain_capacity);
         const root = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), line, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1117,6 +1152,36 @@ test "malformed lines are skipped without error" {
     try testing.expectEqualStrings(default_model, ev.model);
     try testing.expectEqualStrings("01997777-aaaa-4bbb-8ccc-333333333333", ev.session_id);
     try testing.expectEqualStrings("", ev.cwd);
+}
+
+test "bulk response_item lines are rejected before any DOM parse" {
+    var tailer = Tailer.init(testing.allocator);
+    defer tailer.deinit();
+    var out: std.ArrayList(types.UsageEvent) = .empty;
+    defer {
+        freeEvents(testing.allocator, out.items);
+        out.deinit(testing.allocator);
+    }
+
+    // A 64 KiB response_item body, deliberately left unterminated: reaching
+    // std.json at all would burn the parse and (silently) fail, so a moved
+    // counter is proof the prefilter did not fire.
+    var bulk: std.ArrayList(u8) = .empty;
+    defer bulk.deinit(testing.allocator);
+    try bulk.appendSlice(testing.allocator, "{\"timestamp\":\"2025-10-09T12:00:05.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"");
+    try bulk.appendNTimes(testing.allocator, 'x', 64 * 1024);
+    try bulk.append(testing.allocator, '\n');
+
+    try tailer.feed(testing.allocator, "rollout-bulk.jsonl", bulk.items, &out);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+    try testing.expectEqual(@as(u64, 0), tailer.dom_parses);
+
+    // The four line kinds codex actually carries still reach the parser: the
+    // basic fixture's 8 lines are 1 session_meta + 1 turn_context + 4
+    // token_count (kept) and 1 response_item + 1 agent_message (rejected).
+    try tailer.feed(testing.allocator, "rollout-bulk.jsonl", fixture_basic, &out);
+    try testing.expectEqual(@as(usize, 3), out.items.len);
+    try testing.expectEqual(@as(u64, 6), tailer.dom_parses);
 }
 
 test "partial-line feeds carry across chunk boundaries" {

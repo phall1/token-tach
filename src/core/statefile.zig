@@ -8,7 +8,7 @@
 //! file, and re-hydrates freshly-initialized tailers/ledger from it so
 //! catch-up only touches bytes appended since the last save.
 //!
-//! Format: a single JSON object, `{"version": 4, ...}`, written atomically
+//! Format: a single JSON object, `{"version": 5, ...}`, written atomically
 //! (tmp file + rename) at a caller-provided path (`defaultPath` yields
 //! `$XDG_STATE_HOME/token-tach/tailers.json`, falling back to
 //! `~/.local/state/...`) with mode 0600 inside a mode-0700 app state directory.
@@ -29,6 +29,24 @@
 //!   never re-parsed: without the rollups the totals would silently reset.
 //!   Costs are stored as f64 bit patterns (`cost_usd_bits`) so restored
 //!   totals are bit-identical, not shortest-float-round-trip-identical.
+//!   That includes the BOUNDED rollups (`per_hour`, `per_session`): they
+//!   are derived from events the restored offsets guarantee we will never
+//!   re-read, so leaving them out did not make them cheap — it made
+//!   "today by hour" blank for the first minutes of every warm launch.
+//!   Both maps are capped by the ledger itself (`max_hour_buckets`,
+//!   `max_sessions`) and are re-seeded through `putHour`/`putSession`,
+//!   which re-apply retention and LRU eviction on the way in, so a
+//!   hand-edited or stale file cannot restore an unbounded map.
+//! - **Only the PROCESS-lifetime session rollup lives here.** Per-session
+//!   data exists at three lifetimes on purpose: `sessions.Roster` is
+//!   INSTANT (live liveness, never persisted — a restored "running"
+//!   agent would be a lie about a process that exited), `ledger.per_session`
+//!   is PROCESS (this file), and the `history.zig` session dimension is
+//!   FOREVER. Persisting the roster here would collapse two of them.
+//! - **The `history` section is a gate, not a mirror.** `history.zig` is
+//!   its own durable store with its own files; nothing about its contents
+//!   is duplicated here. What is recorded is whether the one-time
+//!   backfill has run — see `Backfill`.
 //! - **Offsets are saved minus any partial-line carry**, so a restore
 //!   re-reads that line from its start; carry buffers themselves are not
 //!   persisted. For claude the dedup set makes the re-read idempotent; for
@@ -46,12 +64,18 @@ const snapsource = @import("snapsource.zig");
 const fleet_mod = @import("fleet.zig");
 const ledger_mod = @import("ledger.zig");
 
-/// v3 adds the collector-fleet sections (`tailers`, `sqlite`,
-/// `snapshots`) and `ledger.others`. v4 adds `ledger.covered_per_day`
-/// (subscription-value numerator). v2/v3 files still restore — the newer
-/// sections default to empty (cold catch-up / a current-month under-read
-/// that self-heals).
-pub const format_version: u32 = 4;
+/// Bumped on every wire change. `restore` demands an EXACT match, so no
+/// older file is ever partially read: it is declined (`.invalid`) and the
+/// boot path re-derives the whole thing with one full catch-up, after
+/// which the next save is current. That is the entire upgrade mechanism —
+/// there is no migration code here and there never has been.
+///
+/// v3 added the collector-fleet sections (`tailers`, `sqlite`,
+/// `snapshots`) and `ledger.others`. v4 added `ledger.covered_per_day`
+/// (subscription-value numerator). v5 adds the bounded ledger rollups
+/// Wave 1 grew (`ledger.per_hour`, `ledger.per_session`) and the
+/// `history` backfill gate.
+pub const format_version: u32 = 5;
 
 /// Hard ceiling on a plausible state file; anything bigger is corrupt.
 const max_state_bytes = 64 * 1024 * 1024;
@@ -64,6 +88,52 @@ pub const RestoreOutcome = enum {
     /// Unreadable, unparseable, or wrong version; state untouched — do a
     /// full catch-up. (The next save overwrites the bad file.)
     invalid,
+};
+
+/// The one-time history backfill gate.
+///
+/// `history.zig` is a durable store that starts EMPTY, and there is no
+/// honest migration into it from a v4 statefile: the dimension
+/// cross-product it needs (bucket x model x project x session, at minute
+/// resolution) was never persisted. `per_day` is six blended scalars per
+/// local day and `per_model`/`per_project` are all-time cumulative with
+/// no time axis at all — you cannot factor a product back out of its
+/// marginals. Any "migration" would be invented data, and this store is
+/// the one place in the app that is TRUTH rather than cache.
+///
+/// The real history is still on disk: the agents' own JSONL/SQLite trees.
+/// So the fix is not a migration but one cold-start catch-up run with the
+/// history writer attached, and this struct is the flag that says it
+/// happened. Running it twice would DOUBLE-COUNT — history records are
+/// additive and event dedup belongs to the tailers, which have no memory
+/// of a pass that ignored their offsets — so the gate is load-bearing,
+/// not a nicety.
+///
+/// `dict_generation` is what makes the flag falsifiable. A quarantined or
+/// rebuilt `history/dict.log` mints a fresh generation and every tier
+/// file stamped with the old one is abandoned; the store is then empty
+/// again and a `backfilled: true` from the previous generation is a claim
+/// about files that no longer exist. Comparing generations turns that
+/// from silent permanent data loss into one more catch-up.
+///
+/// This module only PERSISTS the gate. Deciding to run the backfill,
+/// running it, and setting the fields is the engine's job.
+pub const Backfill = struct {
+    /// The catch-up-with-history-attached pass has completed.
+    backfilled: bool = false,
+    /// Newest event timestamp (unix ms) that pass covered. Kept so a
+    /// resumed or extended backfill knows where the durable record
+    /// already reaches; zero means "nothing covered".
+    backfill_watermark_ms: i64 = 0,
+    /// `history.Writer.dict.generation` the backfill ran against.
+    dict_generation: u32 = 0,
+
+    /// Whether the backfill still owes a run against the store currently
+    /// on disk. Never backfilled, or backfilled into a dictionary
+    /// generation that has since been replaced, both mean yes.
+    pub fn needsRun(self: Backfill, current_dict_generation: u32) bool {
+        return !self.backfilled or self.dict_generation != current_dict_generation;
+    }
 };
 
 /// `$XDG_STATE_HOME/token-tach/tailers.json`, or
@@ -138,6 +208,40 @@ const WireDay = struct { day: i64, totals: WireTotals };
 const WireCoveredDay = struct { day: i64, cost_usd_bits: u64 = 0 };
 const WireKeyed = struct { key: []const u8, totals: WireTotals };
 
+/// One agent's slice of an hour bucket. Split out by stable label rather
+/// than written as a fixed array so adding a types.Agent member neither
+/// invalidates old files nor renumbers anything.
+const WireHourAgent = struct { agent: []const u8, totals: WireTotals };
+
+/// One bounded hourly bucket (`ledger.HourBucket`). `per_agent` carries
+/// only the agents that actually have events in the hour: the full
+/// cross-product would be ~336 buckets x every Agent member of mostly
+/// zeroes, which is pure file size for no information.
+const WireHour = struct {
+    hour: i64,
+    totals: WireTotals = .{},
+    per_agent: []const WireHourAgent = &.{},
+};
+
+/// One PROCESS-lifetime session rollup (`ledger.SessionRollup`). The
+/// agent rides as a stable label, so a session whose agent was removed
+/// from the build is dropped on restore rather than mis-attributed.
+const WireSession = struct {
+    id: []const u8,
+    agent: []const u8,
+    totals: WireTotals = .{},
+    first_seen_ms: i64 = 0,
+    last_seen_ms: i64 = 0,
+};
+
+/// The history backfill gate — see `Backfill` for why this is a flag and
+/// not a migration.
+const WireBackfill = struct {
+    backfilled: bool = false,
+    backfill_watermark_ms: i64 = 0,
+    dict_generation: u32 = 0,
+};
+
 /// One fleet JSONL-tailer file: line-boundary offset plus the cwd
 /// attribution captured from meta lines before that offset.
 const WireTailerFile = struct {
@@ -191,8 +295,10 @@ const WireLedger = struct {
     others: []const WireAgentTotals = &.{},
     per_day: []const WireDay = &.{},
     covered_per_day: []const WireCoveredDay = &.{},
+    per_hour: []const WireHour = &.{},
     per_model: []const WireKeyed = &.{},
     per_project: []const WireKeyed = &.{},
+    per_session: []const WireSession = &.{},
 };
 
 const WireState = struct {
@@ -206,6 +312,7 @@ const WireState = struct {
     sqlite: []const WireSqlite = &.{},
     snapshots: []const WireSnapPoller = &.{},
     ledger: WireLedger = .{},
+    history: WireBackfill = .{},
 };
 
 /// Stable label -> Agent (labels are the persisted identity; enum
@@ -250,6 +357,13 @@ fn unwireTotals(w: WireTotals) ledger_mod.Totals {
 /// are created as needed. Call only from the engine thread — the
 /// tailers must not be mid-feed. `fleet_opt` may be null (tests that
 /// don't care); the fleet sections are then omitted.
+///
+/// Writes a DEFAULT (never-backfilled) history gate. A caller that owns a
+/// history writer must use `saveWith` instead: saving through this entry
+/// point clears the flag, and a cleared flag re-runs the one-time
+/// backfill on the next boot, which double-counts (see `Backfill`).
+/// Read-only and test callers with no history store are unaffected —
+/// their gate is already default.
 pub fn save(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -260,11 +374,28 @@ pub fn save(
     fleet_opt: ?*const fleet_mod.Fleet,
     ledger: *const ledger_mod.Ledger,
 ) !void {
+    return saveWith(allocator, io, path, claude_tailer, codex_tailer, opencode_poller, fleet_opt, ledger, .{});
+}
+
+/// `save` plus the history backfill gate the caller owns. Separate entry
+/// point rather than an extra parameter so the existing signature (and
+/// the read-only CLI path that has no history store) keeps working.
+pub fn saveWith(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    claude_tailer: *const claude.Tailer,
+    codex_tailer: *const codex.Tailer,
+    opencode_poller: *const opencode.Poller,
+    fleet_opt: ?*const fleet_mod.Fleet,
+    ledger: *const ledger_mod.Ledger,
+    backfill: Backfill,
+) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const state = try toWire(arena, claude_tailer, codex_tailer, opencode_poller, fleet_opt, ledger);
+    const state = try toWire(arena, claude_tailer, codex_tailer, opencode_poller, fleet_opt, ledger, backfill);
     const json = try std.json.Stringify.valueAlloc(arena, state, .{});
 
     var cwd = std.Io.Dir.cwd();
@@ -293,8 +424,13 @@ fn toWire(
     opencode_poller: *const opencode.Poller,
     fleet_opt: ?*const fleet_mod.Fleet,
     ledger: *const ledger_mod.Ledger,
+    backfill: Backfill,
 ) !WireState {
-    var state = WireState{ .version = format_version };
+    var state = WireState{ .version = format_version, .history = .{
+        .backfilled = backfill.backfilled,
+        .backfill_watermark_ms = backfill.backfill_watermark_ms,
+        .dict_generation = backfill.dict_generation,
+    } };
 
     // Claude: offsets (minus carry — see module doc) and the dedup set.
     {
@@ -441,6 +577,39 @@ fn toWire(
         while (cit.next()) |entry| {
             try covered_days.append(arena, .{ .day = entry.key_ptr.*, .cost_usd_bits = @bitCast(entry.value_ptr.*) });
         }
+        // Hour buckets, each with the non-empty part of its per-agent
+        // split. Bounded by ledger.max_hour_buckets, so this section is
+        // hundreds of small objects, not an archive.
+        var hours: std.ArrayList(WireHour) = .empty;
+        var hit = ledger.per_hour.iterator();
+        while (hit.next()) |entry| {
+            const bucket = entry.value_ptr;
+            var split: std.ArrayList(WireHourAgent) = .empty;
+            inline for (@typeInfo(types.Agent).@"enum".fields) |field| {
+                const agent: types.Agent = @enumFromInt(field.value);
+                const totals = bucket.per_agent.get(agent);
+                if (totals.events != 0) {
+                    try split.append(arena, .{ .agent = agent.label(), .totals = wireTotals(totals) });
+                }
+            }
+            try hours.append(arena, .{
+                .hour = entry.key_ptr.*,
+                .totals = wireTotals(bucket.totals),
+                .per_agent = try split.toOwnedSlice(arena),
+            });
+        }
+        var sessions: std.ArrayList(WireSession) = .empty;
+        var sit = ledger.per_session.iterator();
+        while (sit.next()) |entry| {
+            const rollup = entry.value_ptr;
+            try sessions.append(arena, .{
+                .id = entry.key_ptr.*,
+                .agent = rollup.agent.label(),
+                .totals = wireTotals(rollup.totals),
+                .first_seen_ms = rollup.first_seen_ms,
+                .last_seen_ms = rollup.last_seen_ms,
+            });
+        }
         var models: std.ArrayList(WireKeyed) = .empty;
         var mit = ledger.per_model.iterator();
         while (mit.next()) |entry| {
@@ -476,8 +645,10 @@ fn toWire(
             .others = try others.toOwnedSlice(arena),
             .per_day = try days.toOwnedSlice(arena),
             .covered_per_day = try covered_days.toOwnedSlice(arena),
+            .per_hour = try hours.toOwnedSlice(arena),
             .per_model = try models.toOwnedSlice(arena),
             .per_project = try projects.toOwnedSlice(arena),
+            .per_session = try sessions.toOwnedSlice(arena),
         };
     }
 
@@ -489,12 +660,14 @@ fn toWire(
 // ---------------------------------------------------------------------------
 
 /// Re-hydrate freshly-initialized tailers, the collector fleet (when
-/// given), and the ledger from `path`. Accepts v2 (fleet sections
-/// default-empty — those sources cold-scan) and v3. Never touches the
-/// arguments unless the file parsed cleanly at a supported version (so
-/// `.absent`/`.invalid` leave them pristine for a full catch-up). Only
-/// OutOfMemory propagates — and can leave the arguments partially
-/// hydrated; treat it as fatal or reinit everything.
+/// given), and the ledger from `path`. Accepts EXACTLY `format_version`;
+/// every older file (v2, v3, v4, ...) is declined as `.invalid` and the
+/// caller does one full catch-up instead — there is no partial or
+/// best-effort read of an older format. Never touches the arguments
+/// unless the file parsed cleanly at that version (so `.absent`/
+/// `.invalid` leave them pristine for that catch-up). Only OutOfMemory
+/// propagates — and can leave the arguments partially hydrated; treat it
+/// as fatal or reinit everything.
 pub fn restore(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -504,6 +677,28 @@ pub fn restore(
     opencode_poller: *opencode.Poller,
     fleet_opt: ?*fleet_mod.Fleet,
     ledger: *ledger_mod.Ledger,
+) error{OutOfMemory}!RestoreOutcome {
+    var ignored: Backfill = .{};
+    return restoreWith(allocator, io, path, claude_tailer, codex_tailer, opencode_poller, fleet_opt, ledger, &ignored);
+}
+
+/// `restore` plus the history backfill gate, written into `backfill_out`.
+///
+/// Only a `.restored` outcome writes it, which is what makes the v5
+/// upgrade self-executing: a v4 file returns `.invalid`, `backfill_out`
+/// keeps the caller's default (`backfilled = false`), and the same full
+/// catch-up that rebuilds the ledger is the one that seeds history —
+/// with the writer attached, once, and never again.
+pub fn restoreWith(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    claude_tailer: *claude.Tailer,
+    codex_tailer: *codex.Tailer,
+    opencode_poller: *opencode.Poller,
+    fleet_opt: ?*fleet_mod.Fleet,
+    ledger: *ledger_mod.Ledger,
+    backfill_out: *Backfill,
 ) error{OutOfMemory}!RestoreOutcome {
     var cwd = std.Io.Dir.cwd();
     const data = cwd.readFileAlloc(io, path, allocator, .limited(max_state_bytes)) catch |err| switch (err) {
@@ -522,9 +717,12 @@ pub fn restore(
         else => return .invalid,
     };
     // Warm restore requires the exact current format. An older readable
-    // file re-derives once: covered_per_day (v4) can only be rebuilt by
-    // re-parsing history, so `.invalid` here routes the boot path through
-    // a one-time full catch-up, after which the next save is current.
+    // file re-derives once: neither covered_per_day (v4) nor the hourly /
+    // session rollups (v5) can be reconstructed from what earlier
+    // versions wrote down, so `.invalid` here routes the boot path
+    // through a one-time full catch-up, after which the next save is
+    // current. That catch-up is also the history backfill (see
+    // `Backfill`), so the upgrade executes itself.
     // A newer file (downgrade) is never guessed at.
     if (state.version != format_version) return .invalid;
 
@@ -591,12 +789,40 @@ pub fn restore(
         ledger.per_agent.set(agent, unwireTotals(o.totals));
     }
     for (state.ledger.per_day) |d| try ledger.putDay(d.day, unwireTotals(d.totals));
-    // Absent on v2/v3 files (covered_per_day is a v4 section): the
-    // subscription-value multiple under-reads for the current month
-    // until a cold rescan or month rollover repopulates it.
     for (state.ledger.covered_per_day) |c| try ledger.putCoveredDay(c.day, @bitCast(c.cost_usd_bits));
+    // putHour/putSession re-apply retention and LRU eviction, so the
+    // bounded maps stay bounded no matter what the file claims, and the
+    // insertion order below is irrelevant: a saved window already spans
+    // at most `max_hour_buckets` contiguous keys, so no bucket in it can
+    // fall outside the window anchored on any other bucket in it.
+    for (state.ledger.per_hour) |h| {
+        var bucket: ledger_mod.HourBucket = .{ .totals = unwireTotals(h.totals) };
+        for (h.per_agent) |a| {
+            const agent = agentFromLabel(a.agent) orelse continue;
+            bucket.per_agent.set(agent, unwireTotals(a.totals));
+        }
+        try ledger.putHour(h.hour, bucket);
+    }
     for (state.ledger.per_model) |m| try ledger.putModel(m.key, unwireTotals(m.totals));
     for (state.ledger.per_project) |p| try ledger.putProject(p.key, unwireTotals(p.totals));
+    for (state.ledger.per_session) |s| {
+        // No label match means the agent left the build; a rollup with no
+        // owner would be attributed to whatever enum ordinal 0 happens to
+        // be, so drop it.
+        const agent = agentFromLabel(s.agent) orelse continue;
+        try ledger.putSession(s.id, .{
+            .agent = agent,
+            .totals = unwireTotals(s.totals),
+            .first_seen_ms = s.first_seen_ms,
+            .last_seen_ms = s.last_seen_ms,
+        });
+    }
+
+    backfill_out.* = .{
+        .backfilled = state.history.backfilled,
+        .backfill_watermark_ms = state.history.backfill_watermark_ms,
+        .dict_generation = state.history.dict_generation,
+    };
 
     return .restored;
 }
@@ -809,6 +1035,30 @@ test "statefile round-trip: identical totals, no re-reads, dedup survives restar
     for (h1.ledger.per_project.keys(), h1.ledger.per_project.values()) |project, totals| {
         try expectTotalsEqual(totals, h2.ledger.per_project.get(project).?);
     }
+    // per_hour (v5): buckets AND their per-agent split, which is what a
+    // windowed AGENT SHARE reads before the first live event lands.
+    try testing.expect(h1.ledger.per_hour.count() > 0);
+    try testing.expectEqual(h1.ledger.per_hour.count(), h2.ledger.per_hour.count());
+    try testing.expectEqual(h1.ledger.newest_hour, h2.ledger.newest_hour);
+    for (h1.ledger.per_hour.keys(), h1.ledger.per_hour.values()) |hour, bucket| {
+        const got = h2.ledger.per_hour.get(hour).?;
+        try expectTotalsEqual(bucket.totals, got.totals);
+        for (std.enums.values(types.Agent)) |agent| {
+            try expectTotalsEqual(bucket.per_agent.get(agent), got.per_agent.get(agent));
+        }
+    }
+    // per_session (v5): rollups, agent attribution, and the recency
+    // timestamps eviction sorts on.
+    try testing.expect(h1.ledger.per_session.count() > 0);
+    try testing.expectEqual(h1.ledger.per_session.count(), h2.ledger.per_session.count());
+    for (h1.ledger.per_session.keys(), h1.ledger.per_session.values()) |id, rollup| {
+        const got = h2.ledger.forSession(id).?;
+        try expectTotalsEqual(rollup.totals, got.totals);
+        try testing.expectEqual(rollup.agent, got.agent);
+        try testing.expectEqual(rollup.first_seen_ms, got.first_seen_ms);
+        try testing.expectEqual(rollup.last_seen_ms, got.last_seen_ms);
+    }
+    try testing.expect(h2.ledger.forSession("ses_state") != null);
 
     // The codex limits reading survives without any file re-read.
     const limits = h2.codex_tailer.lastLimits().?;
@@ -939,14 +1189,12 @@ test "restore outcomes: absent, corrupted, and version mismatch leave state pris
     try testing.expectEqual(@as(usize, 0), h.ledger.per_day.count());
 }
 
-test "a pre-v4 state file re-derives (invalid -> full catch-up), leaving state pristine" {
+test "an older state file re-derives (invalid -> full catch-up), leaving state pristine" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A minimal pre-fleet save: legacy sections only. Older than v4, so
-    // it cannot carry covered_per_day — restore must decline it and let
-    // the boot path re-parse history once (the next save is v4).
+    // A minimal pre-fleet save: legacy sections only.
     try tmp.dir.writeFile(io, .{
         .sub_path = "v2.json",
         .data = "{\"version\":2,\"claude_files\":[{\"path\":\"/x/s1.jsonl\",\"offset\":57}]," ++
@@ -954,23 +1202,162 @@ test "a pre-v4 state file re-derives (invalid -> full catch-up), leaving state p
             "\"ledger\":{\"tz_offset_min\":-300,\"all\":{\"input\":10,\"output\":2,\"events\":1}," ++
             "\"claude\":{\"input\":10,\"output\":2,\"events\":1}}}",
     });
+    // A well-formed v4 file — everything v4 knew how to write, nothing
+    // wrong with it except that it predates per_hour/per_session and the
+    // history gate. It must still be DECLINED: that refusal is the whole
+    // upgrade path, and the full catch-up it forces is the one run that
+    // seeds history.zig (see `Backfill`). If this ever starts restoring,
+    // the backfill silently never happens.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "v4.json",
+        .data = "{\"version\":4,\"claude_files\":[{\"path\":\"/x/s1.jsonl\",\"offset\":57}]," ++
+            "\"claude_seen\":[\"msg_v4|req_v4\"]," ++
+            "\"ledger\":{\"tz_offset_min\":-300,\"all\":{\"input\":10,\"output\":2,\"events\":1}," ++
+            "\"claude\":{\"input\":10,\"output\":2,\"events\":1}," ++
+            "\"per_day\":[{\"day\":20000,\"totals\":{\"input\":10,\"output\":2,\"events\":1}}]," ++
+            "\"covered_per_day\":[{\"day\":20000,\"cost_usd_bits\":4591870180066957722}]}}",
+    });
     var base_buf: [std.fs.max_path_bytes]u8 = undefined;
     const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/v2.json", .{base});
+
+    for ([_][]const u8{ "v2.json", "v4.json" }) |name| {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ base, name });
+
+        var h = Harness.init(0);
+        defer h.deinit();
+        var fl = try fleet_mod.Fleet.init(testing.allocator, .{ .home = "/nonexistent/old-state-test" });
+        defer fl.deinit();
+
+        // A caller's gate starts "never backfilled" and must stay that
+        // way across a declined restore.
+        var gate: Backfill = .{};
+        try testing.expectEqual(
+            RestoreOutcome.invalid,
+            try restoreWith(testing.allocator, io, path, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &fl, &h.ledger, &gate),
+        );
+        // Nothing hydrated — the caller re-inits and does a full catch-up.
+        try testing.expectEqual(@as(u32, 0), h.claude_tailer.files.count());
+        try testing.expectEqual(@as(u64, 0), h.ledger.all.events);
+        try testing.expectEqual(@as(usize, 0), h.ledger.per_day.count());
+        try testing.expect(gate.needsRun(7));
+    }
+}
+
+test "the history backfill gate round-trips and survives a dictionary rebuild" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = try std.fmt.allocPrint(arena, "{s}/gate.json", .{base});
+
+    var h1 = Harness.init(0);
+    defer h1.deinit();
+    const written: Backfill = .{
+        .backfilled = true,
+        .backfill_watermark_ms = 1_783_483_000_000,
+        .dict_generation = 0xC0FFEE,
+    };
+    try saveWith(testing.allocator, io, path, &h1.claude_tailer, &h1.codex_tailer, &h1.opencode_poller, null, &h1.ledger, written);
+
+    var h2 = Harness.init(0);
+    defer h2.deinit();
+    var got: Backfill = .{};
+    try testing.expectEqual(
+        RestoreOutcome.restored,
+        try restoreWith(testing.allocator, io, path, &h2.claude_tailer, &h2.codex_tailer, &h2.opencode_poller, null, &h2.ledger, &got),
+    );
+    try testing.expectEqual(written.backfilled, got.backfilled);
+    try testing.expectEqual(written.backfill_watermark_ms, got.backfill_watermark_ms);
+    try testing.expectEqual(written.dict_generation, got.dict_generation);
+
+    // Same generation: the pass already ran, do not run it again.
+    try testing.expect(!got.needsRun(0xC0FFEE));
+    // A quarantined/rebuilt dict.log mints a new generation, which
+    // abandons every tier file the old backfill wrote. The flag is then
+    // a claim about files that no longer exist, so it must not hold.
+    try testing.expect(got.needsRun(0xC0FFEF));
+
+    // `save` (no gate) is the read-only/test entry point: it writes a
+    // default gate, so a caller that owns history must use `saveWith`.
+    try save(testing.allocator, io, path, &h1.claude_tailer, &h1.codex_tailer, &h1.opencode_poller, null, &h1.ledger);
+    var after: Backfill = .{ .backfilled = true, .dict_generation = 0xC0FFEE };
+    try testing.expectEqual(
+        RestoreOutcome.restored,
+        try restoreWith(testing.allocator, io, path, &h2.claude_tailer, &h2.codex_tailer, &h2.opencode_poller, null, &h2.ledger, &after),
+    );
+    try testing.expect(!after.backfilled);
+}
+
+test "restored hour and session maps stay inside their retention bounds" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(io, &base_buf)];
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = try std.fmt.allocPrint(arena, "{s}/bounds.json", .{base});
+
+    // Hand-build a v5 file that claims far more hours and sessions than
+    // the ledger's ceilings allow. The statefile never writes one (the
+    // saved maps are already capped), but a stale or edited file must not
+    // be able to smuggle an unbounded map into a process that runs for
+    // weeks — putHour/putSession re-apply the bounds on the way in.
+    const hour_span = ledger_mod.max_hour_buckets + 100;
+    const session_span = ledger_mod.max_sessions + 100;
+    var json: std.ArrayList(u8) = .empty;
+    try json.appendSlice(arena, "{\"version\":5,\"ledger\":{\"tz_offset_min\":0,\"per_hour\":[");
+    for (0..hour_span) |i| {
+        if (i != 0) try json.append(arena, ',');
+        try json.print(arena, "{{\"hour\":{d},\"totals\":{{\"output\":1,\"events\":1}}," ++
+            "\"per_agent\":[{{\"agent\":\"claude\",\"totals\":{{\"output\":1,\"events\":1}}}}]}}", .{i});
+    }
+    try json.appendSlice(arena, "],\"per_session\":[");
+    for (0..session_span) |i| {
+        if (i != 0) try json.append(arena, ',');
+        try json.print(arena, "{{\"id\":\"s-{d}\",\"agent\":\"codex\",\"totals\":{{\"output\":1,\"events\":1}}," ++
+            "\"first_seen_ms\":{d},\"last_seen_ms\":{d}}}", .{ i, i, i });
+    }
+    // One session whose agent left the build: dropped, never mis-attributed.
+    try json.appendSlice(arena, ",{\"id\":\"s-ghost\",\"agent\":\"hovercraft\",\"totals\":{\"output\":9,\"events\":1}}");
+    try json.appendSlice(arena, "]}}");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bounds.json", .data = json.items });
 
     var h = Harness.init(0);
     defer h.deinit();
-    var fl = try fleet_mod.Fleet.init(testing.allocator, .{ .home = "/nonexistent/v2-test" });
-    defer fl.deinit();
-
     try testing.expectEqual(
-        RestoreOutcome.invalid,
-        try restore(testing.allocator, io, path, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, &fl, &h.ledger),
+        RestoreOutcome.restored,
+        try restore(testing.allocator, io, path, &h.claude_tailer, &h.codex_tailer, &h.opencode_poller, null, &h.ledger),
     );
-    // Nothing hydrated — the caller re-inits and does a full catch-up.
-    try testing.expectEqual(@as(u32, 0), h.claude_tailer.files.count());
-    try testing.expectEqual(@as(u64, 0), h.ledger.all.events);
+
+    // Both maps sit at their ceiling, holding the NEWEST entries.
+    try testing.expectEqual(ledger_mod.max_hour_buckets, h.ledger.per_hour.count());
+    try testing.expectEqual(@as(i64, @intCast(hour_span - 1)), h.ledger.newest_hour);
+    try testing.expect(h.ledger.per_hour.get(h.ledger.newest_hour) != null);
+    try testing.expectEqual(
+        @as(?ledger_mod.HourBucket, null),
+        h.ledger.per_hour.get(h.ledger.newest_hour - @as(i64, @intCast(ledger_mod.max_hour_buckets))),
+    );
+    // The per-agent split rode along with the buckets that survived.
+    try testing.expectEqual(
+        @as(u64, 1),
+        h.ledger.per_hour.get(h.ledger.newest_hour).?.per_agent.get(.claude).totalTokens(),
+    );
+
+    try testing.expectEqual(ledger_mod.max_sessions, h.ledger.per_session.count());
+    var newest_buf: [1]ledger_mod.SessionRef = undefined;
+    try testing.expectEqual(@as(usize, 1), h.ledger.sessionsByRecency(&newest_buf));
+    try testing.expectEqual(@as(i64, @intCast(session_span - 1)), newest_buf[0].rollup.last_seen_ms);
+    try testing.expectEqual(@as(?ledger_mod.SessionRollup, null), h.ledger.forSession("s-0"));
+    try testing.expectEqual(@as(?ledger_mod.SessionRollup, null), h.ledger.forSession("s-ghost"));
 }
 
 test "save writes atomically and creates parent directories" {
@@ -992,7 +1379,7 @@ test "save writes atomically and creates parent directories" {
     // The final file exists; the tmp staging file does not.
     const data = try std.Io.Dir.cwd().readFileAlloc(io, state_path, testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(data);
-    try testing.expect(std.mem.indexOf(u8, data, "\"version\":4") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "\"version\":5") != null);
     const state_stat = try std.Io.Dir.cwd().statFile(io, state_path, .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), state_stat.permissions.toMode() & 0o777);
     const state_dir = std.fs.path.dirname(state_path).?;
