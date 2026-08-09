@@ -59,6 +59,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          REPO_VISIBILITY: ${{ github.event.repository.visibility }}
         run: |
           set -euo pipefail
           fail() {
@@ -71,12 +72,6 @@ jobs:
           manifest_version="$(jq -r '."."' .release-please-manifest.json)"
           [[ "$manifest_version" == "$version" ]] || fail "Manifest version $manifest_version does not match version.txt $version"
           tag="v$version"
-
-          # Existing published versions are normal on every non-release push.
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "$tag is already published; no release dispatch needed."
-            exit 0
-          fi
 
           # Release Please uses this stable branch for the release PR. Query its
           # merged PR directly instead of inferring the merge from git history.
@@ -93,6 +88,48 @@ jobs:
           release_sha="$(jq -r '.[0].mergeCommit.oid' <<<"$matches")"
           [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]] || fail "Release PR #$release_pr has no merge commit"
           git merge-base --is-ancestor "$release_sha" origin/main || fail "Release commit $release_sha is not on main"
+
+          # With skip-github-release, this workflow owns Release Please's label
+          # transition too. Once artifacts are published, mark the merged PR as
+          # tagged and rerun Release Please so it can open the next version PR.
+          release="$(gh release view "$tag" --json isDraft,assets 2>/dev/null || true)"
+          if [[ -n "$release" ]]; then
+            dmg="token-tach-$version-universal2.dmg"
+            provenance="token-tach-$version.intoto.jsonl"
+            jq -e --arg dmg "$dmg" --arg provenance "$provenance" --arg visibility "$REPO_VISIBILITY" '
+              (.isDraft == false) and
+              ([.assets[] | select(.name == $dmg and .size > 0)] | length == 1) and
+              ([.assets[] | select(.name == "SHA256SUMS" and .size > 0)] | length == 1) and
+              ($visibility != "public" or
+                ([.assets[] | select(.name == $provenance and .size > 0)] | length == 1))
+            ' <<<"$release" >/dev/null || fail "$tag exists but its immutable release assets are incomplete"
+            tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null || true)"
+            [[ "$tag_sha" == "$release_sha" ]] || fail "$tag points to $tag_sha, expected $release_sha"
+
+            labels="$(gh pr view "$release_pr" --json labels)"
+            pending="$(jq 'any(.labels[]; .name == "autorelease: pending")' <<<"$labels")"
+            tagged="$(jq 'any(.labels[]; .name == "autorelease: tagged")' <<<"$labels")"
+            if [[ "$pending" == true || "$tagged" != true ]]; then
+              gh label create "autorelease: tagged" --color ededed --force
+              if [[ "$pending" == true ]]; then
+                gh pr edit "$release_pr" \
+                  --remove-label "autorelease: pending" \
+                  --add-label "autorelease: tagged"
+              else
+                gh pr edit "$release_pr" --add-label "autorelease: tagged"
+              fi
+              settled="$(gh pr view "$release_pr" --json labels)"
+              jq -e '
+                any(.labels[]; .name == "autorelease: tagged") and
+                (any(.labels[]; .name == "autorelease: pending") | not)
+              ' <<<"$settled" >/dev/null || fail "Release PR #$release_pr label transition did not settle"
+              echo "$tag is published; marked release PR #$release_pr as tagged."
+              gh workflow run release-please.yml --ref main
+            else
+              echo "$tag is already published and release PR #$release_pr is settled."
+            fi
+            exit 0
+          fi
 
           manifest_at_release="$(git show "$release_sha:.release-please-manifest.json" | jq -r '."."')"
           version_file_at_release="$(git show "$release_sha:version.txt" | tr -d '[:space:]')"

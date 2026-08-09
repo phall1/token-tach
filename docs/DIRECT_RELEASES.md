@@ -48,12 +48,22 @@ artifacts: it verifies the exact tagged commit, builds and signs Universal 2,
 publishes the DMG/checksums/provenance, and updates the Homebrew tap. Do not
 manually edit release versions or create the normal release tag.
 
+After publication, `Release` dispatches `Release Please` to mark the merged
+release PR as `autorelease: tagged`. Release Please then evaluates whether to
+open or update the next draft version PR; this explicit continuation replaces
+the label transition normally performed while creating a GitHub Release.
+
 For recovery, run the `Release` workflow manually with an existing tag. It never
 builds an arbitrary branch or untagged SHA. If tag creation or dispatch failed,
 rerun `Release Please` on `main`; it derives the tag target directly from the
 matching merged release PR, validates every version mirror at that commit, and
 redispatches the publisher. Duplicate publisher runs cheaply stop before
 allocating a macOS runner once the release exists.
+
+If publication failed after creating only part of a GitHub Release, preflight
+fails with the exact cleanup command. Delete only that incomplete Release with
+`gh release delete vX.Y.Z --yes` (the existing tag is preserved), then rerun the
+`Release` workflow for the same tag. Complete releases are never mutated.
 
 After publication, the workflow dispatches `phall1/homebrew-tap` with the
 released version and verified DMG checksum when the optional token is present.

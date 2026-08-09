@@ -34,9 +34,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          REPO_VISIBILITY: ${{ github.event.repository.visibility }}
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          release="$(gh release view "$RELEASE_TAG" --json isDraft,assets 2>/dev/null || true)"
+          if [[ -n "$release" ]]; then
+            version="${RELEASE_TAG#v}"
+            dmg="token-tach-$version-universal2.dmg"
+            provenance="token-tach-$version.intoto.jsonl"
+            if ! jq -e --arg dmg "$dmg" --arg provenance "$provenance" --arg visibility "$REPO_VISIBILITY" '
+              (.isDraft == false) and
+              ([.assets[] | select(.name == $dmg and .size > 0)] | length == 1) and
+              ([.assets[] | select(.name == "SHA256SUMS" and .size > 0)] | length == 1) and
+              ($visibility != "public" or
+                ([.assets[] | select(.name == $provenance and .size > 0)] | length == 1))
+            ' <<<"$release" >/dev/null; then
+              echo "$RELEASE_TAG exists but is incomplete; preserve its tag, delete only the release, then rerun:" >&2
+              echo "  gh release delete $RELEASE_TAG --yes" >&2
+              exit 1
+            fi
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
             echo "$RELEASE_TAG is already published; skipping macOS release work."
           else
@@ -205,3 +221,22 @@ jobs:
             -f event_type=token-tach-release \
             -F "client_payload[version]=$VERSION" \
             -F "client_payload[sha256]=$sha256"
+
+  continue-release-please:
+    name: Continue Release Please
+    needs: [preflight, release]
+    if: always() && needs.preflight.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && needs.preflight.outputs.should_publish == 'false'))
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Continue after publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" >/dev/null
+          gh workflow run release-please.yml --ref main
