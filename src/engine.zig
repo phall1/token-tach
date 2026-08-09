@@ -37,7 +37,6 @@ pub const Effects = native_sdk.Effects(Msg);
 pub const sweep_timer_key: u64 = 1;
 pub const oauth_gate_timer_key: u64 = 2;
 pub const oauth_fetch_key: u64 = 3;
-pub const tz_spawn_key: u64 = 4;
 pub const creds_spawn_key: u64 = 5;
 pub const catchup_timer_key: u64 = 6;
 pub const ignition_timer_key: u64 = 7;
@@ -75,7 +74,7 @@ pub const Msg = union(enum) {
     oauth_tick: native_sdk.EffectTimer,
     creds_done: native_sdk.EffectExit,
     oauth_response: native_sdk.EffectResponse,
-    tz_done: native_sdk.EffectExit,
+    spawn_done: native_sdk.EffectExit,
     /// Tray "Quit" — accessory apps have no Dock icon to quit from.
     quit,
     /// Display-only: the tray popover just opened (SDK on_command
@@ -700,11 +699,9 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
         break :blk null;
     };
     model.prices = try pricing.Db.init(allocator);
-    // Resolve the local UTC offset SYNCHRONOUSLY, before the ledger and
-    // its day buckets exist. The async `date +%z` gate below only
-    // confirms it — but catch-up starts on boot, and a ledger created at
-    // tz=0 would bucket months of history under UTC until the subprocess
-    // returns, splitting days for every non-UTC user on a cold start.
+    // Resolve the local UTC offset synchronously, before the ledger and
+    // its day buckets exist. Catch-up starts on boot, and a ledger created
+    // at tz=0 would split historical days for every non-UTC user.
     model.tz_offset_min = localTzOffsetMin();
     model.ledger = ledger_mod.Ledger.init(allocator, model.tz_offset_min);
 
@@ -864,12 +861,6 @@ pub fn boot(model: *Model, fx: *Effects) void {
         .mode = .repeating,
         .on_fire = Effects.timerMsg(.oauth_tick),
     });
-    fx.spawn(.{
-        .key = tz_spawn_key,
-        .argv = &.{ "date", "+%z" },
-        .output = .collect,
-        .on_exit = Effects.exitMsg(.tz_done),
-    });
     openSystemChannel(model, fx);
     // One instrument advance so the needle has a pose to sweep from, then
     // the strings. Boot is a sweep boundary; every later refresh on this
@@ -923,6 +914,7 @@ fn systemSamplerMain(handle: native_sdk.ChannelHandle) void {
     defer threaded.deinit();
     const io = threaded.io();
     var sampler = system.Sampler.init();
+    defer sampler.deinit();
     const all = system.Enabled{};
     while (true) {
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(system_sample_interval_ms), .awake) catch return;
@@ -1173,9 +1165,9 @@ fn openConfig(model: *Model, fx: *Effects) void {
     };
     fx.spawn(.{
         .key = config_spawn_key,
-        .argv = &.{ "open", "-t", model.config_path },
+        .argv = &.{ "/usr/bin/open", "-t", model.config_path },
         .output = .collect,
-        .on_exit = Effects.exitMsg(.tz_done), // exit is uninteresting; reuse a no-op-safe arm
+        .on_exit = Effects.exitMsg(.spawn_done),
     });
 }
 
@@ -1287,21 +1279,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             dispatchAlerts(model, fx);
             refreshStrings(model);
         },
-        .tz_done => |exit| {
-            // The offset is already resolved synchronously in setup; this
-            // is a confirmation. Re-key the ledger ONLY if it is still
-            // empty (the offset genuinely changed before any bucket was
-            // written) — never silently re-key populated day buckets,
-            // which would split a day's spend across two keys.
-            if (exit.code == 0) {
-                if (parseTzOffsetMin(exit.output)) |offset| {
-                    model.tz_offset_min = offset;
-                    if (model.ledger.per_day.count() == 0) {
-                        model.ledger.tz_offset_min = offset;
-                    }
-                }
-            }
-        },
+        .spawn_done => {},
         .popover_opened => {
             model.now_ms = fx.wallMs();
             startIgnition(model, fx);
@@ -1443,17 +1421,6 @@ pub fn localTzOffsetMin() i32 {
     var tmv: c.struct_tm = undefined;
     if (c.localtime_r(&t, &tmv) == null) return 0;
     return @intCast(@divTrunc(tmv.tm_gmtoff, 60));
-}
-
-/// "+0530" / "-0700" (optionally newline-terminated) -> minutes east.
-pub fn parseTzOffsetMin(raw: []const u8) ?i32 {
-    const s = std.mem.trim(u8, raw, " \t\r\n");
-    if (s.len != 5 or (s[0] != '+' and s[0] != '-')) return null;
-    const hours = std.fmt.parseInt(i32, s[1..3], 10) catch return null;
-    const mins = std.fmt.parseInt(i32, s[3..5], 10) catch return null;
-    if (hours > 14 or mins > 59) return null;
-    const total = hours * 60 + mins;
-    return if (s[0] == '-') -total else total;
 }
 
 // ------------------------------------------------------------------ sweep
@@ -1749,7 +1716,7 @@ fn maybeOauthPoll(model: *Model, fx: *Effects) void {
     model.oauth_inflight = true;
     fx.spawn(.{
         .key = creds_spawn_key,
-        .argv = &.{ "security", "find-generic-password", "-s", keychain.claude_service, "-w" },
+        .argv = &.{ "/usr/bin/security", "find-generic-password", "-s", keychain.claude_service, "-w" },
         .output = .collect,
         .on_exit = Effects.exitMsg(.creds_done),
     });
@@ -1771,6 +1738,14 @@ fn handleCreds(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
         setErrorStatus(model, "unreadable Claude credentials payload", .{});
         return;
     };
+    defer std.crypto.secureZero(u8, @constCast(creds.access_token));
+
+    if (creds.expired(model.now_ms)) {
+        model.oauth_inflight = false;
+        model.oauth_next_ms = model.now_ms + configuredPollMs(model);
+        setErrorStatus(model, "Claude credentials expired; reopen Claude Code to refresh", .{});
+        return;
+    }
 
     if (creds.subscription_type.len > 0 and creds.subscription_type.len <= model.claude_plan_buf.len) {
         @memcpy(model.claude_plan_buf[0..creds.subscription_type.len], creds.subscription_type);
@@ -1778,6 +1753,7 @@ fn handleCreds(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
     }
 
     var auth_buf: [2048]u8 = undefined;
+    defer std.crypto.secureZero(u8, &auth_buf);
     const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{creds.access_token}) catch {
         model.oauth_inflight = false;
         return;
@@ -2186,14 +2162,6 @@ pub fn subscriptionValue(model: *const Model) SubscriptionValue {
 // ------------------------------------------------------------------ tests
 
 const testing = std.testing;
-
-test "tz offset parsing" {
-    try testing.expectEqual(@as(i32, 330), parseTzOffsetMin("+0530\n").?);
-    try testing.expectEqual(@as(i32, -420), parseTzOffsetMin("-0700").?);
-    try testing.expectEqual(@as(i32, 0), parseTzOffsetMin("+0000").?);
-    try testing.expectEqual(@as(?i32, null), parseTzOffsetMin("UTC"));
-    try testing.expectEqual(@as(?i32, null), parseTzOffsetMin("+9930"));
-}
 
 test "oauth response drives backoff and snapshot state" {
     var model = Model{ .allocator = testing.allocator };

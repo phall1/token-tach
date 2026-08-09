@@ -48,7 +48,7 @@ jobs:
           gh workflow run ci.yml --ref "$head" -f ref="$head"
           echo "Dispatched CI for updated ready PR #$number at $head."
 
-      - name: Check out main release history
+      - name: Check out main
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: main
@@ -61,9 +61,15 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          fail() {
+            echo "$1" >&2
+            exit 1
+          }
+
           version="$(tr -d '[:space:]' < version.txt)"
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail "version.txt is not canonical semver"
           manifest_version="$(jq -r '."."' .release-please-manifest.json)"
-          [[ "$manifest_version" == "$version" ]]
+          [[ "$manifest_version" == "$version" ]] || fail "Manifest version $manifest_version does not match version.txt $version"
           tag="v$version"
 
           # Existing published versions are normal on every non-release push.
@@ -72,57 +78,43 @@ jobs:
             exit 0
           fi
 
-          # Find the first-parent commit that introduced this manifest version.
-          # On recovery this remains the release-PR merge, even if main advanced.
-          #
-          # The candidate list is materialised BEFORE the loop, deliberately.
-          # A `git log | while read ...; break; done` pipeline deadlocks this
-          # job under `pipefail`: a path-filtered `git log` keeps walking
-          # history after it emits its first match, so breaking on that match
-          # closes the read end, git takes SIGPIPE (141), pipefail promotes it
-          # to a pipeline failure, and `set -e` kills the step with no output
-          # at all. It survived v0.8.0 only because the walk was short enough
-          # to finish before the break, which is a race, not a guarantee.
-          mapfile -t candidates < <(
-            git log --first-parent --format=%H -- .release-please-manifest.json
-          )
-          release_sha=""
-          for candidate in "${candidates[@]}"; do
-            candidate_version="$(git show "$candidate:.release-please-manifest.json" 2>/dev/null | jq -r '."."' 2>/dev/null || true)"
-            parent="$(git rev-parse "$candidate^1" 2>/dev/null || true)"
-            parent_version=""
-            if [[ -n "$parent" ]]; then
-              parent_version="$(git show "$parent:.release-please-manifest.json" 2>/dev/null | jq -r '."."' 2>/dev/null || true)"
-            fi
-            if [[ "$candidate_version" == "$version" && "$parent_version" != "$version" ]]; then
-              release_sha="$candidate"
-              break
-            fi
-          done
-          [[ -n "$release_sha" ]]
+          # Release Please uses this stable branch for the release PR. Query its
+          # merged PR directly instead of inferring the merge from git history.
+          release_pr_title="chore(main): release $version"
+          release_prs="$(gh pr list \
+            --state merged \
+            --base main \
+            --head release-please--branches--main--components--token-tach \
+            --limit 100 \
+            --json number,title,mergeCommit)"
+          matches="$(jq --arg title "$release_pr_title" '[.[] | select(.title == $title)]' <<<"$release_prs")"
+          [[ "$(jq 'length' <<<"$matches")" == 1 ]] || fail "Expected one merged release PR titled '$release_pr_title'"
+          release_pr="$(jq -r '.[0].number' <<<"$matches")"
+          release_sha="$(jq -r '.[0].mergeCommit.oid' <<<"$matches")"
+          [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]] || fail "Release PR #$release_pr has no merge commit"
+          git merge-base --is-ancestor "$release_sha" origin/main || fail "Release commit $release_sha is not on main"
+
           manifest_at_release="$(git show "$release_sha:.release-please-manifest.json" | jq -r '."."')"
           version_file_at_release="$(git show "$release_sha:version.txt" | tr -d '[:space:]')"
           app_at_release="$(git show "$release_sha:app.zon" | sed -nE 's/^[[:space:]]*\.version = \"([^\"]+)\".*/\1/p')"
           build_at_release="$(git show "$release_sha:build.zig.zon" | sed -nE 's/^[[:space:]]*\.version = \"([^\"]+)\".*/\1/p')"
-          [[ "$manifest_at_release" == "$version" ]]
-          [[ "$version_file_at_release" == "$version" ]]
-          [[ "$app_at_release" == "$version" ]]
-          [[ "$build_at_release" == "$version" ]]
+          [[ "$manifest_at_release" == "$version" ]] || fail "Release manifest version $manifest_at_release does not match $version"
+          [[ "$version_file_at_release" == "$version" ]] || fail "Release version.txt value $version_file_at_release does not match $version"
+          [[ "$app_at_release" == "$version" ]] || fail "Release app.zon version $app_at_release does not match $version"
+          [[ "$build_at_release" == "$version" ]] || fail "Release build.zig.zon version $build_at_release does not match $version"
 
-          # release-please owns the version PR; this workflow owns the lightweight
-          # tag so the existing artifact publisher remains the sole Release owner.
+          # This workflow owns the lightweight tag; release.yml remains the sole
+          # owner of the GitHub Release and immutable artifacts.
           tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null || true)"
           if [[ -z "$tag_sha" ]]; then
             gh api --method POST "repos/$GH_REPO/git/refs" \
               -f ref="refs/tags/$tag" \
               -f sha="$release_sha" >/dev/null
-            echo "Created $tag at release commit $release_sha."
+            echo "Created $tag at release PR #$release_pr merge $release_sha."
           else
-            [[ "$tag_sha" == "$release_sha" ]]
+            [[ "$tag_sha" == "$release_sha" ]] || fail "$tag points to $tag_sha, expected $release_sha"
             echo "$tag already exists at the release commit; retrying dispatch."
           fi
 
-          # GITHUB_TOKEN tag pushes do not recursively start workflows. A
-          # workflow_dispatch event is the documented exception, so dispatch the
-          # immutable tag publisher explicitly.
+          # GITHUB_TOKEN tag creation does not recursively start workflows.
           gh workflow run release.yml --ref main -f tag="$tag"
