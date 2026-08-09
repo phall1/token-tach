@@ -64,6 +64,12 @@ pub const cwd_cap: usize = 160;
 /// Model ids ("claude-fable-5-20260514", "gpt-5.2-codex") fit comfortably.
 pub const model_cap: usize = 48;
 
+/// Project names are directory basenames, not paths. Stored rather than
+/// derived from `cwd` because `cwd` is truncated from the HEAD, and the
+/// repository root a worktree rolls up to lives in exactly the part that
+/// gets dropped.
+pub const project_cap: usize = 64;
+
 /// Per-session burn ring: 40 buckets x 15 s = a 10-minute window. Wide
 /// enough that a row's sparkline shows the shape of a turn, short enough
 /// that a finished session's rate decays to zero while it is still on
@@ -178,6 +184,10 @@ pub const Session = struct {
     cwd: Fixed(cwd_cap) = .{},
     /// The stored `cwd` lost its leading components to `cwd_cap`.
     cwd_head_truncated: bool = false,
+    /// Basename of the repository root this session's `cwd` belongs to,
+    /// stamped at ingest from `UsageEvent.projectKey()`. Empty for a
+    /// collector that gave us no cwd at all.
+    project_name: Fixed(project_cap) = .{},
     model: Fixed(model_cap) = .{},
     first_seen_ms: i64 = 0,
     /// Newest COMPLETED turn (a priced event).
@@ -207,8 +217,15 @@ pub const Session = struct {
         return self.model.slice();
     }
 
-    /// Basename of `cwd` — the project label a row shows.
+    /// The project label a row shows: the repository's name, so every
+    /// worktree of one repo reads as that repo.
+    ///
+    /// Falls back to the basename of `cwd` for a session recorded before
+    /// the resolved name existed — a journal replayed from an older
+    /// build, or an event assembled without going through ingest.
     pub fn project(self: *const Session) []const u8 {
+        const name = self.project_name.slice();
+        if (name.len > 0) return name;
         return projectName(self.cwd.slice());
     }
 
@@ -310,6 +327,11 @@ pub const Roster = struct {
     pub fn record(self: *Roster, ev: types.UsageEvent, cost_usd: ?f64) void {
         const s = self.slotFor(ev.agent, ev.session_id, ev.timestamp_ms);
         if (ev.cwd.len > 0) s.cwd_head_truncated = s.cwd.setSuffix(ev.cwd);
+        // Stamped from the full, untruncated key, which is why the label
+        // survives a deep path: `projectKey()` is the repository root and
+        // `cwd` above may have already lost its head.
+        const project_key = ev.projectKey();
+        if (project_key.len > 0) s.project_name.setPrefix(projectName(project_key));
         if (ev.model.len > 0) s.model.setPrefix(ev.model);
         s.totals.add(ev, cost_usd);
         s.burn.add(ev.timestamp_ms, predict.limitWeightedTokens(ev));

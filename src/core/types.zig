@@ -113,8 +113,25 @@ pub const UsageEvent = struct {
     cache_read_tokens: u64 = 0,
     /// Session/rollout the event belongs to.
     session_id: []const u8 = "",
-    /// Working directory (claude) — powers per-project attribution.
+    /// Working directory as the agent logged it. Keeps its literal meaning:
+    /// this is where the agent actually ran, worktree and subdirectory
+    /// included, which is what a session's detail row shows.
     cwd: []const u8 = "",
+    /// Repository root `cwd` belongs to, resolved at ingest by
+    /// `core/project.zig`. Empty when nothing resolved it — a collector
+    /// building an event by hand, or a cwd we could not classify.
+    ///
+    /// This, not `cwd`, is the per-project aggregation key. A git worktree
+    /// is a different directory and the same project; so is a
+    /// subdirectory. See `projectKey`.
+    project_root: []const u8 = "",
+
+    /// The key the project dimension groups on. Falls back to `cwd` so an
+    /// event that never passed through the resolver still lands somewhere
+    /// truthful instead of in a nameless bucket.
+    pub fn projectKey(self: UsageEvent) []const u8 {
+        return if (self.project_root.len > 0) self.project_root else self.cwd;
+    }
 
     pub fn totalTokens(self: UsageEvent) u64 {
         return self.input_tokens + self.output_tokens +

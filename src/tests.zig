@@ -41,6 +41,7 @@ test {
     _ = @import("core/ring.zig");
     _ = @import("core/history.zig");
     _ = @import("core/sessions.zig");
+    _ = @import("core/project.zig");
     _ = @import("core/predict.zig");
     _ = @import("core/alerts.zig");
     _ = @import("core/trayfmt.zig");

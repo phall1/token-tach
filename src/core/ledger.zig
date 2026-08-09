@@ -45,6 +45,18 @@ pub const Totals = struct {
         self.events -|= 1;
     }
 
+    /// Fold another rollup into this one. For collapsing two keys that
+    /// turn out to name the same thing; `add` needs an event and these
+    /// have already been summed.
+    pub fn merge(self: *Totals, other: Totals) void {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cost_usd += other.cost_usd;
+        self.events += other.events;
+    }
+
     pub fn totalTokens(self: Totals) u64 {
         return self.input_tokens + self.output_tokens +
             self.cache_creation_tokens + self.cache_read_tokens;
@@ -229,7 +241,10 @@ pub const Ledger = struct {
         // A blank model string is not a model — unpriced sources (e.g.
         // kimi) would otherwise collapse into one nameless rollup row.
         if (ev.model.len > 0) try addKeyed(self.allocator, &self.per_model, ev.model, ev, cost);
-        if (ev.cwd.len > 0) try addKeyed(self.allocator, &self.per_project, ev.cwd, ev, cost);
+        // Keyed on the REPOSITORY, not the directory: two worktrees of one
+        // repo are one project. `projectKey` falls back to `cwd`.
+        const project = ev.projectKey();
+        if (project.len > 0) try addKeyed(self.allocator, &self.per_project, project, ev, cost);
     }
 
     /// Drop hour buckets older than the retention window. Anchored to the
@@ -322,7 +337,10 @@ pub const Ledger = struct {
             if (self.per_session.getPtr(ev.session_id)) |rollup| rollup.totals.remove(ev, cost);
         }
         if (ev.model.len > 0) if (self.per_model.getPtr(ev.model)) |totals| totals.remove(ev, cost);
-        if (ev.cwd.len > 0) if (self.per_project.getPtr(ev.cwd)) |totals| totals.remove(ev, cost);
+        // Must mirror `add`'s key exactly, or a correction subtracts from a
+        // bucket the addition never went into.
+        const project = ev.projectKey();
+        if (project.len > 0) if (self.per_project.getPtr(project)) |totals| totals.remove(ev, cost);
     }
 
     fn addKeyed(
@@ -369,6 +387,46 @@ pub const Ledger = struct {
     /// Statefile restore: seed one project rollup wholesale (overwrites).
     pub fn putProject(self: *Ledger, project: []const u8, totals: Totals) !void {
         try putKeyed(self.allocator, &self.per_project, project, totals);
+    }
+
+    /// Re-resolve every project key through `resolver` and fold the
+    /// collisions together.
+    ///
+    /// `per_project` is lifetime-cumulative and persisted, so without this
+    /// a statefile written before the worktree rollup existed would keep
+    /// showing its old per-worktree rows forever — the new key only ever
+    /// applies to events ingested from now on. Run it once, right after
+    /// restore, and the PROJECTS table reads correctly on the first launch
+    /// after the upgrade instead of on some indefinite future one.
+    ///
+    /// The mapping is many-to-one by design (that is the whole point), so
+    /// totals are merged rather than overwritten. `resolver` is anything
+    /// with `rootFor([]const u8) []const u8`; taking it structurally keeps
+    /// the ledger from depending on the resolver's module.
+    pub fn rekeyProjects(self: *Ledger, resolver: anytype) !void {
+        if (self.per_project.count() == 0) return;
+        var rebuilt: std.StringArrayHashMapUnmanaged(Totals) = .empty;
+        errdefer {
+            for (rebuilt.keys()) |k| self.allocator.free(k);
+            rebuilt.deinit(self.allocator);
+        }
+        for (self.per_project.keys(), self.per_project.values()) |key, totals| {
+            const root = resolver.rootFor(key);
+            const gop = try rebuilt.getOrPut(self.allocator, root);
+            if (!gop.found_existing) {
+                // `root` may alias `key`, which is freed below, so the new
+                // map must own its own copy before the swap.
+                gop.key_ptr.* = self.allocator.dupe(u8, root) catch |err| {
+                    _ = rebuilt.orderedRemove(root);
+                    return err;
+                };
+                gop.value_ptr.* = .{};
+            }
+            gop.value_ptr.merge(totals);
+        }
+        for (self.per_project.keys()) |k| self.allocator.free(k);
+        self.per_project.deinit(self.allocator);
+        self.per_project = rebuilt;
     }
 
     fn putKeyed(
