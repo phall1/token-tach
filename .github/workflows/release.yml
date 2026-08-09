@@ -7,12 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag (for example, v0.3.2)
+        description: Release name (for example, v0.3.2)
         required: true
         type: string
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -27,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       should_publish: ${{ steps.release.outputs.should_publish }}
+      commit: ${{ steps.release.outputs.commit }}
     steps:
       - name: Skip an already published tag
         id: release
@@ -37,35 +39,79 @@ jobs:
           REPO_VISIBILITY: ${{ github.event.repository.visibility }}
         run: |
           set -euo pipefail
-          release="$(gh release view "$RELEASE_TAG" --json isDraft,assets 2>/dev/null || true)"
+          fail() {
+            echo "$1" >&2
+            exit 1
+          }
+
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail "Release tag must be canonical vMAJOR.MINOR.PATCH"
+          version="${RELEASE_TAG#v}"
+          owner="${GH_REPO%%/*}"
+          release_pr_title="chore(main): release $version"
+          release_prs="$(gh api --paginate --slurp \
+            "repos/$GH_REPO/pulls?state=closed&base=main&head=$owner:release-please--branches--main--components--token-tach&per_page=100")"
+          matches="$(jq --arg title "$release_pr_title" '[.[][] | select(.merged_at != null and .title == $title)]' <<<"$release_prs")"
+          [[ "$(jq 'length' <<<"$matches")" == 1 ]] || fail "Expected one merged release PR titled '$release_pr_title'"
+          release_commit="$(jq -r '.[0].merge_commit_sha' <<<"$matches")"
+          [[ "$release_commit" =~ ^[0-9a-f]{40}$ ]] || fail "Release PR has no merge commit"
+
+          release="$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,targetCommitish,assets 2>/dev/null || true)"
           if [[ -n "$release" ]]; then
             if [[ "$(jq -r '.isDraft' <<<"$release")" == true ]]; then
-              echo "should_publish=true" >> "$GITHUB_OUTPUT"
-              echo "$RELEASE_TAG is a draft; resuming artifact publication."
-              exit 0
+              [[ "$(jq -r '.isPrerelease' <<<"$release")" == false ]] || fail "$RELEASE_TAG cannot be both draft and prerelease"
+              commit="$(jq -r '.targetCommitish' <<<"$release")"
+              [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail "$RELEASE_TAG draft must target an exact commit, got $commit"
+              [[ "$commit" == "$release_commit" ]] || fail "$RELEASE_TAG draft targets $commit, expected release PR merge $release_commit"
             fi
-            version="${RELEASE_TAG#v}"
             dmg="token-tach-$version-universal2.dmg"
             provenance="token-tach-$version.intoto.jsonl"
-            if ! jq -e --arg dmg "$dmg" --arg provenance "$provenance" --arg visibility "$REPO_VISIBILITY" '
+            if [[ "$(jq -r '.isDraft' <<<"$release")" == false ]] && jq -e --arg dmg "$dmg" --arg provenance "$provenance" --arg visibility "$REPO_VISIBILITY" '
+              def expected:
+                if $visibility == "public" then [$dmg, "SHA256SUMS", $provenance]
+                else [$dmg, "SHA256SUMS"] end;
               (.isDraft == false) and
-              ([.assets[] | select(.name == $dmg and .size > 0)] | length == 1) and
-              ([.assets[] | select(.name == "SHA256SUMS" and .size > 0)] | length == 1) and
-              ($visibility != "public" or
-                ([.assets[] | select(.name == $provenance and .size > 0)] | length == 1))
+              (.isPrerelease == false) and
+              ([.assets[] | .name] | sort) == (expected | sort) and
+              all(.assets[]; .size > 0)
             ' <<<"$release" >/dev/null; then
-              echo "$RELEASE_TAG exists but is incomplete; preserve its tag, delete only the release, then rerun:" >&2
-              echo "  gh release delete $RELEASE_TAG --yes" >&2
-              exit 1
+              tag_ref="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '[.object.type, .object.sha] | @tsv')" || fail "$RELEASE_TAG release has no tag"
+              IFS=$'\t' read -r tag_type tag_commit <<<"$tag_ref"
+              [[ "$tag_type" == commit ]] || fail "$RELEASE_TAG must be a lightweight tag, got $tag_type"
+              [[ "$tag_commit" == "$release_commit" ]] || fail "$RELEASE_TAG points to $tag_commit, expected $release_commit"
+              echo "should_publish=false" >> "$GITHUB_OUTPUT"
+              echo "$RELEASE_TAG is already published; skipping macOS release work."
+              exit 0
+            elif [[ "$(jq -r '.isDraft' <<<"$release")" == false ]]; then
+              fail "$RELEASE_TAG exists but its immutable release assets are incomplete; preserve its tag, delete only the release, then rerun: gh release delete $RELEASE_TAG --yes"
+            else
+              echo "$RELEASE_TAG is a draft at $commit; validating its source."
             fi
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            echo "$RELEASE_TAG is already published; skipping macOS release work."
           else
-            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            tag_ref="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '[.object.type, .object.sha] | @tsv')" || fail "$RELEASE_TAG has neither a draft release nor an existing tag"
+            IFS=$'\t' read -r tag_type commit <<<"$tag_ref"
+            [[ "$tag_type" == commit ]] || fail "$RELEASE_TAG must be a lightweight tag, got $tag_type"
+            [[ "$commit" == "$release_commit" ]] || fail "$RELEASE_TAG points to $commit, expected release PR merge $release_commit"
           fi
 
+          comparison="$(gh api "repos/$GH_REPO/compare/$commit...main" --jq '.status')"
+          [[ "$comparison" == ahead || "$comparison" == identical ]] || fail "Release commit $commit is not on main"
+          read_source() {
+            gh api "repos/$GH_REPO/contents/$1?ref=$commit" --jq '.content' | tr -d '\n' | base64 --decode
+          }
+          manifest_version="$(read_source .release-please-manifest.json | jq -r '."."')"
+          version_file="$(read_source version.txt | tr -d '[:space:]')"
+          app_version="$(read_source app.zon | sed -nE 's/^[[:space:]]*\.version = "([^"]+)".*/\1/p')"
+          build_version="$(read_source build.zig.zon | sed -nE 's/^[[:space:]]*\.version = "([^"]+)".*/\1/p')"
+          [[ "$manifest_version" == "$version" ]] || fail "Release manifest version $manifest_version does not match $version"
+          [[ "$version_file" == "$version" ]] || fail "Release version.txt value $version_file does not match $version"
+          [[ "$app_version" == "$version" ]] || fail "Release app.zon version $app_version does not match $version"
+          [[ "$build_version" == "$version" ]] || fail "Release build.zig.zon version $build_version does not match $version"
+
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "should_publish=true" >> "$GITHUB_OUTPUT"
+
   verify:
-    name: Verify tagged commit
+    name: Verify release commit
     needs: preflight
     if: needs.preflight.outputs.should_publish == 'true'
     runs-on: macos-15
@@ -75,20 +121,16 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ needs.preflight.outputs.commit }}
           fetch-depth: 0
           submodules: recursive
+          persist-credentials: false
 
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
-
-      - name: Build Native SDK CLI from vendored fork
-        run: cd vendor/native && zig build cli
-
-      - name: Validate exact tag and version
+      - name: Validate exact release source and version
         id: tag
         shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.preflight.outputs.commit }}
         run: |
           set -euo pipefail
           [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
@@ -100,18 +142,40 @@ jobs:
             echo "Could not read exactly one canonical version from app.zon" >&2
             exit 1
           }
+          manifest_version="$(jq -r '."."' .release-please-manifest.json)"
+          version_file="$(tr -d '[:space:]' < version.txt)"
+          build_version="$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)".*/\1/p' build.zig.zon)"
+          [[ "$manifest_version" == "$version" ]] || {
+            echo "Manifest version $manifest_version does not match app.zon version $version" >&2
+            exit 1
+          }
+          [[ "$version_file" == "$version" ]] || {
+            echo "version.txt value $version_file does not match app.zon version $version" >&2
+            exit 1
+          }
+          [[ "$build_version" == "$version" ]] || {
+            echo "build.zig.zon version $build_version does not match app.zon version $version" >&2
+            exit 1
+          }
           [[ "$RELEASE_TAG" == "v$version" ]] || {
             echo "Tag $RELEASE_TAG does not match app.zon version $version" >&2
             exit 1
           }
-          tag_commit="$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"
           head_commit="$(git rev-parse HEAD)"
-          [[ "$head_commit" == "$tag_commit" ]] || {
-            echo "Checkout $head_commit is not tagged commit $tag_commit" >&2
+          [[ "$head_commit" == "$EXPECTED_COMMIT" ]] || {
+            echo "Checkout $head_commit is not expected commit $EXPECTED_COMMIT" >&2
             exit 1
           }
+
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "commit=$head_commit" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - name: Build Native SDK CLI from vendored fork
+        run: cd vendor/native && zig build cli
 
       - name: Verify source
         run: scripts/verify
@@ -122,6 +186,7 @@ jobs:
     runs-on: macos-15
     permissions:
       contents: write
+      pull-requests: read
       id-token: write
       attestations: write
     steps:
@@ -130,6 +195,7 @@ jobs:
           ref: ${{ needs.verify.outputs.commit }}
           fetch-depth: 0
           submodules: recursive
+          persist-credentials: false
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
@@ -146,7 +212,6 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$(git rev-parse HEAD)" == "$EXPECTED_COMMIT" ]]
-          [[ "$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")" == "$EXPECTED_COMMIT" ]]
           [[ "$RELEASE_TAG" == "v$EXPECTED_VERSION" ]]
 
       - name: Build and validate Universal 2 ad-hoc release
@@ -205,23 +270,134 @@ jobs:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
-          remote_tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
-          [[ "$remote_tag_sha" == "$EXPECTED_COMMIT" ]] || {
-            echo "$RELEASE_TAG moved to $remote_tag_sha during the build; expected $EXPECTED_COMMIT" >&2
-            exit 1
+          tag_ref_if_exists() {
+            local output error
+            output="$(mktemp)"
+            error="$(mktemp)"
+            if gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '[.object.type, .object.sha] | @tsv' >"$output" 2>"$error"; then
+              cat "$output"
+            elif ! grep -q 'HTTP 404' "$error"; then
+              cat "$error" >&2
+              rm -f "$output" "$error"
+              return 1
+            fi
+            rm -f "$output" "$error"
           }
-          release="$(gh release view "$RELEASE_TAG" --json isDraft 2>/dev/null || true)"
+
+          validate_remote_provenance() {
+            local owner release_pr_title release_prs matches release_commit comparison
+            owner="${GH_REPO%%/*}"
+            release_pr_title="chore(main): release $VERSION"
+            release_prs="$(gh api --paginate --slurp \
+              "repos/$GH_REPO/pulls?state=closed&base=main&head=$owner:release-please--branches--main--components--token-tach&per_page=100")"
+            matches="$(jq --arg title "$release_pr_title" '[.[][] | select(.merged_at != null and .title == $title)]' <<<"$release_prs")"
+            [[ "$(jq 'length' <<<"$matches")" == 1 ]] || {
+              echo "Expected one merged release PR titled '$release_pr_title' at publication" >&2
+              return 1
+            }
+            release_commit="$(jq -r '.[0].merge_commit_sha' <<<"$matches")"
+            [[ "$release_commit" == "$EXPECTED_COMMIT" ]] || {
+              echo "Release PR moved to $release_commit; expected $EXPECTED_COMMIT" >&2
+              return 1
+            }
+            comparison="$(gh api "repos/$GH_REPO/compare/$EXPECTED_COMMIT...main" --jq '.status')"
+            [[ "$comparison" == ahead || "$comparison" == identical ]] || {
+              echo "Release commit $EXPECTED_COMMIT is no longer on main" >&2
+              return 1
+            }
+          }
+
+          validate_remote_provenance
+          remote_tag_ref="$(tag_ref_if_exists)"
+          if [[ -n "$remote_tag_ref" ]]; then
+            IFS=$'\t' read -r remote_tag_type remote_tag_sha <<<"$remote_tag_ref"
+            [[ "$remote_tag_type" == commit ]] || {
+              echo "$RELEASE_TAG must be a lightweight tag, got $remote_tag_type" >&2
+              exit 1
+            }
+            [[ "$remote_tag_sha" == "$EXPECTED_COMMIT" ]] || {
+              echo "$RELEASE_TAG points to $remote_tag_sha; expected $EXPECTED_COMMIT" >&2
+              exit 1
+            }
+          fi
+
+          release="$(gh release view "$RELEASE_TAG" --json databaseId,isDraft,isPrerelease,targetCommitish,assets 2>/dev/null || true)"
           if [[ -n "$release" ]]; then
-            [[ "$(jq -r '.isDraft' <<<"$release")" == true ]] || {
+            jq -e --arg commit "$EXPECTED_COMMIT" '
+              (.isDraft == true) and
+              (.isPrerelease == false) and
+              (.targetCommitish == $commit)
+            ' <<<"$release" >/dev/null || {
               echo "Published release $RELEASE_TAG already exists; refusing to mutate it" >&2
               exit 1
             }
             gh release upload "$RELEASE_TAG" dist/* --clobber
-            gh release edit "$RELEASE_TAG" --draft=false --title "Token Tach $VERSION"
+            release="$(gh release view "$RELEASE_TAG" --json databaseId,isDraft,isPrerelease,targetCommitish,assets)"
+            dmg="token-tach-$VERSION-universal2.dmg"
+            provenance="token-tach-$VERSION.intoto.jsonl"
+            jq -e --arg commit "$EXPECTED_COMMIT" --arg dmg "$dmg" --arg provenance "$provenance" --arg visibility "${{ github.event.repository.visibility }}" '
+              def expected:
+                if $visibility == "public" then [$dmg, "SHA256SUMS", $provenance]
+                else [$dmg, "SHA256SUMS"] end;
+              (.isDraft == true) and
+              (.isPrerelease == false) and
+              (.targetCommitish == $commit) and
+              ([.assets[] | .name] | sort) == (expected | sort) and
+              all(.assets[]; .size > 0)
+            ' <<<"$release" >/dev/null || {
+              echo "$RELEASE_TAG draft changed during artifact upload" >&2
+              exit 1
+            }
+            remote_tag_ref="$(tag_ref_if_exists)"
+            if [[ -n "$remote_tag_ref" ]]; then
+              IFS=$'\t' read -r remote_tag_type remote_tag_sha <<<"$remote_tag_ref"
+              [[ "$remote_tag_type" == commit && "$remote_tag_sha" == "$EXPECTED_COMMIT" ]] || {
+                echo "$RELEASE_TAG tag changed during artifact upload" >&2
+                exit 1
+              }
+            fi
+            release_id="$(jq -r '.databaseId' <<<"$release")"
+            [[ "$release_id" =~ ^[0-9]+$ ]] || {
+              echo "$RELEASE_TAG draft has no numeric release ID" >&2
+              exit 1
+            }
+            gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
+              -F draft=false \
+              -F prerelease=false \
+              -f "target_commitish=$EXPECTED_COMMIT" >/dev/null
           else
+            [[ -n "$remote_tag_ref" ]] || {
+              echo "$RELEASE_TAG has neither a draft release nor an existing tag" >&2
+              exit 1
+            }
+            remote_tag_ref="$(tag_ref_if_exists)"
+            IFS=$'\t' read -r remote_tag_type remote_tag_sha <<<"$remote_tag_ref"
+            [[ "$remote_tag_type" == commit && "$remote_tag_sha" == "$EXPECTED_COMMIT" ]] || {
+              echo "$RELEASE_TAG changed before publication" >&2
+              exit 1
+            }
             gh release create "$RELEASE_TAG" dist/* \
               --verify-tag --title "Token Tach $VERSION" --generate-notes
           fi
+          remote_tag_ref="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '[.object.type, .object.sha] | @tsv')"
+          IFS=$'\t' read -r remote_tag_type remote_tag_sha <<<"$remote_tag_ref"
+          [[ "$remote_tag_type" == commit && "$remote_tag_sha" == "$EXPECTED_COMMIT" ]] || {
+            echo "$RELEASE_TAG published at $remote_tag_sha; expected $EXPECTED_COMMIT" >&2
+            exit 1
+          }
+          release="$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,targetCommitish,assets)"
+          jq -e --arg dmg "token-tach-$VERSION-universal2.dmg" --arg provenance "token-tach-$VERSION.intoto.jsonl" --arg visibility "${{ github.event.repository.visibility }}" '
+            def expected:
+              if $visibility == "public" then [$dmg, "SHA256SUMS", $provenance]
+              else [$dmg, "SHA256SUMS"] end;
+            (.isDraft == false) and
+            (.isPrerelease == false) and
+            ([.assets[] | .name] | sort) == (expected | sort) and
+            all(.assets[]; .size > 0)
+          ' <<<"$release" >/dev/null || {
+            echo "$RELEASE_TAG publication state or assets are invalid" >&2
+            exit 1
+          }
 
       - name: Update Homebrew tap
         shell: bash

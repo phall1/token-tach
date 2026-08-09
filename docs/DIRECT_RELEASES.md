@@ -1,9 +1,10 @@
 # Direct GitHub Releases
 
-The `Release` workflow publishes an existing `vMAJOR.MINOR.PATCH` tag. It builds
-the tag's exact commit for arm64 and x86_64, creates and verifies a Universal 2
-binary, applies an ad-hoc signature, and publishes the DMG, `SHA256SUMS`, and
-GitHub artifact provenance. Homebrew is the canonical install/update path.
+The `Release` workflow publishes a validated `vMAJOR.MINOR.PATCH` release target.
+It builds the matching merged release PR commit for arm64 and x86_64, creates and
+verifies a Universal 2 binary, applies an ad-hoc signature, and publishes the
+DMG, `SHA256SUMS`, and GitHub artifact provenance. Homebrew is the canonical
+install/update path.
 
 ## Repository configuration
 
@@ -24,9 +25,10 @@ to remove its public-repository guard.
 
 Protect `v*` tags with a repository ruleset, restrict tag creation to release
 maintainers, require the normal CI checks before tag creation, and enable
-immutable releases in repository settings when available. The workflow also
-runs the full `scripts/verify` lane against the tagged commit and refuses to alter
-an existing GitHub Release.
+immutable releases in repository settings when available. Before any repository
+code runs, the workflow validates the draft target or lightweight tag against the
+unique merged release PR and all version mirrors. It runs the full
+`scripts/verify` lane against that commit and never mutates a published Release.
 
 ## Publishing
 
@@ -38,28 +40,31 @@ dispatches CI against the new head so an older green result cannot authorize it.
 
 Merging the release PR atomically updates `version.txt`, `app.zon`,
 `build.zig.zon`, `CHANGELOG.md`, and the Release Please manifest. The
-`Release Please` workflow then creates a draft GitHub Release targeting that
-merge commit (which atomically creates the lightweight `vX.Y.Z` tag) and
+`Release Please` workflow then creates a private draft Release targeting that
+exact merge commit and
 explicitly dispatches the existing `Release` workflow. The explicit dispatch is
 required because GitHub suppresses recursive workflows created with
 `GITHUB_TOKEN`.
 
 The `Release` workflow remains the sole publisher and artifact owner: it verifies
-the exact tagged commit, builds and signs Universal 2, uploads the
-DMG/checksums/provenance, publishes the draft, and updates the Homebrew tap. Do
-not manually edit release versions or create the normal release tag.
+the draft target against the matching merged release PR, builds and signs that
+exact commit, uploads the DMG/checksums/provenance, then publishes the complete
+draft. Publication creates the lightweight `vX.Y.Z` tag at the validated commit;
+no assetless release is public. Do not manually edit release versions or create
+the normal release tag, and do not edit an in-flight draft.
 
 After publication, `Release` dispatches `Release Please` to mark the merged
 release PR as `autorelease: tagged`. Release Please then evaluates whether to
 open or update the next draft version PR; this explicit continuation replaces
 the label transition normally performed while creating a GitHub Release.
 
-For recovery, run the `Release` workflow manually with an existing tag. It never
-builds an arbitrary branch or untagged SHA. If tag creation or dispatch failed,
-rerun `Release Please` on `main`; it derives the tag target directly from the
-matching merged release PR, validates every version mirror at that commit, and
-redispatches the publisher. Duplicate publisher runs cheaply stop before
-allocating a macOS runner once the release exists.
+For recovery, rerun `Release Please` on `main`; it derives the target directly
+from the matching merged release PR, validates every version mirror at that
+commit, and redispatches the publisher. `Release` accepts either that private
+draft target or an existing tag, and independently requires the exact matching
+merged release PR commit. It never builds an arbitrary branch or caller-supplied
+SHA. Duplicate publisher runs cheaply stop before allocating a macOS runner once
+the release exists.
 
 If artifact upload fails while the Release is still a draft, rerun `Release`; it
 clobbers partial draft assets and resumes publication. If a published Release is
