@@ -50,10 +50,10 @@ manually edit release versions or create the normal release tag.
 
 For recovery, run the `Release` workflow manually with an existing tag. It never
 builds an arbitrary branch or untagged SHA. If tag creation or dispatch failed,
-rerun `Release Please` on `main`; it derives the tag target from the first-parent
-commit that introduced the unreleased manifest version, validates every version
-mirror at that commit, and redispatches the publisher. Duplicate publisher runs
-cheaply stop before allocating a macOS runner once the release exists.
+rerun `Release Please` on `main`; it derives the tag target directly from the
+matching merged release PR, validates every version mirror at that commit, and
+redispatches the publisher. Duplicate publisher runs cheaply stop before
+allocating a macOS runner once the release exists.
 
 After publication, the workflow dispatches `phall1/homebrew-tap` with the
 released version and verified DMG checksum when the optional token is present.
