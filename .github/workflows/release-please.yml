@@ -76,40 +76,43 @@ jobs:
           # Release Please uses this stable branch for the release PR. Query its
           # merged PR directly instead of inferring the merge from git history.
           release_pr_title="chore(main): release $version"
-          release_prs="$(gh pr list \
-            --state merged \
-            --base main \
-            --head release-please--branches--main--components--token-tach \
-            --limit 100 \
-            --json number,title,mergeCommit)"
-          matches="$(jq --arg title "$release_pr_title" '[.[] | select(.title == $title)]' <<<"$release_prs")"
+          owner="${GH_REPO%%/*}"
+          release_prs="$(gh api --paginate --slurp \
+            "repos/$GH_REPO/pulls?state=closed&base=main&head=$owner:release-please--branches--main--components--token-tach&per_page=100")"
+          matches="$(jq --arg title "$release_pr_title" '[.[][] | select(.merged_at != null and .title == $title)]' <<<"$release_prs")"
           [[ "$(jq 'length' <<<"$matches")" == 1 ]] || fail "Expected one merged release PR titled '$release_pr_title'"
           release_pr="$(jq -r '.[0].number' <<<"$matches")"
-          release_sha="$(jq -r '.[0].mergeCommit.oid' <<<"$matches")"
+          release_sha="$(jq -r '.[0].merge_commit_sha' <<<"$matches")"
           [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]] || fail "Release PR #$release_pr has no merge commit"
           git merge-base --is-ancestor "$release_sha" origin/main || fail "Release commit $release_sha is not on main"
 
           # With skip-github-release, this workflow owns Release Please's label
           # transition too. Once artifacts are published, mark the merged PR as
           # tagged and rerun Release Please so it can open the next version PR.
-          release="$(gh release view "$tag" --json isDraft,assets 2>/dev/null || true)"
+          release="$(gh release view "$tag" --json isDraft,isPrerelease,targetCommitish,assets 2>/dev/null || true)"
           if [[ -n "$release" ]]; then
-            tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null)" || tag_sha=""
-            [[ "$tag_sha" == "$release_sha" ]] || fail "$tag points to $tag_sha, expected $release_sha"
             if [[ "$(jq -r '.isDraft' <<<"$release")" == true ]]; then
+              target="$(jq -r '.targetCommitish' <<<"$release")"
+              [[ "$target" == "$release_sha" ]] || fail "$tag draft targets $target, expected $release_sha"
               echo "$tag has a draft release at the expected commit; retrying artifact publication."
               gh workflow run release.yml --ref main -f tag="$tag"
               exit 0
             fi
+            tag_ref="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '[.object.type, .object.sha] | @tsv' 2>/dev/null)" || tag_ref=""
+            IFS=$'\t' read -r tag_type tag_sha <<<"$tag_ref"
+            [[ "$tag_type" == commit ]] || fail "$tag must be a lightweight tag, got $tag_type"
+            [[ "$tag_sha" == "$release_sha" ]] || fail "$tag points to $tag_sha, expected $release_sha"
 
             dmg="token-tach-$version-universal2.dmg"
             provenance="token-tach-$version.intoto.jsonl"
             jq -e --arg dmg "$dmg" --arg provenance "$provenance" --arg visibility "$REPO_VISIBILITY" '
+              def expected:
+                if $visibility == "public" then [$dmg, "SHA256SUMS", $provenance]
+                else [$dmg, "SHA256SUMS"] end;
               (.isDraft == false) and
-              ([.assets[] | select(.name == $dmg and .size > 0)] | length == 1) and
-              ([.assets[] | select(.name == "SHA256SUMS" and .size > 0)] | length == 1) and
-              ($visibility != "public" or
-                ([.assets[] | select(.name == $provenance and .size > 0)] | length == 1))
+              (.isPrerelease == false) and
+              ([.assets[] | .name] | sort) == (expected | sort) and
+              all(.assets[]; .size > 0)
             ' <<<"$release" >/dev/null || fail "$tag exists but its immutable release assets are incomplete"
 
             labels="$(gh pr view "$release_pr" --json labels)"
@@ -146,16 +149,13 @@ jobs:
           [[ "$app_at_release" == "$version" ]] || fail "Release app.zon version $app_at_release does not match $version"
           [[ "$build_at_release" == "$version" ]] || fail "Release build.zig.zon version $build_at_release does not match $version"
 
-          # The Git ref API rejects this repository's GITHUB_TOKEN. Creating a
-          # draft Release is the supported atomic tag bootstrap; release.yml
-          # remains the sole publisher and artifact owner.
+          # Keep the release private and mutable while release.yml builds the
+          # validated target. Publishing the complete draft creates the tag.
           gh release create "$tag" \
             --target "$release_sha" \
             --draft \
             --title "Token Tach $version" \
             --generate-notes
-          tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha')"
-          [[ "$tag_sha" == "$release_sha" ]] || fail "$tag was created at $tag_sha, expected $release_sha"
           echo "Created draft $tag at release PR #$release_pr merge $release_sha."
 
           # GITHUB_TOKEN release creation does not recursively start workflows.
