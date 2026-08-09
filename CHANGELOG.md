@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.4](https://github.com/phall1/token-tach/compare/v0.9.3...v0.9.4) (2026-08-09)
+
+
+### Bug Fixes
+
+* **release:** discover private drafts ([#15](https://github.com/phall1/token-tach/issues/15)) ([4ef5b75](https://github.com/phall1/token-tach/commit/4ef5b756c76716b6a967620ad9ab324831b4b7cf))
+
 ## [0.9.3](https://github.com/phall1/token-tach/compare/v0.9.2...v0.9.3) (2026-08-09)
 
 
