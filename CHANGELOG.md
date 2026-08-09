@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.3](https://github.com/phall1/token-tach/compare/v0.9.2...v0.9.3) (2026-08-09)
+
+
+### Bug Fixes
+
+* **release:** publish validated draft targets ([#13](https://github.com/phall1/token-tach/issues/13)) ([c5729ce](https://github.com/phall1/token-tach/commit/c5729ce0ad442a90e046f8aa177bb1e12382b942))
+
 ## [0.9.2](https://github.com/phall1/token-tach/compare/v0.9.1...v0.9.2) (2026-08-09)
 
 
