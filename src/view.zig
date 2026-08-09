@@ -898,7 +898,7 @@ fn burnTrace(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model) void 
         .frame = rect(24, 318, 120, 12),
         .size = .sm,
         .style = .{ .foreground = theme.text_faint },
-    }, "BURN · 20 MIN"));
+    }, ui.fmt("BURN · {d} MIN", .{@divTrunc(predict.ScopeTrace.span_ms, 60_000)})));
     push(ui, nodes, ui.text(.{
         .frame = rect(146, 318, 130, 12),
         .size = .sm,
@@ -1718,10 +1718,23 @@ fn fleetRow(ui: *Ui, nodes: *std.ArrayList(Ui.Node), row: FleetRow, index: usize
 
 // ------------------------------------------------------------ scope page
 
-/// Samples on the scope page's shared x axis: 10 s apart, 20 minutes
-/// wide — the span the fleet burn trace covers, so both lanes are the
-/// same window and one pointer position means one moment.
-const scope_points: usize = 120;
+/// Samples on the scope page's shared x axis — the span the fleet burn
+/// trace covers, so both lanes are the same window and one pointer
+/// position means one moment.
+///
+/// Read off `ScopeTrace` rather than typed. `needleTrace` fills a
+/// `bucket_count` buffer and plots it `scope_points` wide and hands both
+/// lengths to `ringOffset`; as two independent literals they were one
+/// constant edit away from disagreeing, and the failure is a silently
+/// misaligned trace rather than a compile error.
+const scope_points: usize = predict.ScopeTrace.bucket_count;
+
+comptime {
+    // `cpuBand` fans every cell out to two source samples, so the system
+    // ring has to run at exactly half the trace's cadence. Stated here
+    // because the arithmetic at that call site assumes it in silence.
+    std.debug.assert(engine.SystemHistory.period_ms * 2 == predict.ScopeTrace.period_ms);
+}
 
 /// The machine and the needle on ONE time axis.
 ///
@@ -1737,7 +1750,7 @@ fn scopePage(ui: *Ui, nodes: *std.ArrayList(Ui.Node), model: *const Model, frame
         .frame = rect(bars_x, frame.y + 32, 160, 13),
         .size = .sm,
         .style = .{ .foreground = theme.text_faint },
-    }, "MACHINE · 20 MIN"));
+    }, ui.fmt("MACHINE · {d} MIN", .{@divTrunc(predict.ScopeTrace.span_ms, 60_000)})));
     // A CPU lane with no samples behind it would draw a confident flat
     // line along zero, which is a claim about the machine and not the
     // truth ("nothing recorded yet"). No samples, no lane.

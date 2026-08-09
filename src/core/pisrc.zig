@@ -27,7 +27,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const tailsource = @import("tailsource.zig");
-const claude = @import("claude.zig"); // parseTimestamp: same ISO8601 shape
+const timeutil = @import("timeutil.zig"); // parseTimestamp: same ISO8601 shape
 const Allocator = std.mem.Allocator;
 
 /// Cheap pre-checks: the only two line shapes worth JSON-parsing.
@@ -136,7 +136,7 @@ fn parseLine(event_allocator: Allocator, line: []const u8, ctx: tailsource.FileC
     const model = getString(message, "model") orelse return null;
     const usage = getValue(message, "usage") orelse return null;
     const ts_str = getString(root, "timestamp") orelse return null;
-    const ts_ms = claude.parseTimestamp(ts_str) orelse return null;
+    const ts_ms = timeutil.parseTimestamp(ts_str) orelse return null;
 
     const model_owned = event_allocator.dupe(u8, model) catch return null;
     // Global dedup identity: forked sessions re-log the same message with
@@ -170,23 +170,10 @@ fn parseLine(event_allocator: Allocator, line: []const u8, ctx: tailsource.FileC
 // JSON helpers (all null-tolerant)
 // ---------------------------------------------------------------------------
 
-fn getValue(v: std.json.Value, key: []const u8) ?std.json.Value {
-    if (v != .object) return null;
-    return v.object.get(key);
-}
-
-fn getString(v: std.json.Value, key: []const u8) ?[]const u8 {
-    const child = getValue(v, key) orelse return null;
-    if (child != .string) return null;
-    return child.string;
-}
-
-fn getU64(v: std.json.Value, key: []const u8) u64 {
-    const child = getValue(v, key) orelse return 0;
-    if (child != .integer) return 0;
-    if (child.integer < 0) return 0;
-    return @intCast(child.integer);
-}
+const jsonget = @import("jsonget.zig");
+const getValue = jsonget.getValue;
+const getString = jsonget.getString;
+const getU64 = jsonget.getU64;
 
 // ---------------------------------------------------------------------------
 // Tests

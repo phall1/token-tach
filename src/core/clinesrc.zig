@@ -286,19 +286,9 @@ fn tok(v: i64) u64 {
     return if (v < 0) 0 else @intCast(v);
 }
 
-fn getString(v: std.json.Value, key: []const u8) ?[]const u8 {
-    if (v != .object) return null;
-    const child = v.object.get(key) orelse return null;
-    if (child != .string) return null;
-    return child.string;
-}
-
-fn getI64(v: std.json.Value, key: []const u8) ?i64 {
-    if (v != .object) return null;
-    const child = v.object.get(key) orelse return null;
-    if (child != .integer) return null;
-    return child.integer;
-}
+const jsonget = @import("jsonget.zig");
+const getString = jsonget.getString;
+const getI64 = jsonget.getI64;
 
 // ---------------------------------------------------------------------------
 // Tests

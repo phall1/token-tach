@@ -19,6 +19,9 @@ test {
     _ = @import("core/config.zig");
     _ = @import("core/cfcache.zig");
     _ = @import("core/dbgate.zig");
+    _ = @import("core/sqlite.zig");
+    _ = @import("core/jsonget.zig");
+    _ = @import("core/timeutil.zig");
     _ = @import("core/claude.zig");
     _ = @import("core/codex.zig");
     _ = @import("core/opencode.zig");
