@@ -302,6 +302,20 @@ jobs:
             fi
             rm -f "$output" "$error"
           }
+          wait_for_tag_ref() {
+            local ref
+            for _ in {1..10}; do
+              if ! ref="$(tag_ref_if_exists)"; then
+                return 1
+              fi
+              if [[ -n "$ref" ]]; then
+                printf '%s\n' "$ref"
+                return 0
+              fi
+              sleep 2
+            done
+            return 1
+          }
 
           validate_remote_provenance() {
             local owner release_pr_title release_prs matches release_commit comparison
@@ -414,22 +428,33 @@ jobs:
             gh release create "$RELEASE_TAG" dist/* \
               --verify-tag --title "Token Tach $VERSION" --generate-notes
           fi
-          remote_tag_ref="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '[.object.type, .object.sha] | @tsv')"
+          remote_tag_ref="$(wait_for_tag_ref)" || {
+            echo "$RELEASE_TAG was not visible after publication" >&2
+            exit 1
+          }
           IFS=$'\t' read -r remote_tag_type remote_tag_sha <<<"$remote_tag_ref"
           [[ "$remote_tag_type" == commit && "$remote_tag_sha" == "$EXPECTED_COMMIT" ]] || {
             echo "$RELEASE_TAG published at $remote_tag_sha; expected $EXPECTED_COMMIT" >&2
             exit 1
           }
-          release="$(release_by_tag)"
-          jq -e --arg dmg "token-tach-$VERSION-universal2.dmg" --arg provenance "token-tach-$VERSION.intoto.jsonl" --arg visibility "${{ github.event.repository.visibility }}" '
-            def expected:
-              if $visibility == "public" then [$dmg, "SHA256SUMS", $provenance]
-              else [$dmg, "SHA256SUMS"] end;
-            (.isDraft == false) and
-            (.isPrerelease == false) and
-            ([.assets[] | .name] | sort) == (expected | sort) and
-            all(.assets[]; .size > 0)
-          ' <<<"$release" >/dev/null || {
+          published=false
+          for _ in {1..10}; do
+            release="$(release_by_tag)"
+            if jq -e --arg dmg "token-tach-$VERSION-universal2.dmg" --arg provenance "token-tach-$VERSION.intoto.jsonl" --arg visibility "${{ github.event.repository.visibility }}" '
+              def expected:
+                if $visibility == "public" then [$dmg, "SHA256SUMS", $provenance]
+                else [$dmg, "SHA256SUMS"] end;
+              (.isDraft == false) and
+              (.isPrerelease == false) and
+              ([.assets[] | .name] | sort) == (expected | sort) and
+              all(.assets[]; .size > 0)
+            ' <<<"$release" >/dev/null; then
+              published=true
+              break
+            fi
+            sleep 2
+          done
+          [[ "$published" == true ]] || {
             echo "$RELEASE_TAG publication state or assets are invalid" >&2
             exit 1
           }
