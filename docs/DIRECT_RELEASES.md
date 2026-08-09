@@ -38,15 +38,16 @@ dispatches CI against the new head so an older green result cannot authorize it.
 
 Merging the release PR atomically updates `version.txt`, `app.zon`,
 `build.zig.zon`, `CHANGELOG.md`, and the Release Please manifest. The
-`Release Please` workflow then creates the matching lightweight `vX.Y.Z` tag
-and explicitly dispatches the existing `Release` workflow. The explicit
-dispatch is required because GitHub suppresses recursive tag workflows created
-with `GITHUB_TOKEN`.
+`Release Please` workflow then creates a draft GitHub Release targeting that
+merge commit (which atomically creates the lightweight `vX.Y.Z` tag) and
+explicitly dispatches the existing `Release` workflow. The explicit dispatch is
+required because GitHub suppresses recursive workflows created with
+`GITHUB_TOKEN`.
 
-The `Release` workflow remains the sole owner of the GitHub Release and its
-artifacts: it verifies the exact tagged commit, builds and signs Universal 2,
-publishes the DMG/checksums/provenance, and updates the Homebrew tap. Do not
-manually edit release versions or create the normal release tag.
+The `Release` workflow remains the sole publisher and artifact owner: it verifies
+the exact tagged commit, builds and signs Universal 2, uploads the
+DMG/checksums/provenance, publishes the draft, and updates the Homebrew tap. Do
+not manually edit release versions or create the normal release tag.
 
 After publication, `Release` dispatches `Release Please` to mark the merged
 release PR as `autorelease: tagged`. Release Please then evaluates whether to
@@ -60,10 +61,12 @@ matching merged release PR, validates every version mirror at that commit, and
 redispatches the publisher. Duplicate publisher runs cheaply stop before
 allocating a macOS runner once the release exists.
 
-If publication failed after creating only part of a GitHub Release, preflight
-fails with the exact cleanup command. Delete only that incomplete Release with
-`gh release delete vX.Y.Z --yes` (the existing tag is preserved), then rerun the
-`Release` workflow for the same tag. Complete releases are never mutated.
+If artifact upload fails while the Release is still a draft, rerun `Release`; it
+clobbers partial draft assets and resumes publication. If a published Release is
+somehow incomplete, preflight fails with the exact cleanup command. Delete only
+that incomplete Release with `gh release delete vX.Y.Z --yes` (the existing tag
+is preserved), then rerun `Release` for the same tag. Complete releases are never
+mutated.
 
 After publication, the workflow dispatches `phall1/homebrew-tap` with the
 released version and verified DMG checksum when the optional token is present.

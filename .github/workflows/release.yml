@@ -39,6 +39,11 @@ jobs:
           set -euo pipefail
           release="$(gh release view "$RELEASE_TAG" --json isDraft,assets 2>/dev/null || true)"
           if [[ -n "$release" ]]; then
+            if [[ "$(jq -r '.isDraft' <<<"$release")" == true ]]; then
+              echo "should_publish=true" >> "$GITHUB_OUTPUT"
+              echo "$RELEASE_TAG is a draft; resuming artifact publication."
+              exit 0
+            fi
             version="${RELEASE_TAG#v}"
             dmg="token-tach-$version-universal2.dmg"
             provenance="token-tach-$version.intoto.jsonl"
@@ -195,15 +200,28 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_COMMIT: ${{ needs.verify.outputs.commit }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Release $RELEASE_TAG already exists; refusing to mutate it" >&2
+          remote_tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          [[ "$remote_tag_sha" == "$EXPECTED_COMMIT" ]] || {
+            echo "$RELEASE_TAG moved to $remote_tag_sha during the build; expected $EXPECTED_COMMIT" >&2
             exit 1
+          }
+          release="$(gh release view "$RELEASE_TAG" --json isDraft 2>/dev/null || true)"
+          if [[ -n "$release" ]]; then
+            [[ "$(jq -r '.isDraft' <<<"$release")" == true ]] || {
+              echo "Published release $RELEASE_TAG already exists; refusing to mutate it" >&2
+              exit 1
+            }
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            gh release edit "$RELEASE_TAG" --draft=false --title "Token Tach $VERSION"
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --verify-tag --title "Token Tach $VERSION" --generate-notes
           fi
-          gh release create "$RELEASE_TAG" dist/* \
-            --verify-tag --title "Token Tach $VERSION" --generate-notes
 
       - name: Update Homebrew tap
         shell: bash
