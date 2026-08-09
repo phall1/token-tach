@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.5](https://github.com/phall1/token-tach/compare/v0.9.4...v0.9.5) (2026-08-09)
+
+
+### Bug Fixes
+
+* **release:** await published tag visibility ([#17](https://github.com/phall1/token-tach/issues/17)) ([a8ffdf5](https://github.com/phall1/token-tach/commit/a8ffdf5d87677a46718f4f753a8aec46160674b2))
+
 ## [0.9.4](https://github.com/phall1/token-tach/compare/v0.9.3...v0.9.4) (2026-08-09)
 
 
