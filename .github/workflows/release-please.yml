@@ -103,7 +103,7 @@ jobs:
               ($visibility != "public" or
                 ([.assets[] | select(.name == $provenance and .size > 0)] | length == 1))
             ' <<<"$release" >/dev/null || fail "$tag exists but its immutable release assets are incomplete"
-            tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null || true)"
+            tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null)" || tag_sha=""
             [[ "$tag_sha" == "$release_sha" ]] || fail "$tag points to $tag_sha, expected $release_sha"
 
             labels="$(gh pr view "$release_pr" --json labels)"
@@ -142,7 +142,7 @@ jobs:
 
           # This workflow owns the lightweight tag; release.yml remains the sole
           # owner of the GitHub Release and immutable artifacts.
-          tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null || true)"
+          tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null)" || tag_sha=""
           if [[ -z "$tag_sha" ]]; then
             gh api --method POST "repos/$GH_REPO/git/refs" \
               -f ref="refs/tags/$tag" \
