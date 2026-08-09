@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.9.1](https://github.com/phall1/token-tach/compare/v0.9.0...v0.9.1) (2026-08-09)
+
+
+### Bug Fixes
+
+* harden release automation and OAuth ([#7](https://github.com/phall1/token-tach/issues/7)) ([da08c8a](https://github.com/phall1/token-tach/commit/da08c8a75af24036cbb9afe852d78c29898a775f))
+* **release:** continue after artifact publication ([#8](https://github.com/phall1/token-tach/issues/8)) ([80d45c6](https://github.com/phall1/token-tach/commit/80d45c642db241648dd05dbbfbe56a3ac0fd5f77))
+* **release:** stop the tag walk deadlocking on SIGPIPE ([#6](https://github.com/phall1/token-tach/issues/6)) ([de71543](https://github.com/phall1/token-tach/commit/de715435d9f5337c6b17a5a5541ee6d7679224f8))
+
 ## [0.9.0](https://github.com/phall1/token-tach/compare/v0.8.0...v0.9.0) (2026-08-04)
 
 
