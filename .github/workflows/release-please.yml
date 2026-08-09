@@ -94,6 +94,14 @@ jobs:
           # tagged and rerun Release Please so it can open the next version PR.
           release="$(gh release view "$tag" --json isDraft,assets 2>/dev/null || true)"
           if [[ -n "$release" ]]; then
+            tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null)" || tag_sha=""
+            [[ "$tag_sha" == "$release_sha" ]] || fail "$tag points to $tag_sha, expected $release_sha"
+            if [[ "$(jq -r '.isDraft' <<<"$release")" == true ]]; then
+              echo "$tag has a draft release at the expected commit; retrying artifact publication."
+              gh workflow run release.yml --ref main -f tag="$tag"
+              exit 0
+            fi
+
             dmg="token-tach-$version-universal2.dmg"
             provenance="token-tach-$version.intoto.jsonl"
             jq -e --arg dmg "$dmg" --arg provenance "$provenance" --arg visibility "$REPO_VISIBILITY" '
@@ -103,8 +111,6 @@ jobs:
               ($visibility != "public" or
                 ([.assets[] | select(.name == $provenance and .size > 0)] | length == 1))
             ' <<<"$release" >/dev/null || fail "$tag exists but its immutable release assets are incomplete"
-            tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null)" || tag_sha=""
-            [[ "$tag_sha" == "$release_sha" ]] || fail "$tag points to $tag_sha, expected $release_sha"
 
             labels="$(gh pr view "$release_pr" --json labels)"
             pending="$(jq 'any(.labels[]; .name == "autorelease: pending")' <<<"$labels")"
@@ -140,18 +146,17 @@ jobs:
           [[ "$app_at_release" == "$version" ]] || fail "Release app.zon version $app_at_release does not match $version"
           [[ "$build_at_release" == "$version" ]] || fail "Release build.zig.zon version $build_at_release does not match $version"
 
-          # This workflow owns the lightweight tag; release.yml remains the sole
-          # owner of the GitHub Release and immutable artifacts.
-          tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null)" || tag_sha=""
-          if [[ -z "$tag_sha" ]]; then
-            gh api --method POST "repos/$GH_REPO/git/refs" \
-              -f ref="refs/tags/$tag" \
-              -f sha="$release_sha" >/dev/null
-            echo "Created $tag at release PR #$release_pr merge $release_sha."
-          else
-            [[ "$tag_sha" == "$release_sha" ]] || fail "$tag points to $tag_sha, expected $release_sha"
-            echo "$tag already exists at the release commit; retrying dispatch."
-          fi
+          # The Git ref API rejects this repository's GITHUB_TOKEN. Creating a
+          # draft Release is the supported atomic tag bootstrap; release.yml
+          # remains the sole publisher and artifact owner.
+          gh release create "$tag" \
+            --target "$release_sha" \
+            --draft \
+            --title "Token Tach $version" \
+            --generate-notes
+          tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$tag" --jq '.object.sha')"
+          [[ "$tag_sha" == "$release_sha" ]] || fail "$tag was created at $tag_sha, expected $release_sha"
+          echo "Created draft $tag at release PR #$release_pr merge $release_sha."
 
-          # GITHUB_TOKEN tag creation does not recursively start workflows.
+          # GITHUB_TOKEN release creation does not recursively start workflows.
           gh workflow run release.yml --ref main -f tag="$tag"
