@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.2](https://github.com/phall1/token-tach/compare/v0.9.1...v0.9.2) (2026-08-09)
+
+
+### Bug Fixes
+
+* **release:** bootstrap tags through drafts ([#11](https://github.com/phall1/token-tach/issues/11)) ([cfc79ca](https://github.com/phall1/token-tach/commit/cfc79ca6ccf6bd2b3070214452d733ab06d7b492))
+* **release:** handle missing tag refs ([#10](https://github.com/phall1/token-tach/issues/10)) ([db6f96d](https://github.com/phall1/token-tach/commit/db6f96db8fddd4c3e96ef6883f3af6d03e76d534))
+
 ## [0.9.1](https://github.com/phall1/token-tach/compare/v0.9.0...v0.9.1) (2026-08-09)
 
 
