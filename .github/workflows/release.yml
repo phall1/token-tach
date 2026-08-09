@@ -26,6 +26,9 @@ jobs:
   preflight:
     name: Check release state
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
     outputs:
       should_publish: ${{ steps.release.outputs.should_publish }}
       commit: ${{ steps.release.outputs.commit }}
@@ -43,6 +46,22 @@ jobs:
             echo "$1" >&2
             exit 1
           }
+          release_by_tag() {
+            gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" | jq -r --arg tag "$RELEASE_TAG" '
+              [.[][] | select(.tag_name == $tag)] |
+              if length == 0 then ""
+              elif length == 1 then
+                (.[0] | {
+                  databaseId: .id,
+                  isDraft: .draft,
+                  isPrerelease: .prerelease,
+                  targetCommitish: .target_commitish,
+                  assets: [.assets[] | {name, size}]
+                } | tojson)
+              else error("multiple releases use tag " + $tag)
+              end
+            '
+          }
 
           [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail "Release tag must be canonical vMAJOR.MINOR.PATCH"
           version="${RELEASE_TAG#v}"
@@ -55,7 +74,7 @@ jobs:
           release_commit="$(jq -r '.[0].merge_commit_sha' <<<"$matches")"
           [[ "$release_commit" =~ ^[0-9a-f]{40}$ ]] || fail "Release PR has no merge commit"
 
-          release="$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,targetCommitish,assets 2>/dev/null || true)"
+          release="$(release_by_tag)"
           if [[ -n "$release" ]]; then
             if [[ "$(jq -r '.isDraft' <<<"$release")" == true ]]; then
               [[ "$(jq -r '.isPrerelease' <<<"$release")" == false ]] || fail "$RELEASE_TAG cannot be both draft and prerelease"
@@ -306,6 +325,22 @@ jobs:
               return 1
             }
           }
+          release_by_tag() {
+            gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" | jq -r --arg tag "$RELEASE_TAG" '
+              [.[][] | select(.tag_name == $tag)] |
+              if length == 0 then ""
+              elif length == 1 then
+                (.[0] | {
+                  databaseId: .id,
+                  isDraft: .draft,
+                  isPrerelease: .prerelease,
+                  targetCommitish: .target_commitish,
+                  assets: [.assets[] | {name, size}]
+                } | tojson)
+              else error("multiple releases use tag " + $tag)
+              end
+            '
+          }
 
           validate_remote_provenance
           remote_tag_ref="$(tag_ref_if_exists)"
@@ -321,7 +356,7 @@ jobs:
             }
           fi
 
-          release="$(gh release view "$RELEASE_TAG" --json databaseId,isDraft,isPrerelease,targetCommitish,assets 2>/dev/null || true)"
+          release="$(release_by_tag)"
           if [[ -n "$release" ]]; then
             jq -e --arg commit "$EXPECTED_COMMIT" '
               (.isDraft == true) and
@@ -332,7 +367,7 @@ jobs:
               exit 1
             }
             gh release upload "$RELEASE_TAG" dist/* --clobber
-            release="$(gh release view "$RELEASE_TAG" --json databaseId,isDraft,isPrerelease,targetCommitish,assets)"
+            release="$(release_by_tag)"
             dmg="token-tach-$VERSION-universal2.dmg"
             provenance="token-tach-$VERSION.intoto.jsonl"
             jq -e --arg commit "$EXPECTED_COMMIT" --arg dmg "$dmg" --arg provenance "$provenance" --arg visibility "${{ github.event.repository.visibility }}" '
@@ -385,7 +420,7 @@ jobs:
             echo "$RELEASE_TAG published at $remote_tag_sha; expected $EXPECTED_COMMIT" >&2
             exit 1
           }
-          release="$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,targetCommitish,assets)"
+          release="$(release_by_tag)"
           jq -e --arg dmg "token-tach-$VERSION-universal2.dmg" --arg provenance "token-tach-$VERSION.intoto.jsonl" --arg visibility "${{ github.event.repository.visibility }}" '
             def expected:
               if $visibility == "public" then [$dmg, "SHA256SUMS", $provenance]
