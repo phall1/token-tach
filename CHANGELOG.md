@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.6](https://github.com/phall1/token-tach/compare/v0.9.5...v0.9.6) (2026-08-09)
+
+
+### Bug Fixes
+
+* **projects:** roll worktrees up to their repository, and collapse triplicated helpers ([#19](https://github.com/phall1/token-tach/issues/19)) ([835c73e](https://github.com/phall1/token-tach/commit/835c73e6092514055bb0e0352d7b80012525c188))
+
 ## [0.9.5](https://github.com/phall1/token-tach/compare/v0.9.4...v0.9.5) (2026-08-09)
 
 
