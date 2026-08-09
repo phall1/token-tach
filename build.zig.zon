@@ -2,7 +2,7 @@
     .name = .token_tach,
     .fingerprint = 0xe3b1adac5a707070,
     // x-release-please-start-version
-    .version = "0.9.0",
+    .version = "0.9.1",
     // x-release-please-end
     .minimum_zig_version = "0.16.0",
     .dependencies = .{ .native_sdk = .{ .path = "vendor/native" } },

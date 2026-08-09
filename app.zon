@@ -4,7 +4,7 @@
     .display_name = "Token Tach",
     .description = "Menu-bar tachometer for AI coding-agent token usage and limits.",
     // x-release-please-start-version
-    .version = "0.9.0",
+    .version = "0.9.1",
     // x-release-please-end
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},
