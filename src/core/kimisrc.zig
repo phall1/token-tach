@@ -153,23 +153,10 @@ fn parseLine(event_allocator: Allocator, line: []const u8, ctx: tailsource.FileC
 // JSON helpers (all null-tolerant)
 // ---------------------------------------------------------------------------
 
-fn getValue(v: std.json.Value, key: []const u8) ?std.json.Value {
-    if (v != .object) return null;
-    return v.object.get(key);
-}
-
-fn getString(v: std.json.Value, key: []const u8) ?[]const u8 {
-    const child = getValue(v, key) orelse return null;
-    if (child != .string) return null;
-    return child.string;
-}
-
-fn getU64(v: std.json.Value, key: []const u8) u64 {
-    const child = getValue(v, key) orelse return 0;
-    if (child != .integer) return 0;
-    if (child.integer < 0) return 0;
-    return @intCast(child.integer);
-}
+const jsonget = @import("jsonget.zig");
+const getValue = jsonget.getValue;
+const getString = jsonget.getString;
+const getU64 = jsonget.getU64;
 
 /// Kimi timestamps are unix float seconds; tolerate whole-second values
 /// the JSON parser surfaces as integers.

@@ -164,6 +164,14 @@ hard stop with an explanatory note, not a filter that matches nothing:
 an empty filter would answer a question nobody asked with a full table of
 everything.
 
+A `--project` is a **repository root**, not the directory an agent happened
+to sit in: worktrees and subdirectories are attributed to the repository
+that contains them, so `--project ~/workspace/token-tach` covers every
+worktree of it. Records written before v0.9.6 kept the raw working
+directory, so a store with history from both eras lists a repo's older
+worktree spend under the worktree's own path — ids are never reassigned, so
+that history is reported as-is rather than rewritten.
+
 ### `export` — the archival seam
 
 `export` has one fixed CSV schema. `--group` is ignored so the file cannot

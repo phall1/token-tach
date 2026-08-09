@@ -881,6 +881,20 @@ fn shareBar(ui: *Ui, share: f64, ink: Color) Ui.Node {
 /// Live sessions — the roster's flagship signal. `mid_turn` (transcript
 /// grew, no event parsed yet) is the only place in the app that can say
 /// an agent is thinking AT THIS INSTANT, so it gets the lit pip.
+/// A session's project, or the agent's name when it has none.
+///
+/// Six of the eleven collectors cannot report a working directory at all —
+/// gemini and kimi hash it away (a `projectHash`, an md5 of the path),
+/// goose and kilo do not select it, cline and roo never populate the field
+/// they have — so `project()` is legitimately empty for them. The sessions
+/// pane rendered that as a nameless row with a bare status pip beside it.
+/// `view.zig`'s fleet rows already fall back this way; this pane was the
+/// one that did not.
+fn projectLabel(session: *const sessions_mod.Session) []const u8 {
+    const project = session.project();
+    return if (project.len > 0) project else session.agent.label();
+}
+
 fn sessionRows(ui: *Ui, model: *const Model) []const Ui.Node {
     var buffer: [sessions_mod.max_sessions]*const sessions_mod.Session = undefined;
     const live = if (model.ux.filter_agent) |agent|
@@ -913,13 +927,13 @@ fn sessionRows(ui: *Ui, model: *const Model) []const Ui.Node {
             },
             .on_press = .{ .row_press = @intCast(i) },
             .semantics = .{
-                .label = ui.fmt("{s} {s} {s}", .{ session.agent.label(), session.project(), @tagName(activity) }),
+                .label = ui.fmt("{s} {s} {s}", .{ session.agent.label(), projectLabel(session), @tagName(activity) }),
                 .focusable = true,
             },
         }, .{
             ui.row(.{ .gap = 6, .cross = .center }, .{
                 ui.panel(.{ .width = 6, .height = 6, .style = .{ .background = pip, .radius = 3 } }, .{}),
-                ui.text(.{ .grow = 1, .style_tokens = .{ .foreground = .text } }, session.project()),
+                ui.text(.{ .grow = 1, .style_tokens = .{ .foreground = .text } }, projectLabel(session)),
                 ui.text(.{
                     .size = .sm,
                     .width = 74,

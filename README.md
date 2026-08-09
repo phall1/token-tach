@@ -85,9 +85,20 @@ token-tach export --format csv --since 90d > usage.csv
 token-tach doctor --history
 ```
 
-Names are matched exactly, and a project is its full working directory —
+Names are matched exactly, and a project is its **repository root** —
 asking for one the store has never seen is a hard stop with an
 explanatory note, not a filter that quietly matches nothing.
+
+A git worktree is a different directory and the same project, so
+`token-tach/.claude/worktrees/toasty-floating-marshmallow` is attributed
+to `token-tach`, not to a project named after the worktree; so is a session
+started in a subdirectory like `token-tach/src/core`. The root comes from
+git itself (an upward walk for `.git`, so a worktree parked at an unrelated
+sibling path still resolves), falling back to a path rule for directories
+that no longer exist. Rows written before v0.9.6 keep their per-worktree
+names: the dictionary is append-only and ids are never reassigned, so older
+worktree spend appears under its own name rather than being rewritten. The
+live panels re-key themselves on first launch and need no such caveat.
 
 Records are **additive** — multiple records sharing a key sum — which is
 what makes a late-arriving transcript, a six-month backfill, and a crash

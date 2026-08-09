@@ -973,7 +973,13 @@ pub const Writer = struct {
         if (opts.synthetic) flags |= flag_synthetic;
 
         const model_id = try self.dict.intern(self.io, dict_kind_model, ev.model);
-        const project_id = try self.dict.intern(self.io, dict_kind_project, ev.cwd);
+        // The repository root, not the raw cwd: `--group project` and
+        // `--project` are meant to answer "what did this repo cost", and a
+        // worktree is the same repo. Rows written before this existed keep
+        // their per-worktree ids — the dictionary is append-only and ids
+        // are never reassigned (see the invariant above), so history from
+        // before the change stays split and is not rewritten.
+        const project_id = try self.dict.intern(self.io, dict_kind_project, ev.projectKey());
         const session_id = try self.dict.intern(self.io, dict_kind_session, ev.session_id);
 
         const rec = Record{

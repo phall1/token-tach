@@ -24,6 +24,7 @@ const ledger_mod = @import("core/ledger.zig");
 const statefile = @import("core/statefile.zig");
 const predict = @import("core/predict.zig");
 const sessions = @import("core/sessions.zig");
+const project_mod = @import("core/project.zig");
 const history_mod = @import("core/history.zig");
 const ring = @import("core/ring.zig");
 const alerts = @import("core/alerts.zig");
@@ -336,6 +337,15 @@ pub const Model = struct {
     /// `history`'s session dimension is the durable record; the three are
     /// separate on purpose.)
     roster: sessions.Roster = .{},
+
+    /// cwd -> repository root, memoized. Not journaled: it caches a
+    /// filesystem fact, and the answers it produces are copied into the
+    /// roster, the ledger and the history store at ingest, so a replay
+    /// reads what was recorded rather than re-deriving it on a machine
+    /// where the worktree has since been deleted.
+    /// Defaults to the allocator-free string-rule resolver, so a Model
+    /// built without `setup` still attributes projects deterministically.
+    projects: project_mod.Resolver = .{},
 
     /// Durable analytical time series — the FOREVER tier. Null when the
     /// store could not be opened (another instance holds the lock, or the
@@ -665,6 +675,9 @@ fn historyIo() std.Io {
 pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
     model.allocator = allocator;
     const home = env.home;
+    // Before anything can ingest: the statefile restore below resolves the
+    // project keys it reads through this.
+    model.projects = project_mod.Resolver.init(allocator, home);
 
     // Config: absent file or bad lines never block startup. The path and
     // mtime stick around on the model so the 2 s sweep can live-reload.
@@ -721,7 +734,16 @@ pub fn setup(model: *Model, allocator: std.mem.Allocator, env: Env) !void {
             &model.backfill,
         ) catch .invalid; // OOM: hydration may be partial — reset below.
         switch (outcome) {
-            .restored => model.state_saved_events = model.ledger.all.events,
+            .restored => {
+                model.state_saved_events = model.ledger.all.events;
+                // The restored PROJECTS rollup is keyed on whatever the
+                // writing build used. Fold it onto repository roots so a
+                // statefile from before the worktree rollup stops showing
+                // its old per-worktree rows. A failure here leaves the
+                // rollup exactly as restored — stale keys, correct totals.
+                model.ledger.rekeyProjects(&model.projects) catch
+                    std.log.warn("project rollup rekey failed — PROJECTS may show stale worktree rows", .{});
+            },
             .absent => {},
             .invalid => {
                 model.claude_tailer.deinit();
@@ -1539,7 +1561,8 @@ fn systemEnabled(s: config.SystemStats) system.Enabled {
 /// Note what this path does NOT do: set `state_dirty`. The tailers'
 /// restored offsets already make the statefile's save cadence sufficient,
 /// which is exactly why the history flush has its own dirty counter.
-fn ingest(model: *Model, ev: types.UsageEvent) void {
+fn ingest(model: *Model, raw: types.UsageEvent) void {
+    const ev = withProjectRoot(model, raw);
     const cost = model.prices.costOf(ev);
     model.ledger.add(ev, cost) catch return;
     model.burn.addTokens(ev.timestamp_ms, predict.limitWeightedTokens(ev));
@@ -1547,6 +1570,20 @@ fn ingest(model: *Model, ev: types.UsageEvent) void {
     model.roster.record(ev, cost);
     recordHistory(model, ev, .{ .cost_usd = cost, .now_ms = model.now_ms });
     tripAdd(model, ev, cost);
+}
+
+/// Stamp `project_root` on an event: the one place cwd becomes a project.
+///
+/// Every consumer downstream keys or labels off `projectKey()`, so doing
+/// this once here is what makes a worktree, a subdirectory and the
+/// checkout itself all read as one repository. Cheap by construction — the
+/// resolver memoizes per distinct cwd, so a months-long cold-start replay
+/// pays for a handful of directories, not for every event.
+fn withProjectRoot(model: *Model, ev: types.UsageEvent) types.UsageEvent {
+    if (ev.cwd.len == 0) return ev;
+    var out = ev;
+    out.project_root = model.projects.rootFor(ev.cwd);
+    return out;
 }
 
 /// Stage one row into the durable series. Never fails: `Writer.record`
@@ -1588,7 +1625,10 @@ fn ingestOpenCodeChange(model: *Model, change: opencode.Change) void {
 /// and the fleet's snapshot pollers — same Change shape, distinct
 /// types, so the helper takes the two events directly). A replace
 /// feeds only the token DELTA to the burn gauge.
-fn ingestChange(model: *Model, previous: ?types.UsageEvent, current: types.UsageEvent) void {
+fn ingestChange(model: *Model, previous_raw: ?types.UsageEvent, current_raw: types.UsageEvent) void {
+    const current = withProjectRoot(model, current_raw);
+    const previous: ?types.UsageEvent =
+        if (previous_raw) |old| withProjectRoot(model, old) else null;
     const new_cost = model.prices.costOf(current);
     if (previous) |old| {
         const old_cost = model.prices.costOf(old);
@@ -1603,6 +1643,9 @@ fn ingestChange(model: *Model, previous: ?types.UsageEvent, current: types.Usage
             .cache_read_tokens = current.cache_read_tokens -| old.cache_read_tokens,
             .session_id = current.session_id,
             .cwd = current.cwd,
+            // Carried, not re-resolved: the delta must land in the same
+            // project bucket the row itself did.
+            .project_root = current.project_root,
         };
         model.burn.addTokens(delta.timestamp_ms, predict.limitWeightedTokens(delta));
         model.agent_burn.addEvent(delta);

@@ -63,6 +63,7 @@ const fleet_mod = @import("core/fleet.zig");
 const pricing = @import("core/pricing.zig");
 const ledger_mod = @import("core/ledger.zig");
 const statefile = @import("core/statefile.zig");
+const project_mod = @import("core/project.zig");
 const history_mod = @import("core/history.zig");
 const trayfmt = @import("core/trayfmt.zig");
 const system = @import("core/system/system.zig");
@@ -485,11 +486,30 @@ pub fn collectWith(
     var fleet_ptr: ?*fleet_mod.Fleet = null;
     if (fl) |*f| fleet_ptr = f;
 
+    // Same cwd -> repository rollup the app applies at ingest, so
+    // `--json`'s project table and the app's PROJECTS panel agree. Arena
+    // allocated: this process exits after one snapshot.
+    var projects = project_mod.Resolver.init(arena, env.home);
+    const rooted = struct {
+        fn f(r: *project_mod.Resolver, ev: types.UsageEvent) types.UsageEvent {
+            if (ev.cwd.len == 0) return ev;
+            var out = ev;
+            out.project_root = r.rootFor(ev.cwd);
+            return out;
+        }
+    }.f;
+
     // Warm path: restore offsets + rollups so the sweep below only reads
     // appended bytes. READ-ONLY — this module never calls statefile.save,
     // so it cannot corrupt the app's state or race a running instance.
     if (statefile.defaultPath(arena, env.xdg_state_home, env.home) catch null) |state_path| {
         snap.state = try statefile.restoreWith(arena, io, state_path, &claude_tailer, &codex_tailer, &opencode_poller, fleet_ptr, &ledger, &backfill);
+        if (snap.state == .restored) {
+            // Fold the restored PROJECTS keys onto repository roots, the
+            // same way engine.setup does, so the CLI and the app never
+            // disagree about what a project is.
+            ledger.rekeyProjects(&projects) catch {};
+        }
         if (snap.state == .invalid) {
             // Restore guarantees pristine args on .invalid, but stay in
             // lockstep with engine.setup's belt-and-suspenders reinit.
@@ -511,14 +531,16 @@ pub fn collectWith(
     if (cfg.sources.enabled(.claude)) {
         var sink = claude.ListSink.init(arena);
         _ = claude_tailer.sweepIncremental(arena, io, claude_roots, sink.sink(), now_ms) catch false;
-        for (sink.events.items) |ev| {
+        for (sink.events.items) |raw| {
+            const ev = rooted(&projects, raw);
             ledger.add(ev, if (prices) |*db| db.costOf(ev) else null) catch {};
         }
     }
     if (cfg.sources.enabled(.codex)) {
         var events: std.ArrayList(types.UsageEvent) = .empty;
         _ = codex_tailer.sweepIncremental(io, arena, codex_roots, &events, now_ms) catch false;
-        for (events.items) |ev| {
+        for (events.items) |raw| {
+            const ev = rooted(&projects, raw);
             ledger.add(ev, if (prices) |*db| db.costOf(ev) else null) catch {};
         }
         // Limits ride the tailer: restored from the state file and/or
@@ -529,10 +551,12 @@ pub fn collectWith(
         var changes: std.ArrayList(opencode.Change) = .empty;
         opencode_poller.poll(arena, opencode_path, &changes) catch {};
         for (changes.items) |change| {
-            const new_cost = if (prices) |*db| db.costOf(change.current) else null;
-            if (change.previous) |old| {
-                ledger.replace(old, if (prices) |*db| db.costOf(old) else null, change.current, new_cost) catch {};
-            } else ledger.add(change.current, new_cost) catch {};
+            const current = rooted(&projects, change.current);
+            const new_cost = if (prices) |*db| db.costOf(current) else null;
+            if (change.previous) |old_raw| {
+                const old = rooted(&projects, old_raw);
+                ledger.replace(old, if (prices) |*db| db.costOf(old) else null, current, new_cost) catch {};
+            } else ledger.add(current, new_cost) catch {};
         }
     }
     // Collector fleet: one sweep over every enabled fleet source (its
@@ -541,14 +565,17 @@ pub fn collectWith(
         var events: std.ArrayList(types.UsageEvent) = .empty;
         var changes: std.ArrayList(snapsource.Change) = .empty;
         f.sweep(arena, io, cfg.sources, now_ms, &events, &changes);
-        for (events.items) |ev| {
+        for (events.items) |raw| {
+            const ev = rooted(&projects, raw);
             ledger.add(ev, if (prices) |*db| db.costOf(ev) else null) catch {};
         }
         for (changes.items) |change| {
-            const new_cost = if (prices) |*db| db.costOf(change.current) else null;
-            if (change.previous) |old| {
-                ledger.replace(old, if (prices) |*db| db.costOf(old) else null, change.current, new_cost) catch {};
-            } else ledger.add(change.current, new_cost) catch {};
+            const current = rooted(&projects, change.current);
+            const new_cost = if (prices) |*db| db.costOf(current) else null;
+            if (change.previous) |old_raw| {
+                const old = rooted(&projects, old_raw);
+                ledger.replace(old, if (prices) |*db| db.costOf(old) else null, current, new_cost) catch {};
+            } else ledger.add(current, new_cost) catch {};
         }
     }
 

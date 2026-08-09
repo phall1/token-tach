@@ -9,32 +9,9 @@
 const std = @import("std");
 const types = @import("types.zig");
 const dbgate = @import("dbgate.zig");
-const c = struct {
-    pub const sqlite3 = opaque {};
-    pub const sqlite3_stmt = opaque {};
-    pub const SQLITE_OK: c_int = 0;
-    pub const SQLITE_ROW: c_int = 100;
-    pub const SQLITE_DONE: c_int = 101;
-    pub const SQLITE_INTEGER: c_int = 1;
-    pub const SQLITE_OPEN_READONLY: c_int = 0x00000001;
-    pub const SQLITE_OPEN_READWRITE: c_int = 0x00000002;
-    pub const SQLITE_OPEN_CREATE: c_int = 0x00000004;
-    pub const SQLITE_OPEN_URI: c_int = 0x00000040;
-    pub const SQLITE_OPEN_NOMUTEX: c_int = 0x00008000;
-
-    pub extern fn sqlite3_open_v2([*:0]const u8, *?*sqlite3, c_int, ?[*:0]const u8) c_int;
-    pub extern fn sqlite3_close(?*sqlite3) c_int;
-    pub extern fn sqlite3_busy_timeout(?*sqlite3, c_int) c_int;
-    pub extern fn sqlite3_prepare_v2(?*sqlite3, [*]const u8, c_int, *?*sqlite3_stmt, ?*?[*]const u8) c_int;
-    pub extern fn sqlite3_finalize(?*sqlite3_stmt) c_int;
-    pub extern fn sqlite3_bind_int64(?*sqlite3_stmt, c_int, i64) c_int;
-    pub extern fn sqlite3_step(?*sqlite3_stmt) c_int;
-    pub extern fn sqlite3_column_text(?*sqlite3_stmt, c_int) ?[*]const u8;
-    pub extern fn sqlite3_column_bytes(?*sqlite3_stmt, c_int) c_int;
-    pub extern fn sqlite3_column_int64(?*sqlite3_stmt, c_int) i64;
-    pub extern fn sqlite3_column_type(?*sqlite3_stmt, c_int) c_int;
-    pub extern fn sqlite3_exec(?*sqlite3, [*:0]const u8, ?*const anyopaque, ?*anyopaque, ?*?[*:0]u8) c_int;
-};
+const sqlite = @import("sqlite.zig");
+const c = sqlite.c;
+const columnText = sqlite.columnText;
 
 const Allocator = std.mem.Allocator;
 
@@ -251,12 +228,6 @@ const next_sql: [:0]const u8 =
     "coalesce(json_extract(m.data,'$.tokens.cache.write'),0),m.session_id,s.directory " ++
     "FROM session_message m JOIN session s ON s.id=m.session_id " ++
     "WHERE m.time_updated>=?1 AND m.type='assistant'";
-
-fn columnText(stmt: ?*c.sqlite3_stmt, column: c_int) ?[]const u8 {
-    const ptr = c.sqlite3_column_text(stmt, column) orelse return null;
-    const len = c.sqlite3_column_bytes(stmt, column);
-    return ptr[0..@intCast(len)];
-}
 
 fn nonnegativeColumn(stmt: ?*c.sqlite3_stmt, column: c_int) ?u64 {
     if (c.sqlite3_column_type(stmt, column) != c.SQLITE_INTEGER) return null;

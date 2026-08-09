@@ -30,6 +30,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const timeutil = @import("timeutil.zig");
 const Allocator = std.mem.Allocator;
 
 /// Model string used when no `turn_context`/`session_meta` model was seen.
@@ -984,7 +985,7 @@ pub fn parseIso8601Ms(s: []const u8) ?i64 {
         }
     }
 
-    const days = daysFromCivil(year, month, day);
+    const days = timeutil.daysFromCivil(year, month, day);
     const secs = days * 86400 + hour * 3600 + minute * 60 + second - offset_minutes * 60;
     return secs * 1000 + frac_ms;
 }
@@ -1000,15 +1001,6 @@ fn parseDigits(s: []const u8) ?i64 {
 
 /// Howard Hinnant's days-from-civil: days since 1970-01-01 for a proleptic
 /// Gregorian date.
-fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
-    const y = if (month <= 2) year - 1 else year;
-    const era = @divFloor(y, 400);
-    const yoe = y - era * 400; // [0, 399]
-    const mp = @mod(month + 9, 12); // Mar=0 .. Feb=11
-    const doy = @divTrunc(153 * mp + 2, 5) + day - 1; // [0, 365]
-    const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy; // [0, 146096]
-    return era * 146097 + doe - 719468;
-}
 
 // ---------------------------------------------------------------------------
 // Tests

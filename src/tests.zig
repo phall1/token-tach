@@ -19,6 +19,9 @@ test {
     _ = @import("core/config.zig");
     _ = @import("core/cfcache.zig");
     _ = @import("core/dbgate.zig");
+    _ = @import("core/sqlite.zig");
+    _ = @import("core/jsonget.zig");
+    _ = @import("core/timeutil.zig");
     _ = @import("core/claude.zig");
     _ = @import("core/codex.zig");
     _ = @import("core/opencode.zig");
@@ -41,6 +44,7 @@ test {
     _ = @import("core/ring.zig");
     _ = @import("core/history.zig");
     _ = @import("core/sessions.zig");
+    _ = @import("core/project.zig");
     _ = @import("core/predict.zig");
     _ = @import("core/alerts.zig");
     _ = @import("core/trayfmt.zig");

@@ -23,30 +23,9 @@
 const std = @import("std");
 const types = @import("types.zig");
 const dbgate = @import("dbgate.zig");
-const c = struct {
-    pub const sqlite3 = opaque {};
-    pub const sqlite3_stmt = opaque {};
-    pub const SQLITE_OK: c_int = 0;
-    pub const SQLITE_ROW: c_int = 100;
-    pub const SQLITE_DONE: c_int = 101;
-    pub const SQLITE_OPEN_READONLY: c_int = 0x00000001;
-    pub const SQLITE_OPEN_READWRITE: c_int = 0x00000002;
-    pub const SQLITE_OPEN_CREATE: c_int = 0x00000004;
-    pub const SQLITE_OPEN_URI: c_int = 0x00000040;
-    pub const SQLITE_OPEN_NOMUTEX: c_int = 0x00008000;
-
-    pub extern fn sqlite3_open_v2([*:0]const u8, *?*sqlite3, c_int, ?[*:0]const u8) c_int;
-    pub extern fn sqlite3_close(?*sqlite3) c_int;
-    pub extern fn sqlite3_busy_timeout(?*sqlite3, c_int) c_int;
-    pub extern fn sqlite3_prepare_v2(?*sqlite3, [*]const u8, c_int, *?*sqlite3_stmt, ?*?[*]const u8) c_int;
-    pub extern fn sqlite3_finalize(?*sqlite3_stmt) c_int;
-    pub extern fn sqlite3_bind_int64(?*sqlite3_stmt, c_int, i64) c_int;
-    pub extern fn sqlite3_step(?*sqlite3_stmt) c_int;
-    pub extern fn sqlite3_column_text(?*sqlite3_stmt, c_int) ?[*]const u8;
-    pub extern fn sqlite3_column_bytes(?*sqlite3_stmt, c_int) c_int;
-    pub extern fn sqlite3_column_int64(?*sqlite3_stmt, c_int) i64;
-    pub extern fn sqlite3_exec(?*sqlite3, [*:0]const u8, ?*const anyopaque, ?*anyopaque, ?*?[*:0]u8) c_int;
-};
+const sqlite = @import("sqlite.zig");
+const c = sqlite.c;
+const columnText = sqlite.columnText;
 
 const Allocator = std.mem.Allocator;
 
@@ -90,10 +69,8 @@ pub const Poller = struct {
     /// Filesystem change gate — the shared one in dbgate.zig, which owns the
     /// two ordering rules (stat before open, commit only on SQLITE_DONE).
     gate: dbgate.Gate = .{},
-    /// NUL-terminated copy of the last polled path. `sqlite3_open_v2` needs
-    /// one and the path never changes in practice, so duping it on every
-    /// 2 s tick was pure churn on the long-lived allocator.
-    zpath: ?[:0]u8 = null,
+    /// NUL-terminated copy of the last polled path — see sqlite.PathCache.
+    zpath: sqlite.PathCache = .{},
     /// Polls that passed the change gate and went on to touch SQLite. Read by
     /// the tests to prove the gate fires; free for callers to read too.
     scan_count: u64 = 0,
@@ -103,21 +80,7 @@ pub const Poller = struct {
     }
 
     pub fn deinit(self: *Poller) void {
-        if (self.zpath) |z| self.allocator.free(z);
-        self.zpath = null;
-    }
-
-    /// Borrow a cached NUL-terminated copy of `path`, re-duping only when the
-    /// caller hands us a different database than last time.
-    fn zPathFor(self: *Poller, path: []const u8) ![:0]const u8 {
-        if (self.zpath) |cached| {
-            if (std.mem.eql(u8, cached, path)) return cached;
-            self.allocator.free(cached);
-            self.zpath = null;
-        }
-        const owned = try self.allocator.dupeZ(u8, path);
-        self.zpath = owned;
-        return owned;
+        self.zpath.deinit(self.allocator);
     }
 
     /// Highest usage_ledger rowid ingested so far — persist this in the
@@ -142,7 +105,7 @@ pub const Poller = struct {
         // on every 2 s tick of an idle session.
         const fingerprint = self.gate.beforeOpen(path) orelse return;
         self.scan_count += 1;
-        const zpath = try self.zPathFor(path);
+        const zpath = try self.zpath.get(self.allocator, path);
 
         var db: ?*c.sqlite3 = null;
         const flags = c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_URI | c.SQLITE_OPEN_NOMUTEX;
@@ -206,12 +169,6 @@ pub const Poller = struct {
 
 pub fn freeEvents(allocator: Allocator, events: []const types.UsageEvent) void {
     for (events) |ev| freeEvent(allocator, ev);
-}
-
-fn columnText(stmt: ?*c.sqlite3_stmt, column: c_int) ?[]const u8 {
-    const ptr = c.sqlite3_column_text(stmt, column) orelse return null;
-    const len = c.sqlite3_column_bytes(stmt, column);
-    return ptr[0..@intCast(len)];
 }
 
 fn dupeEvent(allocator: Allocator, ev: types.UsageEvent) !types.UsageEvent {
