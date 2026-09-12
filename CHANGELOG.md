@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/phall1/token-tach/compare/v0.9.6...v0.10.0) (2026-09-12)
+
+
+### Features
+
+* reshape Token Tach around allowance and usage ([#21](https://github.com/phall1/token-tach/issues/21)) ([69f72aa](https://github.com/phall1/token-tach/commit/69f72aac09d68a17dc43065f1b8f203fd49a5644))
+
 ## [0.9.6](https://github.com/phall1/token-tach/compare/v0.9.5...v0.9.6) (2026-08-09)
 
 
