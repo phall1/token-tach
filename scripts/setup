@@ -41,8 +41,7 @@ else
   ok=0
 fi
 
-# The CLI must come from the vendored fork: app.zon uses `.macos`
-# (accessory mode), which the stock npm 0.4.0 CLI cannot parse.
+# Build the CLI from the vendored fork to match its SDK and automation protocol.
 echo "==> fork CLI"
 if [ -x vendor/native/zig-out/bin/native ]; then
   echo "✓ $(vendor/native/zig-out/bin/native --version) (fork)"

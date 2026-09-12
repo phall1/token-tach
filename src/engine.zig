@@ -32,6 +32,8 @@ const oauth = @import("core/oauth.zig");
 const keychain = @import("core/keychain.zig");
 const trayfmt = @import("core/trayfmt.zig");
 const system = @import("core/system/system.zig");
+const usage_summary = @import("core/usage_summary.zig");
+const presentation = @import("presentation.zig");
 
 pub const Effects = native_sdk.Effects(Msg);
 
@@ -70,6 +72,9 @@ pub const catchup_interval_ms: u32 = 120;
 pub const catchup_chunk_bytes: u64 = 12 * 1024 * 1024;
 
 pub const Msg = union(enum) {
+    popover_page: presentation.Page,
+    select_source: types.Agent,
+    refresh_usage,
     tick: native_sdk.EffectTimer,
     catchup_tick: native_sdk.EffectTimer,
     oauth_tick: native_sdk.EffectTimer,
@@ -183,6 +188,8 @@ pub const ChartHover = struct { chart: u8 = 0, sample: u16 = 0 };
 /// state without touching the Model's engine fields, so a UI change can
 /// never accidentally alter what gets journaled, persisted or measured.
 pub const Ux = struct {
+    popover_page: presentation.Page = .overview,
+    selected_source: ?types.Agent = null,
     mfd_page: MfdPage = .burn,
     time_range: TimeRange = .live,
     filter_agent: ?types.Agent = null,
@@ -292,6 +299,11 @@ pub const SystemHistory = struct {
 };
 
 pub const Model = struct {
+    usage_summary: usage_summary.Snapshot = .{},
+    summary_next_ms: i64 = 0,
+    summary_error: bool = false,
+    /// An allowance failure belongs to Claude, not to every source card.
+    claude_error: usage_summary.Name = .{},
     allocator: std.mem.Allocator = undefined,
     ready: bool = false,
     cfg: config.Config = .{},
@@ -889,7 +901,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // path is strings-only.
     advanceInstrument(model);
     refreshStrings(model);
-    startIgnition(model, fx);
+    refreshUsageSummary(model);
 }
 
 // -------------------------------------------------- system telemetry channel
@@ -1146,9 +1158,9 @@ pub const config_spawn_key: u64 = 8;
 
 const config_template =
     \\# token-tach configuration — live-reloaded while the app runs.
-    \\# Tray template tokens: {burn} {eta} {pct} {tok} {cost}
+    \\# Tray template tokens: {status} {burn} {eta} {pct} {tok} {cost}
     \\#                       {cpu} {gpu} {mem} {disk} {net} {batt}
-    \\#tray-format = {burn} → {eta}
+    \\#tray-format = {status}
     \\
     \\# System telemetry strip: true/false, or a module list
     \\# (cpu, gpu, mem, disk, net, battery).
@@ -1243,46 +1255,7 @@ fn flushHistory(model: *Model) void {
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
-        .tick => {
-            model.now_ms = fx.wallMs();
-            // Config live-reload rides the sweep tick: an mtime stat per
-            // 2 s is free, and a newly enabled source gets the same
-            // chunked history catch-up boot gives it.
-            if (maybeReloadConfig(model)) |newly_enabled| {
-                if (newly_enabled.any() and !model.catchup_active) {
-                    startCatchup(model, newly_enabled, fx);
-                }
-                refreshStrings(model);
-            }
-            applyLaunchAtLogin(model, fx);
-            // System telemetry normally arrives PUSHED through the
-            // sampler channel; the sweep samples it only when that
-            // channel is unavailable (spawn failed / closed / refused).
-            if (model.system_tick_fallback) sampleSystem(model);
-            // While catch-up owns the tailers, the steady usage sweep
-            // stands down (offsets make overlap safe, but it's wasted
-            // work); the instrument and the strings still advance so the
-            // new system sample reaches the strip.
-            if (!model.catchup_active) {
-                const sweep_start_ns = native_sdk.monotonicNanoseconds();
-                sweepOnce(model);
-                const sweep_us = (native_sdk.monotonicNanoseconds() - sweep_start_ns) / std.time.ns_per_us;
-                std.log.debug("sweep: {d} us", .{sweep_us});
-                dispatchAlerts(model, fx);
-                maybeSaveState(model);
-                maybeFlushHistory(model);
-            } else {
-                // Catch-up owns the tailers, but this tick is still the
-                // 2 s boundary the decay constant is written for — the
-                // dial should keep ranging while months of history parse,
-                // just not once per 120 ms chunk.
-                advanceInstrument(model);
-                refreshStrings(model);
-            }
-            // First OAuth poll shouldn't wait for the 30 s gate.
-            if (!model.first_sweep_done) maybeOauthPoll(model, fx);
-            model.first_sweep_done = true;
-        },
+        .tick => updateTick(model, fx),
         .catchup_tick => {
             model.now_ms = fx.wallMs();
             if (model.catchup_active) processCatchupChunk(model, fx);
@@ -1302,44 +1275,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             refreshStrings(model);
         },
         .spawn_done => {},
-        .popover_opened => {
-            model.now_ms = fx.wallMs();
-            startIgnition(model, fx);
-        },
-        .open_config => openConfig(model, fx),
-        .system_reading => |event| {
-            model.now_ms = fx.wallMs();
-            switch (event.kind) {
-                .data => {
-                    // The producer posts a whole fixed-size Snapshot;
-                    // guard the length so a stray payload can't misread.
-                    if (event.bytes.len == @sizeOf(system.Snapshot)) {
-                        const full = std.mem.bytesToValue(system.Snapshot, event.bytes[0..@sizeOf(system.Snapshot)]);
-                        model.system_snap = maskSystemSnapshot(full, model.cfg.system_stats);
-                        model.system_drops = event.dropped_total;
-                        model.system_history.record(model.now_ms, model.system_snap);
-                        // Glance only. This arm fires at 1 Hz and changes
-                        // nothing but the telemetry tokens in the tray
-                        // template — re-deriving three agent lines, the
-                        // odometer and the status footer for it was pure
-                        // waste, and journaling a needle pose here zeroed
-                        // the sweep animation's delta between sweeps.
-                        refreshGlance(model);
-                    }
-                },
-                // The channel ended (teardown) or the open was refused —
-                // resume sampling on the sweep so the strip stays live.
-                .closed, .rejected => {
-                    model.system_tick_fallback = true;
-                    model.system_drops = event.dropped_total;
-                },
-            }
-        },
-        // Hover reveal is pure display: set the target (or clear it) and
-        // let the rebuild re-render the footer. Cheap — hover Msgs fire
-        // on containment edges, never per pointer move.
-        .hover_system => |target| model.hovered_system = target,
-        .hover_clear => model.hovered_system = null,
+        .system_reading => |event| updateSystemReading(model, event, fx),
         .quit => {
             // Accessory app: the tray Quit item is the only exit
             // affordance. Flush state and history (deinit flushes, then
@@ -1350,6 +1286,65 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             deinit(model);
             std.process.exit(0);
         },
+        else => updateInteraction(model, msg, fx),
+    }
+}
+
+fn updateTick(model: *Model, fx: *Effects) void {
+    model.now_ms = fx.wallMs();
+    if (maybeReloadConfig(model)) |newly_enabled| {
+        if (newly_enabled.any() and !model.catchup_active) startCatchup(model, newly_enabled, fx);
+        refreshStrings(model);
+    }
+    applyLaunchAtLogin(model, fx);
+    if (model.system_tick_fallback) sampleSystem(model);
+    if (model.catchup_active) {
+        advanceInstrument(model);
+        refreshStrings(model);
+    } else {
+        const sweep_start_ns = native_sdk.monotonicNanoseconds();
+        sweepOnce(model);
+        const sweep_us = (native_sdk.monotonicNanoseconds() - sweep_start_ns) / std.time.ns_per_us;
+        std.log.debug("sweep: {d} us", .{sweep_us});
+        dispatchAlerts(model, fx);
+        maybeSaveState(model);
+        maybeFlushHistory(model);
+        refreshUsageSummary(model);
+    }
+    if (!model.first_sweep_done) maybeOauthPoll(model, fx);
+    model.first_sweep_done = true;
+}
+
+fn updateSystemReading(model: *Model, event: native_sdk.EffectChannelEvent, fx: *Effects) void {
+    model.now_ms = fx.wallMs();
+    switch (event.kind) {
+        .data => {
+            if (event.bytes.len != @sizeOf(system.Snapshot)) return;
+            const full = std.mem.bytesToValue(system.Snapshot, event.bytes[0..@sizeOf(system.Snapshot)]);
+            model.system_snap = maskSystemSnapshot(full, model.cfg.system_stats);
+            model.system_drops = event.dropped_total;
+            model.system_history.record(model.now_ms, model.system_snap);
+            refreshGlance(model);
+        },
+        .closed, .rejected => {
+            model.system_tick_fallback = true;
+            model.system_drops = event.dropped_total;
+        },
+    }
+}
+
+fn updateInteraction(model: *Model, msg: Msg, fx: *Effects) void {
+    switch (msg) {
+        .popover_opened, .refresh_usage => {
+            model.now_ms = fx.wallMs();
+            if (model.ready and !model.catchup_active) sweepOnce(model);
+            model.summary_next_ms = 0;
+            refreshUsageSummary(model);
+            maybeOauthPoll(model, fx);
+        },
+        .open_config => openConfig(model, fx),
+        .hover_system => |target| model.hovered_system = target,
+        .hover_clear => model.hovered_system = null,
         .open_dashboard => {
             model.now_ms = fx.wallMs();
             model.dashboard_open = true;
@@ -1357,39 +1352,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .dashboard_closed => {
             model.dashboard_open = false;
         },
-        .ignition_tick => {
-            model.now_ms = fx.wallMs();
-            switch (model.ignition_phase) {
-                .up => {
-                    model.ignition_phase = .settle;
-                    fx.startTimer(.{
-                        .key = ignition_timer_key,
-                        .interval_ms = ignition_settle_ms,
-                        .mode = .one_shot,
-                        .on_fire = Effects.timerMsg(.ignition_tick),
-                    });
-                },
-                .settle, .off => model.ignition_phase = .off,
-            }
-        },
-
-        // ------------------------------------------------------ UI wave
-        // Every one of these is pure display state, so they share one
-        // effect-free handler — which is also what makes them testable
-        // without standing up an effects channel.
-        .mfd_page,
-        .time_range,
-        .filter_agent,
-        .sort_by,
-        .readout_cycle,
-        .dashboard_focus,
-        .alert_ack,
-        .hud_toggle,
-        .hud_closed,
-        .chart_hover,
-        .row_press,
-        .trip_reset,
-        => applyUxMsg(model, msg),
+        .ignition_tick => model.ignition_phase = .off,
+        else => applyUxMsg(model, msg),
     }
 }
 
@@ -1401,22 +1365,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 /// returns, and re-deriving display strings for a click would put tailer
 /// work on the input path.
 pub fn applyUxMsg(model: *Model, msg: Msg) void {
+    if (applyNavigationMsg(model, msg)) return;
     switch (msg) {
-        .mfd_page => |page| model.ux.mfd_page = page,
-        .time_range => |range| model.ux.time_range = range,
-        .filter_agent => |agent| model.ux.filter_agent = agent,
         // Re-sending the live column flips the direction; a new column
         // starts descending, which is the useful end of every column here.
-        .sort_by => |column| {
-            if (model.ux.sort_by == column) {
-                model.ux.sort_desc = !model.ux.sort_desc;
-            } else {
-                model.ux.sort_by = column;
-                model.ux.sort_desc = true;
-            }
-        },
+        .sort_by => |column| selectSort(&model.ux, column),
         .readout_cycle => model.ux.readout = nextReadout(model.ux.readout),
-        .dashboard_focus => |pane| model.ux.dashboard_focus = pane,
         .alert_ack => model.ux.alerts_acked_ms = model.now_ms,
         .hud_toggle => |panel| model.ux.hud = if (model.ux.hud == panel) .none else panel,
         // A dismissal names the panel it came from, so a late one cannot
@@ -1424,8 +1378,6 @@ pub fn applyUxMsg(model: *Model, msg: Msg) void {
         .hud_closed => |panel| {
             if (model.ux.hud == panel) model.ux.hud = .none;
         },
-        .chart_hover => |sample| model.ux.hover = sample,
-        .row_press => |row| model.ux.selected_row = row,
         .trip_reset => {
             model.trip = .{};
             model.trip_start_ms = model.now_ms;
@@ -1433,6 +1385,82 @@ pub fn applyUxMsg(model: *Model, msg: Msg) void {
         // Everything else is the engine's; this handler never sees them.
         else => {},
     }
+}
+
+fn selectSort(ux: *Ux, column: SortColumn) void {
+    if (ux.sort_by == column) {
+        ux.sort_desc = !ux.sort_desc;
+        return;
+    }
+    ux.sort_by = column;
+    ux.sort_desc = true;
+}
+
+fn applyNavigationMsg(model: *Model, msg: Msg) bool {
+    switch (msg) {
+        .mfd_page => |page| model.ux.mfd_page = page,
+        .time_range => |range| model.ux.time_range = range,
+        .filter_agent => |agent| model.ux.filter_agent = agent,
+        .dashboard_focus => |pane| model.ux.dashboard_focus = pane,
+        .chart_hover => |sample| model.ux.hover = sample,
+        .row_press => |row| model.ux.selected_row = row,
+        .popover_page => |page| model.ux.popover_page = page,
+        .select_source => |agent| {
+            model.ux.selected_source = agent;
+            model.ux.popover_page = .overview;
+        },
+        else => return false,
+    }
+    return true;
+}
+
+fn refreshUsageSummary(model: *Model) void {
+    if (!model.ready or model.catchup_active) return;
+    if (model.now_ms < model.summary_next_ms and model.now_ms >= model.usage_summary.updated_ms) return;
+    model.summary_next_ms = model.now_ms + 30_000;
+    const writer = if (model.history) |*value| value else return;
+    if (!writer.enabled) {
+        model.summary_error = true;
+        return;
+    }
+    writer.flush();
+    if (!writer.enabled) {
+        model.summary_error = true;
+        return;
+    }
+    model.usage_summary = usage_summary.load(model.allocator, historyIo(), writer.dir, model.now_ms) catch {
+        model.summary_error = true;
+        return;
+    };
+    model.summary_error = false;
+}
+
+pub fn presentationInput(model: *const Model) presentation.Input {
+    var recorded = std.EnumSet(types.Agent).initEmpty();
+    if (model.ready) {
+        for (std.enums.values(types.Agent)) |agent| {
+            if (model.ledger.forAgent(agent).events > 0) recorded.insert(agent);
+        }
+    }
+    return .{
+        .now_ms = model.now_ms,
+        .tz_offset_min = model.tz_offset_min,
+        .ready = model.ready,
+        .scanning = model.catchup_active,
+        .enabled = model.cfg.sources,
+        .recorded = recorded,
+        .claude = model.claude_limits,
+        .codex = model.codex_limits,
+        .claude_oauth = model.cfg.claude_oauth,
+        .claude_inflight = model.oauth_inflight,
+        .claude_error = model.claude_error.text(),
+        .history_error = model.summary_error,
+        .history_blocked = if (model.history) |writer| !writer.enabled else true,
+        .usage = &model.usage_summary,
+        .roster = &model.roster,
+        .selected = model.ux.selected_source,
+        .page = model.ux.popover_page,
+    };
 }
 
 /// The machine's current UTC offset in minutes east, from libc — a
@@ -1700,8 +1728,9 @@ fn storeLimits(model: *Model, slot: *?types.LimitSnapshot, snap: types.LimitSnap
 /// Enforce the config's `launch-at-login` preference (tt-rex). Absent
 /// key = never touch the OS registration. Guarded on the last pushed
 /// value, so this is a no-op on every tick until the config changes.
-/// A bare dev binary reports RequiresAppBundle — logged once, not an
-/// error status (the packaged app is where the preference is real).
+/// A bare dev binary can report not_found; upstream's returned status also
+/// distinguishes approval-required from enabled. Log it once rather than
+/// treating every accepted request as an enabled login item.
 fn applyLaunchAtLogin(model: *Model, fx: *Effects) void {
     const want = model.cfg.launch_at_login orelse return;
     if (model.launch_at_login_applied == want) return;
@@ -1709,11 +1738,11 @@ fn applyLaunchAtLogin(model: *Model, fx: *Effects) void {
     // Mark attempted either way: a failing environment (dev binary,
     // macOS < 13) will not succeed on retry, so don't retry every tick.
     model.launch_at_login_applied = want;
-    services.setLaunchAtLogin(want) catch |err| {
+    const status = services.setLaunchAtLogin(want) catch |err| {
         std.log.warn("launch-at-login = {}: not applied ({s}) — the packaged app (macOS 13+) is required", .{ want, @errorName(err) });
         return;
     };
-    std.log.info("launch-at-login: {}", .{want});
+    std.log.info("launch-at-login requested {}: {t}", .{ want, status });
 }
 
 fn dispatchAlerts(model: *Model, fx: *Effects) void {
@@ -1754,6 +1783,7 @@ fn dispatchAlerts(model: *Model, fx: *Effects) void {
 /// the path for signed/bundled builds whose ACL entry sticks.
 fn maybeOauthPoll(model: *Model, fx: *Effects) void {
     if (!model.cfg.claude_oauth) return;
+    if (!model.cfg.sources.enabled(.claude)) return;
     if (model.oauth_inflight or model.now_ms < model.oauth_next_ms) return;
 
     model.oauth_inflight = true;
@@ -1770,6 +1800,7 @@ fn handleCreds(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
         model.oauth_inflight = false;
         model.oauth_next_ms = model.now_ms + configuredPollMs(model);
         setErrorStatus(model, "keychain read failed (security exit {d})", .{exit.code});
+        model.claude_error = usage_summary.Name.init("Keychain unavailable. Sign in with Claude Code and allow access.");
         return;
     }
 
@@ -1779,6 +1810,7 @@ fn handleCreds(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
         model.oauth_inflight = false;
         model.oauth_next_ms = model.now_ms + configuredPollMs(model);
         setErrorStatus(model, "unreadable Claude credentials payload", .{});
+        model.claude_error = usage_summary.Name.init("Claude credentials could not be read.");
         return;
     };
     defer std.crypto.secureZero(u8, @constCast(creds.access_token));
@@ -1787,6 +1819,7 @@ fn handleCreds(model: *Model, exit: native_sdk.EffectExit, fx: *Effects) void {
         model.oauth_inflight = false;
         model.oauth_next_ms = model.now_ms + configuredPollMs(model);
         setErrorStatus(model, "Claude credentials expired; reopen Claude Code to refresh", .{});
+        model.claude_error = usage_summary.Name.init("Sign in with Claude Code to refresh expired credentials.");
         return;
     }
 
@@ -1826,11 +1859,13 @@ fn handleOauthResponse(model: *Model, resp: native_sdk.EffectResponse) void {
             model.oauth_backoff.onFailure();
             model.oauth_next_ms = model.now_ms + model.oauth_backoff.delayMs();
             setErrorStatus(model, "unparseable usage response", .{});
+            model.claude_error = usage_summary.Name.init("Allowance response could not be read. Will retry.");
             return;
         };
         model.walls.observe(snap);
         storeLimits(model, &model.claude_limits, snap);
         model.oauth_backoff.onSuccess();
+        model.claude_error = .{};
         model.status_error = false;
         model.oauth_last_success_ms = model.now_ms;
         model.oauth_next_ms = model.now_ms + configuredPollMs(model);
@@ -1838,6 +1873,7 @@ fn handleOauthResponse(model: *Model, resp: native_sdk.EffectResponse) void {
         model.oauth_backoff.onFailure();
         model.oauth_next_ms = model.now_ms + model.oauth_backoff.delayMs();
         setErrorStatus(model, "usage endpoint: status {d} ({t})", .{ resp.status, resp.outcome });
+        model.claude_error = usage_summary.Name.init(model.status_text);
     }
 }
 
@@ -1864,7 +1900,7 @@ fn computeGlanceState(model: *const Model) trayfmt.GlanceState {
     const today = model.ledger.today(model.now_ms);
     const wall = model.walls.nearestWall(model.now_ms);
     const hot = model.walls.maxUtilization();
-    return .{
+    var result: trayfmt.GlanceState = .{
         .now_ms = model.now_ms,
         .tz_offset_min = model.tz_offset_min,
         // Per-agent rings, blended. Bit-exact against the single ring
@@ -1877,14 +1913,24 @@ fn computeGlanceState(model: *const Model) trayfmt.GlanceState {
         .next_reset_ms = nextReset(model),
         .today_tokens = today.totalTokens(),
         .today_cost_usd = today.cost_usd,
-        .cpu_frac = if (model.system_snap.cpu) |s| s.total_frac else null,
-        .gpu_frac = if (model.system_snap.gpu) |s| s.device_utilization else null,
-        .mem_frac = if (model.system_snap.mem) |s| s.used_frac else null,
-        .disk_free_bytes = if (model.system_snap.disk) |s| s.free_bytes else null,
-        .net_rx_bps = if (model.system_snap.net) |s| s.in_bytes_per_sec else null,
-        .net_tx_bps = if (model.system_snap.net) |s| s.out_bytes_per_sec else null,
-        .battery_frac = if (model.system_snap.battery) |s| s.charge else null,
+        .loading = !model.ready or model.catchup_active,
     };
+    if (presentation.glance(presentationInput(model))) |allowance| {
+        result.allowance_name = allowance.name;
+        result.allowance_percent = allowance.percent;
+    }
+    applySystemGlance(&result, model.system_snap);
+    return result;
+}
+
+fn applySystemGlance(result: *trayfmt.GlanceState, snap: system.Snapshot) void {
+    result.cpu_frac = if (snap.cpu) |s| s.total_frac else null;
+    result.gpu_frac = if (snap.gpu) |s| s.device_utilization else null;
+    result.mem_frac = if (snap.mem) |s| s.used_frac else null;
+    result.disk_free_bytes = if (snap.disk) |s| s.free_bytes else null;
+    result.net_rx_bps = if (snap.net) |s| s.in_bytes_per_sec else null;
+    result.net_tx_bps = if (snap.net) |s| s.out_bytes_per_sec else null;
+    result.battery_frac = if (snap.battery) |s| s.charge else null;
 }
 
 fn nextReset(model: *const Model) ?i64 {

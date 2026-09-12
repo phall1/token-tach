@@ -21,6 +21,9 @@ pub const GlanceState = struct {
     next_reset_ms: ?i64 = null,
     today_tokens: u64 = 0,
     today_cost_usd: f64 = 0,
+    allowance_name: []const u8 = "",
+    allowance_percent: ?f64 = null,
+    loading: bool = false,
 
     // Live system telemetry, populated when the system sampler is
     // enabled and the reading exists. An absent reading renders as
@@ -69,62 +72,80 @@ pub fn render(buf: []u8, template: []const u8, state: GlanceState) []const u8 {
 }
 
 fn writeToken(w: *std.Io.Writer, token: []const u8, state: GlanceState) !void {
-    if (std.mem.eql(u8, token, "burn")) {
-        if (state.idle) {
-            try w.writeAll("idle");
-        } else {
-            // Fixed-width form: the tray title re-renders every sweep and
-            // the menu bar reflows on every width change — "4.2k" jumping
-            // to "980" to "12k" makes the whole status area shiver.
-            try w.writeAll("⚡ ");
-            try writeHumanTokensFixed(w, @intFromFloat(@max(state.burn_tokens_per_min, 0)));
-            try w.writeAll("/m");
-        }
-    } else if (std.mem.eql(u8, token, "eta")) {
-        if (!state.idle) {
-            if (state.wall_at_ms) |wall| {
-                try w.writeAll("wall ");
-                try writeClock(w, wall, state.tz_offset_min);
-                return;
-            }
-        }
-        if (state.next_reset_ms) |reset| {
-            if (reset > state.now_ms) {
-                try w.writeAll("resets ");
-                try writeCountdown(w, reset - state.now_ms);
-                return;
-            }
-        }
-        // No signal: token contributes nothing.
-    } else if (std.mem.eql(u8, token, "pct")) {
-        if (state.hot_percent) |p| {
-            try w.printInt(@as(u64, @intFromFloat(std.math.clamp(p, 0, 100))), 10, .lower, .{});
-            try w.writeByte('%');
-        }
-    } else if (std.mem.eql(u8, token, "tok")) {
-        try writeHumanTokens(w, state.today_tokens);
-    } else if (std.mem.eql(u8, token, "cost")) {
-        try writeCost(w, state.today_cost_usd);
-    } else if (std.mem.eql(u8, token, "cpu")) {
-        if (state.cpu_frac) |f| try writePercent(w, f);
-    } else if (std.mem.eql(u8, token, "gpu")) {
-        if (state.gpu_frac) |f| try writePercent(w, f);
-    } else if (std.mem.eql(u8, token, "mem")) {
-        if (state.mem_frac) |f| try writePercent(w, f);
-    } else if (std.mem.eql(u8, token, "disk")) {
-        if (state.disk_free_bytes) |bytes| try writeHumanBytes(w, bytes);
-    } else if (std.mem.eql(u8, token, "net")) {
-        if (state.net_rx_bps != null or state.net_tx_bps != null) {
-            try w.writeAll("↓");
-            try writeHumanBytes(w, @intFromFloat(@max(state.net_rx_bps orelse 0, 0)));
-            try w.writeAll(" ↑");
-            try writeHumanBytes(w, @intFromFloat(@max(state.net_tx_bps orelse 0, 0)));
-        }
-    } else if (std.mem.eql(u8, token, "batt")) {
-        if (state.battery_frac) |f| try writePercent(w, f);
-    } else {
-        return error.UnknownToken;
+    const Token = enum { burn, eta, pct, tok, cost, status };
+    const kind = std.meta.stringToEnum(Token, token) orelse return writeSystemToken(w, token, state);
+    switch (kind) {
+        .burn => try writeBurn(w, state),
+        .eta => try writeEta(w, state),
+        .pct => if (state.hot_percent) |p| try writeUsedPercent(w, p),
+        .tok => try writeHumanTokens(w, state.today_tokens),
+        .cost => try writeCost(w, state.today_cost_usd),
+        .status => try writeStatus(w, state),
     }
+}
+
+fn writeStatus(w: *std.Io.Writer, state: GlanceState) !void {
+    if (state.allowance_percent) |percent| {
+        try w.writeAll(state.allowance_name);
+        try w.writeByte(' ');
+        try writeUsedPercent(w, percent);
+        return;
+    }
+    if (state.loading) return w.writeAll("Syncing usage...");
+    try writeHumanTokens(w, state.today_tokens);
+    try w.writeAll(" tok today");
+}
+
+fn writeUsedPercent(w: *std.Io.Writer, percent: f64) !void {
+    try w.printInt(@as(u64, @intFromFloat(std.math.clamp(percent, 0, 100))), 10, .lower, .{});
+    try w.writeByte('%');
+}
+
+fn writeBurn(w: *std.Io.Writer, state: GlanceState) !void {
+    if (state.idle) return w.writeAll("idle");
+    try w.writeAll("⚡ ");
+    try writeHumanTokensFixed(w, @intFromFloat(@max(state.burn_tokens_per_min, 0)));
+    try w.writeAll("/m");
+}
+
+fn writeEta(w: *std.Io.Writer, state: GlanceState) !void {
+    if (!state.idle) {
+        if (state.wall_at_ms) |wall| {
+            try w.writeAll("wall ");
+            return writeClock(w, wall, state.tz_offset_min);
+        }
+    }
+    if (state.next_reset_ms) |reset| {
+        if (reset > state.now_ms) {
+            try w.writeAll("resets ");
+            try writeCountdown(w, reset - state.now_ms);
+        }
+    }
+}
+
+fn writeSystemToken(w: *std.Io.Writer, token: []const u8, state: GlanceState) !void {
+    const Token = enum { cpu, gpu, mem, disk, net, batt };
+    const kind = std.meta.stringToEnum(Token, token) orelse return error.UnknownToken;
+    switch (kind) {
+        .cpu => try writeOptionalPercent(w, state.cpu_frac),
+        .gpu => try writeOptionalPercent(w, state.gpu_frac),
+        .mem => try writeOptionalPercent(w, state.mem_frac),
+        .batt => try writeOptionalPercent(w, state.battery_frac),
+        .disk => if (state.disk_free_bytes) |bytes| try writeHumanBytes(w, bytes),
+        .net => try writeNetwork(w, state),
+    }
+}
+
+fn writeOptionalPercent(w: *std.Io.Writer, value: ?f64) !void {
+    if (value) |fraction| try writePercent(w, fraction);
+}
+
+fn writeNetwork(w: *std.Io.Writer, state: GlanceState) !void {
+    if (state.net_rx_bps == null and state.net_tx_bps == null) return;
+    try w.writeAll("↓");
+    try writeHumanBytes(w, @intFromFloat(@max(state.net_rx_bps orelse 0, 0)));
+    try w.writeAll(" ↑");
+    try writeHumanBytes(w, @intFromFloat(@max(state.net_tx_bps orelse 0, 0)));
 }
 
 /// Fraction 0..1 as a clamped integer percent: 0.434 -> "43%".

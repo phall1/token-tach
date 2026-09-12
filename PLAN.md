@@ -9,7 +9,17 @@ the data-source landscape, and ~20 prior-art apps.
 
 ---
 
-## Locked decisions
+## Current direction — allowance-first (2026-09-12)
+
+The user approved a substantial reshape against Omarchy's Agents panel.
+[PRODUCT.md](specs/tt-uju/PRODUCT.md) and [TECH.md](specs/tt-uju/TECH.md) are
+the current contract. The default glance is fresh allowance pressure with a
+recorded-usage fallback; the popover is identity → limits → recent usage →
+models. Sessions and history are drill-downs. The large dial, ignition sweep,
+odometer and machine strip leave the default popover. Harness, provider and
+account are distinct; unknown subscription attribution remains unknown.
+
+## Original decisions (hero, vibe and surfaces superseded above)
 
 | Axis | Decision |
 |---|---|
@@ -33,13 +43,13 @@ the data-source landscape, and ~20 prior-art apps.
   permission-gated via `app.zon`.
 - **Fork & patch the ObjC host** (`src/platform/macos/appkit_host.m`, plain ObjC,
   Zig has first-class C interop). Patches carried on the fork
-  (`phall1/native@token-tach-patches-v0.8.0`); the original "PR'd upstream"
+  (`phall1/native@token-tach-patches-v0.10.1`); the original "PR'd upstream"
   intent was withdrawn — patches stay on the fork, available on request:
   1. `NSPopover` anchored to the status item (transient dismiss) — the one-click popover.
-  2. `app.zon` `.macos.accessory` → `LSUIElement` (menu-bar-only, no Dock icon).
-  3. `SMAppService` launch-at-login.
-  4. Render animations anchored to the presenting frame, not the declarer's
-     stale clock (added at the v0.8.0 rebase).
+  2. `SMAppService` launch-at-login helpers over upstream's status-aware API.
+  3. Render animations anchored to the presenting frame, not the declarer's
+     stale clock.
+  Accessory mode uses upstream `.dock_visible = false` (`LSUIElement`).
 - **Known SDK gaps we absorb**: no file watching (poll JSONL trees with
   `fx.startTimer`, 1–2 s, byte-offset tailing — cheap); pre-1.0 API churn
   (pin + vendor the fork; expect rebase cost per 0.x release; project is 2 months

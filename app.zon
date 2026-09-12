@@ -2,7 +2,7 @@
     .id = "com.phall.token-tach",
     .name = "token-tach",
     .display_name = "Token Tach",
-    .description = "Menu-bar tachometer for AI coding-agent token usage and limits.",
+    .description = "A calm menu-bar monitor for coding-agent usage and allowance.",
     // x-release-please-start-version
     .version = "0.9.6",
     // x-release-please-end
@@ -10,7 +10,7 @@
     .platforms = .{"macos"},
     .permissions = .{ "view", "command", "network", "notifications" },
     .capabilities = .{ "native_views", "gpu_surfaces", "tray", "notifications" },
-    .macos = .{ .accessory = true },
+    .dock_visible = false,
     .commands = .{
         .{ .id = "tach.dashboard", .title = "Dashboard" },
         .{ .id = "tach.hud", .title = "Desktop HUD" },
@@ -25,8 +25,8 @@
                 .title = "Token Tach",
                 // Kept in lockstep with view.window_width/height and
                 // main.zig's shell window — nothing enforces it.
-                .width = 640,
-                .height = 500,
+                .width = 400,
+                .height = 600,
                 .titlebar = "chromeless",
                 .resizable = false,
                 .restore_state = false,

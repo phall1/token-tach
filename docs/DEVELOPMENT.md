@@ -57,16 +57,16 @@ field mirrors the manifest. The build imports the manifest version directly
 for CLI, JSON, and menu consumers, while Native SDK packaging uses it for
 bundle metadata and artifact names.
 
-Currently pinned to **upstream v0.8.0**, on the fork branch
-`phall1/native@token-tach-patches-v0.8.0`. Four patches ride on top:
+SDK target: **upstream v0.10.1**, on the fork branch
+`phall1/native@token-tach-patches-v0.10.1`. Token Tach carries compatibility
+patches for these seams:
 
 1. **status-item NSPopover hosting** — an `NSPopover` anchored to the tray
    item, reparenting the app's Metal surface in and out of an
    `NSViewController` (`src/platform/macos/appkit_host.m`).
-2. **`app.zon` `.macos.accessory`** — emits `LSUIElement` so the app is
-   menu-bar-only with no Dock icon.
-3. **launch-at-login** — a runtime API over `SMAppService` (macOS 13+).
-4. **render animations anchored to the presenting frame**, not the
+2. **launch-at-login compatibility** — Zig runtime convenience methods over
+   upstream's status-aware `SMAppService` API (macOS 13+).
+3. **render animations anchored to the presenting frame**, not the
    declarer's stale clock — without it the ignition sweep replays from
    whatever time the declaring frame happened to carry.
 
@@ -74,8 +74,12 @@ These stay on the fork. Do not open upstream PRs to vercel-labs/native;
 a prior one was withdrawn on explicit instruction. "Patches available on
 request" is the correct posture.
 
-The `native` CLI itself (check/test/build/automate verbs) still comes from
-the vendored fork (`cd vendor/native && zig build cli` -> vendor/native/zig-out/bin/native); scripts/setup builds it. The stock npm CLI cannot parse app.zon's `.macos` key.
+Accessory mode now uses upstream's `.dock_visible = false`, which selects
+accessory activation policy and emits packaged `LSUIElement` metadata.
+
+The `native` CLI itself (check/test/build/automate verbs) comes from the vendored
+fork (`cd vendor/native && zig build cli` -> `vendor/native/zig-out/bin/native`);
+scripts/setup builds it so the SDK and automation protocol stay in lockstep.
 
 ### Rebasing onto a new SDK release
 
@@ -87,7 +91,7 @@ bump:
 cd vendor/native
 git fetch upstream                       # https://github.com/vercel-labs/native
 git switch -c token-tach-patches-vX.Y.Z token-tach-patches-<previous>
-git rebase vX.Y.Z                        # replay our four patches onto the tag
+git rebase vX.Y.Z                        # replay compatibility patches onto the tag
 git push origin token-tach-patches-vX.Y.Z
 cd ../.. && scripts/verify               # prove the world still stands
 (cd vendor/native && zig build cli)      # rebuild the fork CLI — required
@@ -95,14 +99,13 @@ git add vendor/native && git commit
 ```
 
 `git -C vendor/native describe --tags` names the upstream tag plus the
-patch count (`v0.8.0-4-g<sha>`), which is the fastest way to confirm what
+patch count (for example `v0.10.1-3-g<sha>`), which is the fastest way to confirm what
 the submodule is actually pinned to.
 
 Patches are kept small and mechanical; if a rebase fights back, check
 whether the upstream API for trays/windows changed and fix forward.
-Rebuilding the fork CLI is not optional: the stock npm CLI cannot parse
-`app.zon`'s `.macos` key, and a stale fork CLI will `check` against the
-wrong SDK.
+Rebuild the fork CLI after updating: a stale binary checks against the wrong
+SDK and may speak a different automation protocol from the app.
 
 ## Hygiene
 

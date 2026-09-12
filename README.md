@@ -1,60 +1,42 @@
 # token-tach
 
-A macOS menu-bar tachometer for AI coding-agent token usage and subscription
-limits. It reads the session ledgers your agents already write — no proxy,
-no accounts, no telemetry — and turns them into an instrument.
+A macOS menu-bar monitor for coding-agent allowance and usage. It reads the
+session ledgers your agents already write — no proxy, tracking account or telemetry.
 
 ```
-⚡ 50.7k/m → wall 3:40p          ← the menu bar, all day
+Codex 67%                      ← fresh allowance, when available
+8.2M tok today                 ← recorded-usage fallback
 ```
 
-One click, and the needle does the full ignition sweep every time you open it:
+One click shows allowance, reset times, seven days of usage and top models:
 
-![the instrument cluster](docs/assets/popover.png)
+![allowance-first popover](docs/assets/popover.png)
 
-The dial is burn rate. To its right, every agent that is actually running —
-sorted by what each one is burning right now, with the session it is in.
-Underneath, the machine itself on the same 30-minute clock.
+Choose a harness to see its local usage. Provider allowance is shown alongside
+it when available; local usage is never assumed to belong to a subscription
+just because a model name matches. Sessions and History are one click away.
 
 ## What it shows
 
-- **Burn rate** — limit-weighted tokens/minute (cache reads at 0.1×, because
-  that's roughly how they press on your quota), decayed over a 15-minute
-  window. The needle.
-- **Predicted wall** — "at this pace you hit a limit at 3:40 PM", projected
-  from the *slope of the vendors' own utilization numbers*, not guessed
-  token capacities.
-- **Who's burning it** — burn split per agent, so "50.7k/m" resolves into
-  *which* of the agents on this machine is spending it right now.
-- **Window utilization** — Claude 5-hour / weekly (server truth) and Codex
-  5-hour / weekly (embedded in its own logs), with reset countdowns and
-  threshold coloring.
-- **Today's spend** — API-equivalent dollars for all tracked usage, priced
-  against LiteLLM's model database, on a mechanical odometer. OpenCode usage
-  contributes API-equivalent value; it is not claimed as subscription-covered.
-- **A live session roster** — one row per agent session actually running on
-  this machine: which agent, which project, which model, turns, tokens,
-  cost, and its own burn sparkline. The interesting signal is **mid-turn**:
-  a usage event proves a turn *finished*, but a transcript that grew and
-  produced no event means an agent is thinking or running tools *at this
-  instant*. Those are tracked as two separate observations and never
-  conflated.
+- **Allowance first** — Claude 5-hour / weekly (opt-in OAuth) and Codex
+  5-hour / weekly (observed in local logs), with reset countdowns. Readings
+  older than five minutes or past their reset stay visible as stale and stop
+  driving the default menu-bar percentage.
+- **Seven-day usage** — recorded tokens including cache, split by harness,
+  and top models over the same period. Backed by the durable archive, including
+  after restart. Today is partial; archive timezone differences are disclosed.
+- **Honest cost** — API-equivalent dollars from model pricing, not a bill or
+  proof of subscription coverage. Unidentified accounts remain unidentified.
+- **Recent sessions** — project, harness, model and observed activity. Transcript
+  growth can suggest possible work; it does not prove an agent process is running.
 - **History dashboard** — a second native window for the long view: this
   month, subscription value, day-by-day cost, and per-model/per-project
   attribution.
 
 ![the dashboard](docs/assets/dashboard.png)
-- **System telemetry** — a quiet strip of micro-meters under the odometer:
-  CPU, GPU, memory (kernel pressure-aware), disk, network, battery. Sampled
-  straight from mach/sysctl/IOKit on the same 2-second sweep — no
-  subprocesses, no root, microseconds per reading. Cells only exist for
-  hardware that exists (a desktop shows no battery cell), and any reading
-  can be put in the menu bar via `tray-format` tokens
-  (`{cpu} {gpu} {mem} {disk} {net} {batt}`). Thirty minutes of each series
-  is kept on a wall clock, so the strip has a time axis and not just a bar
-  of *now*.
-- **A trip odometer** — what *this launch* has burned, on its own clock,
-  resettable. The counterpart to the all-time and per-day totals.
+- **Optional instruments** — the desktop HUD, history dashboard, burn prediction,
+  trip totals and custom tray telemetry tokens remain available. The default
+  `{status}` template prioritizes allowance; existing custom templates still work.
 - **Alerts and CLI** — hysteresis notifications at configured thresholds,
   plus `--json` / `--statusline` for scripting and Claude Code statuslines,
   and six query verbs over the durable history (below). `--json` includes
@@ -125,18 +107,15 @@ pixel through Metal.
 
 ## How it's built (the fun parts)
 
-- **The popover is a patched framework.** Native SDK had a tray API but no
-  `NSPopover`, no dock-less mode, no launch-at-login — so this repo vendors
-  [a fork](https://github.com/phall1/native/tree/token-tach-patches-v0.8.0)
-  of upstream v0.8.0 that adds all three to its Objective-C AppKit host,
+- **The popover uses a small SDK fork.** This repo vendors
+  [a fork](https://github.com/phall1/native/tree/token-tach-patches-v0.10.1)
+  of upstream v0.10.1 with primary-status-item `NSPopover` hosting,
   with the popover reparenting the app's Metal surface in and out of an
-  `NSViewController`. A fourth patch anchors render animations to the
-  presenting frame rather than the declarer's stale clock.
-- **The needle is real geometry.** The widget grammar rasterizes rects
-  axis-aligned, so the blade is a tapered vector path drawn through the
-  chrome display-list seam — the one primitive that stays true under the
-  render-animation rotation channel. Rest pose is always truth; animations
-  replay only deltas.
+  `NSViewController`. Upstream handles dock-less mode and login-item services;
+  the fork keeps Zig login helpers and frame-anchored render animations.
+- **A small presentation interface.** Collectors feed the existing usage engine
+  and durable archive. A bounded seven-day summary and typed allowance snapshot
+  feed a flow-layout popover; views perform no filesystem or credential reads.
 - **Server-truth limits, no scraping.** Claude's 5h/weekly utilization comes
   from the same OAuth endpoint Claude Code's `/usage` uses. Codex is even
   better: it writes its `rate_limits` straight into its rollout files —
@@ -145,8 +124,8 @@ pixel through Metal.
   sampler thread that owns its own counters and `post`s each reading through
   a Native SDK [external-source channel](https://github.com/vercel-labs/native) —
   the UI updates when the machine changes, on its own cadence, replay-safe,
-  with no shared mutable state. Hover any cell and the footer reveals its full
-  precision via the SDK's `on_hover_enter`/`on_hover_leave` Msg bindings.
+  with no shared mutable state. Custom tray tokens and the history window expose
+  those readings without adding a machine-monitor strip to the usage popover.
 - **Everything is fixture-tested.** ~370 tests, ~300 of them over the
   UI-free core (tailers, pricing, prediction, ledger, sessions, history,
   config, state), and `scripts/verify` launches the real app headlessly,
@@ -246,9 +225,9 @@ Use the Dashboard menu item or the popover's `DASH` button for history.
 **live-reloaded** (edit it and watch the tray re-template within a tick):
 
 ```ini
-# the menu-bar template: {burn} {eta} {pct} {tok} {cost}
+# the menu-bar template: {status} {burn} {eta} {pct} {tok} {cost}
 #                        {cpu} {gpu} {mem} {disk} {net} {batt}
-tray-format = {burn} → {eta}
+tray-format = {status}
 
 claude-oauth = true        # opt in to server-truth Claude limits
 poll-interval = 180s

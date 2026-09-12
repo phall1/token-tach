@@ -638,7 +638,7 @@ fn chartFoot(ui: *Ui, model: *const Model, frame: *const Frame, partial_cost: f6
 /// roster and scopes to the selected range where the ledger can.
 fn fleetCard(ui: *Ui, model: *const Model, frame: *const Frame) Ui.Node {
     const sessions_pane = model.ux.dashboard_focus == .sessions;
-    const tag = if (sessions_pane) "LIVE" else if (frame.agents_scoped) frame.scope.tag else "ALL-TIME";
+    const tag = if (sessions_pane) "RECENT" else if (frame.agents_scoped) frame.scope.tag else "ALL-TIME";
     var panes = [_]Ui.Node{
         ui.el(.segmented_control, .{
             .key = .{ .str = "agents" },
@@ -695,7 +695,7 @@ fn fleetFoot(ui: *Ui, model: *const Model, frame: *const Frame, sessions_pane: b
         if (session.isRunning(model.now_ms)) running += 1;
     }
     const text = if (sessions_pane)
-        ui.fmt("{d} live · {d} running · {d} seen", .{ live.len, running, model.roster.count() })
+        ui.fmt("{d} recent · {d} active (inferred) · {d} seen", .{ live.len, running, model.roster.count() })
     else blk: {
         var storage: [agent_count]AgentRow = undefined;
         const ranked = rankAgents(frame, &storage);
@@ -911,12 +911,7 @@ fn sessionRows(ui: *Ui, model: *const Model) []const Ui.Node {
     };
     for (live[0..shown], 0..) |session, i| {
         const ordinal = @intFromEnum(session.agent);
-        const activity = session.activityAt(model.now_ms);
-        const pip = switch (activity) {
-            .running => if (session.mid_turn) theme.activity_dot else theme.green,
-            .idle => theme.idle_dot,
-            .done => theme.telltale_off,
-        };
+        const pip = sessionInk(session, model.now_ms);
         nodes[i] = ui.column(.{
             .key = .{ .str = session.sessionId() },
             .gap = 2,
@@ -927,7 +922,7 @@ fn sessionRows(ui: *Ui, model: *const Model) []const Ui.Node {
             },
             .on_press = .{ .row_press = @intCast(i) },
             .semantics = .{
-                .label = ui.fmt("{s} {s} {s}", .{ session.agent.label(), projectLabel(session), @tagName(activity) }),
+                .label = ui.fmt("{s} {s} {s}", .{ session.agent.label(), projectLabel(session), @import("presentation.zig").activityLabel(session, model.now_ms) }),
                 .focusable = true,
             },
         }, .{
@@ -949,6 +944,14 @@ fn sessionRows(ui: *Ui, model: *const Model) []const Ui.Node {
     }
     if (overflow > 0) nodes[shown] = overflowNote(ui, overflow, 0);
     return nodes;
+}
+
+fn sessionInk(session: *const sessions_mod.Session, now_ms: i64) canvas.Color {
+    return switch (session.activityAt(now_ms)) {
+        .running => if (session.mid_turn) theme.activity_dot else theme.green,
+        .idle => theme.idle_dot,
+        .done => theme.telltale_off,
+    };
 }
 
 fn emptyNote(ui: *Ui, text: []const u8) []const Ui.Node {
