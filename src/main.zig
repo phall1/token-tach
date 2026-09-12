@@ -1,6 +1,6 @@
 //! token-tach: a menu-bar tachometer for AI coding-agent token usage.
 //! The engine (Model/Msg/boot/update) lives in `engine.zig`; the
-//! instrument-cluster canvas view in `view.zig` (theme in `theme.zig`);
+//! allowance-first canvas view in `view.zig` (theme in `theme.zig`);
 //! the UI-free core under `core/`. This file is shell wiring: window
 //! scene, permissions, the status-item glance, and the runtime entry
 //! point.
@@ -22,6 +22,7 @@ const hud = @import("hud.zig");
 const cli = @import("cli.zig");
 const theme = @import("theme.zig");
 const trayfmt = @import("core/trayfmt.zig");
+const presentation = @import("presentation.zig");
 
 pub const Model = engine.Model;
 pub const Msg = engine.Msg;
@@ -68,6 +69,11 @@ pub const AppUi = canvas.Ui(Msg);
 
 const TachApp = native_sdk.UiApp(Model, Msg);
 
+fn popoverView(ui: *AppUi, model: *const Model) AppUi.Node {
+    const snapshot = presentation.snapshot(engine.presentationInput(model));
+    return view.rootView(ui, &snapshot);
+}
+
 /// The menu-bar glance: title is the trayfmt-rendered hero line, the
 /// dropdown mirrors the dashboard's per-agent and today lines. Rendered
 /// from the model after every dispatch; the runtime patches only what
@@ -98,8 +104,8 @@ fn statusItem(model: *const Model, scratch: *TachApp.StatusItemScratch) TachApp.
     scratch.items[4] = .{ .id = 5, .separator = true };
     // The reserved toggle command is intercepted by the runtime, so this
     // menu item opens the popover cluster without any app wiring.
-    scratch.items[5] = .{ .id = 6, .label = "Open Tach", .command = "native-sdk.tray.toggle-popover" };
-    scratch.items[6] = .{ .id = 7, .label = "Dashboard", .command = "tach.dashboard" };
+    scratch.items[5] = .{ .id = 6, .label = "Usage overview", .command = "native-sdk.tray.toggle-popover" };
+    scratch.items[6] = .{ .id = 7, .label = "History", .command = "tach.dashboard" };
     // The HUD is click-through, so this item is not merely the nicest
     // way to dismiss it — it is the ONLY one. The label carries the
     // direction because TrayMenuItem has no checked state.
@@ -187,20 +193,10 @@ pub fn main(init: std.process.Init) !void {
         // NSPopover hosting the "main" window); the fn derives title+menu.
         .status_item = .{ .popover_window = "main" },
         .status_item_fn = statusItem,
-        .view = view.rootView,
+        .view = popoverView,
         .windows_fn = tachWindows,
         .window_view = tachWindowView,
         .tokens = theme.tokens(),
-        .animations = view.animations,
-        // Raw display-list chrome around the widget span: gradient
-        // bezels + shaded dial face under the widgets, the machined
-        // needle blade + glass glare over them (real vector paths — the
-        // rotation-true primitive the widget grammar lacks).
-        .chrome = .{
-            .prefix_commands = view.chrome_prefix_commands,
-            .suffix_commands = view.chrome_suffix_commands,
-            .build = view.buildChrome,
-        },
         .on_command = onCommand,
     });
     defer app_state.destroy();

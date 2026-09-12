@@ -10,8 +10,7 @@ set -e
 unsetopt bg_nice 2>/dev/null || true
 cd "$(dirname "$0")/.."
 
-# The app.zon uses `.macos` (accessory mode), which the stock npm CLI
-# cannot parse — prefer the CLI built from the vendored fork.
+# Match the CLI and automation protocol to the vendored SDK fork.
 # scripts/setup builds it; NATIVE_BIN overrides.
 NATIVE="${NATIVE_BIN:-vendor/native/zig-out/bin/native}"
 [[ -x "$NATIVE" ]] || NATIVE=native
@@ -36,39 +35,50 @@ if [[ "$1" == "--no-smoke" ]]; then
 fi
 
 echo "==> smoke drive"
-pkill -f zig-out/bin/token-tach 2>/dev/null || true
-sleep 0.5
-./zig-out/bin/token-tach >/dev/null 2>&1 &
+if [[ -n "$TACH_SMOKE_HOME" ]]; then
+  env HOME="$TACH_SMOKE_HOME" XDG_STATE_HOME="$TACH_SMOKE_HOME/state" XDG_DATA_HOME="$TACH_SMOKE_HOME/data" ./zig-out/bin/token-tach >/dev/null 2>&1 &
+else
+  ./zig-out/bin/token-tach >/dev/null 2>&1 &
+fi
 APP_PID=$!
 cleanup() { kill $APP_PID 2>/dev/null || true }
 trap cleanup EXIT
 
-# wait for automation socket
-for i in {1..20}; do
-  $NATIVE automate list >/dev/null 2>&1 && break
-  sleep 0.25
-done
+# A prior run leaves automation files behind. Wait for THIS process before
+# issuing a command, otherwise a successful enqueue can be lost during boot.
+$NATIVE automate assert --timeout-ms 30000 "publisher_pid=$APP_PID " >/dev/null
 
 SNAP=$($NATIVE automate snapshot 2>/dev/null)
 # Popover-hosted: the window exists but stays hidden until toggled.
 echo "$SNAP" | grep -q 'popover_window="main"' || { echo "FAIL: tray popover binding missing"; exit 1 }
 
 # Toggle the popover open and assert the dashboard rendered.
-$NATIVE automate native-command native-sdk.tray.toggle-popover >/dev/null 2>&1 || true
-sleep 1
+$NATIVE automate native-command native-sdk.tray.toggle-popover >/dev/null
+$NATIVE automate assert --timeout-ms 30000 'popover_visible=true' >/dev/null
 SNAP=$($NATIVE automate snapshot 2>/dev/null)
 echo "$SNAP" | grep -q 'popover_visible=true' || { echo "FAIL: popover did not open"; exit 1 }
-echo "$SNAP" | grep -q 'today \$' || { echo "FAIL: today line missing from snapshot"; exit 1 }
-echo "$SNAP" | grep -q 'models priced\|starting\|scanning' || { echo "FAIL: status line missing"; exit 1 }
+echo "$SNAP" | grep -q 'Token Tach usage overview' || { echo "FAIL: usage overview missing"; exit 1 }
+echo "$SNAP" | grep -q 'Settings' || { echo "FAIL: navigation missing"; exit 1 }
 
 # Give the first 2s sweep a chance to run, then confirm the app survived it.
 sleep 3
 SNAP=$($NATIVE automate snapshot 2>/dev/null)
-echo "$SNAP" | grep -q 'today \$' || { echo "FAIL: app died or blanked after first sweep"; exit 1 }
-# The system telemetry strip needs one sweep to sample; instantaneous
-# modules (mem/gpu/disk) must be there by now.
-echo "$SNAP" | grep -q 'System telemetry' || { echo "FAIL: system telemetry strip missing"; exit 1 }
+echo "$SNAP" | grep -q 'Token Tach usage overview' || { echo "FAIL: app died or blanked after first sweep"; exit 1 }
 $NATIVE automate screenshot main-canvas >/dev/null 2>&1 || true
+
+# Route real buttons, including returning to a differently sized body. This
+# catches stale route state independently of the opening tray command.
+click_button() {
+  local id=$($NATIVE automate snapshot | sed -n "s/.*main-canvas#\([0-9]*\) role=button name=\"$1\".*/\1/p" | head -1)
+  [[ -n "$id" ]] || { echo "FAIL: button $1 missing"; return 1 }
+  $NATIVE automate widget-click main-canvas "$id" >/dev/null
+}
+click_button Sessions
+$NATIVE automate assert 'Recent sessions' 'name="Back"' >/dev/null
+$NATIVE automate screenshot main-canvas >/dev/null
+click_button Back
+$NATIVE automate assert 'name="Refresh usage"' 'name="Settings"' >/dev/null
+$NATIVE automate screenshot main-canvas >/dev/null
 
 # Open the model-declared dashboard window and assert its canvas tree exists.
 $NATIVE automate native-command tach.dashboard >/dev/null 2>&1 || true

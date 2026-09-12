@@ -12,7 +12,7 @@ set -euo pipefail
 unsetopt bg_nice 2>/dev/null || true
 cd "$(dirname "$0")/.."
 
-# app.zon uses `.macos` — needs the fork-built CLI (see scripts/setup).
+# Match the CLI to the vendored SDK fork (see scripts/setup).
 NATIVE="${NATIVE_BIN:-vendor/native/zig-out/bin/native}"
 [[ -x "$NATIVE" ]] || NATIVE=native
 

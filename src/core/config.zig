@@ -78,7 +78,7 @@ pub const default_alert_thresholds = [_]u8{ 70, 90 };
 pub const Config = struct {
     /// `tray-format` — tray title template, stored verbatim. Placeholder
     /// substitution ({burn}, {eta}, ...) is the renderer's job.
-    tray_format: []const u8 = "{burn} → {eta}",
+    tray_format: []const u8 = "{status}",
     /// `alert-threshold` — notification thresholds in percent (0–100).
     /// Comma-separated, appendable across repeated keys.
     alert_thresholds: []const u8 = &default_alert_thresholds,
@@ -400,7 +400,7 @@ test "defaults when empty" {
 
     const result = try parse(arena, "");
     try testing.expectEqual(@as(usize, 0), result.warnings.len);
-    try testing.expectEqualStrings("{burn} → {eta}", result.config.tray_format);
+    try testing.expectEqualStrings("{status}", result.config.tray_format);
     try testing.expectEqualSlices(u8, &.{ 70, 90 }, result.config.alert_thresholds);
     try testing.expectEqual(false, result.config.claude_oauth);
     try testing.expectEqual(@as(u32, 180), result.config.poll_interval_s);
